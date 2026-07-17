@@ -90,9 +90,13 @@ void sopk_entry(int argc, char **argv, char **envp) {
     for (int i = 0; i < 32; i++) key[i] = src->key[i];
     for (int i = 0; i < 16; i++) nonce[i] = src->nonce[i];
 
+    int dolog = (flags & SOPK_FLAG_LOG) != 0;
     sopk_dbg("[sopk] A:entry\n");
-    if (magic != SOPK_MAGIC || text_size == 0)
+    if (dolog) sopk_logcat("sopack", "A:entry");
+    if (magic != SOPK_MAGIC || text_size == 0) {
+        if (dolog) sopk_logv("sopack", "A:not-patched magic=", magic);
         goto chain;                                       /* not patched — just chain */
+    }
 
     uintptr_t text = self + (intptr_t)delta_text;         /* runtime .text base */
     size_t    tlen = (size_t)text_size;
@@ -101,11 +105,18 @@ void sopk_entry(int argc, char **argv, char **envp) {
     uintptr_t win_lo = sopk_align_down(text, pg);
     uintptr_t win_hi = sopk_align_up(text + tlen, pg);
     size_t    win_len = win_hi - win_lo;
+    if (dolog) { sopk_logv("sopack", "B:pg=", pg);
+                 sopk_logv("sopack", "B:text=", text);
+                 sopk_logv("sopack", "B:len=", tlen); }
 
     /* 1. anon RW scratch */
     sopk_dbg("[sopk] B:mmap\n");
     void *scratch = sopk_mmap_anon(win_len);
-    if (scratch == SOPK_MAP_FAILED) goto chain;           /* fail open: leave as-is */
+    if (sopk_is_err(scratch)) {
+        if (dolog) sopk_logv("sopack", "C:mmap FAILED ret=", (unsigned long)scratch);
+        goto chain;                                       /* fail open: leave as-is */
+    }
+    if (dolog) sopk_logv("sopack", "C:mmap ok=", (unsigned long)scratch);
 
     /* 2. copy the page window verbatim (encrypted .text + any plaintext neighbors) */
     sopk_dbg("[sopk] C:memcpy\n");
@@ -115,21 +126,39 @@ void sopk_entry(int argc, char **argv, char **envp) {
     sopk_dbg("[sopk] D:decrypt\n");
     uint8_t *text_in_scratch = (uint8_t *)scratch + (text - win_lo);
     sopk_decrypt(text_in_scratch, tlen, cipher_id, key, nonce);
+    if (dolog) sopk_logv("sopack", "D:decrypt done first8=",
+                         *(unsigned long *)text_in_scratch);
 
     /* 4. move decrypted pages onto the ORIGINAL .text VA (anon dest => execmem path) */
     sopk_dbg("[sopk] E:mremap\n");
     void *placed = sopk_mremap_fixed(scratch, win_len, (void *)win_lo);
-    if (placed == SOPK_MAP_FAILED) goto chain;
+    if (sopk_is_err(placed)) {
+        if (dolog) sopk_logv("sopack", "E:mremap FAILED ret=", (unsigned long)placed);
+        /* Fallback: unmap the file-backed .text window and map fresh anon pages at the
+         * same VA, then copy the decrypted window in. Same execmem result via a
+         * different kernel path (some devices reject MREMAP_FIXED over a file map). */
+        sopk_munmap((void *)win_lo, win_len);
+        void *fx = sopk_mmap_fixed_anon((void *)win_lo, win_len);
+        if (sopk_is_err(fx)) {
+            if (dolog) sopk_logv("sopack", "E2:mmap-fixed FAILED ret=", (unsigned long)fx);
+            goto chain;
+        }
+        sopk_memcpy((void *)win_lo, scratch, win_len);
+        sopk_munmap(scratch, win_len);
+        if (dolog) sopk_logv("sopack", "E2:mmap-fixed fallback ok=", (unsigned long)fx);
+    } else if (dolog) {
+        sopk_logv("sopack", "E:mremap ok=", (unsigned long)placed);
+    }
 
     /* 5. RW -> R-X, then flush I-cache before anything executes there */
     sopk_dbg("[sopk] F:mprotect\n");
-    sopk_mprotect((void *)win_lo, win_len, SOPK_PROT_READ | SOPK_PROT_EXEC);
+    int mp = sopk_mprotect((void *)win_lo, win_len, SOPK_PROT_READ | SOPK_PROT_EXEC);
+    if (dolog && mp != 0) sopk_logv("sopack", "F:mprotect FAILED ret=", (unsigned long)(long)mp);
     sopk_dbg("[sopk] G:flush\n");
     sopk_clear_icache((void *)text, (void *)(text + tlen));
     sopk_dbg("[sopk] H:done\n");
 
-    if (flags & SOPK_FLAG_LOG)
-        sopk_logcat("sopack", "native .text decrypted OK");
+    if (dolog) sopk_logcat("sopack", "H:native .text decrypted OK");
 
 chain:
     if (flags & SOPK_FLAG_CHAIN_INIT) {

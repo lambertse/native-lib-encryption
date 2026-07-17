@@ -244,7 +244,8 @@ def _add_dtinit_inplace(path: str, entry_rva: int) -> None:
             elif ptype == _PT_LOAD:
                 p_off = struct.unpack_from(W, buf, p + P_OFFSET)[0]
                 p_filesz = struct.unpack_from(W, buf, p + P_FILESZ)[0]
-                loads.append((p_off, p_filesz))
+                p_memsz = struct.unpack_from(W, buf, p + P_MEMSZ)[0]
+                loads.append((p_off, p_filesz, p_memsz))
         if ph_dyn is None:
             raise InjectError("no PT_DYNAMIC program header found")
         dyn_off = struct.unpack_from(W, buf, ph_dyn + P_OFFSET)[0]
@@ -260,17 +261,32 @@ def _add_dtinit_inplace(path: str, entry_rva: int) -> None:
         if term is None:
             raise InjectError(".dynamic has no DT_NULL terminator")
 
-        # the slot AFTER the (to-be-overwritten) terminator becomes the new terminator;
-        # it must be zero (reads as DT_NULL) and file-backed within a PT_LOAD (mapped).
+        # The slot AFTER the (to-be-overwritten) terminator becomes the new terminator.
+        # It must read as DT_NULL (zero) AND be mapped AT RUNTIME. The runtime state is
+        # decided by the containing PT_LOAD's filesz/memsz, NOT by the file bytes:
+        #   * within filesz  -> the file bytes are mapped -> they must be zero (e.g. .bss
+        #                       that is PROGBITS-zero inside the segment);
+        #   * beyond filesz  -> the loader zero-fills [filesz .. roundup(memsz,page)], so
+        #                       it reads as DT_NULL regardless of any non-loaded file
+        #                       bytes there (e.g. .shstrtab, which has no SHF_ALLOC).
+        # We use a 4 KB page for the bound (conservative: real pages >= 4 KB only enlarge
+        # the zero-filled, mapped tail).
         new_term_off = dyn_off + (term + 1) * DYN
         if new_term_off + DYN > len(buf):
             raise InjectError("no room after .dynamic for a new terminator")
-        if bytes(buf[new_term_off:new_term_off + DYN]) != b"\x00" * DYN:
-            raise InjectError("bytes after .dynamic terminator are non-zero; "
-                              "cannot add DT_INIT in place (unsupported layout)")
-        if not any(off <= new_term_off and new_term_off + DYN <= off + fsz
-                   for off, fsz in loads):
-            raise InjectError("new terminator slot is not inside a mapped PT_LOAD")
+        container = next(((o, fsz, msz) for (o, fsz, msz) in loads
+                          if o <= dyn_off < o + fsz), None)
+        if container is None:
+            raise InjectError(".dynamic is not inside a PT_LOAD segment")
+        c_off, c_filesz, c_memsz = container
+        seg_term = new_term_off - c_off
+        if seg_term + DYN <= c_filesz:
+            if bytes(buf[new_term_off:new_term_off + DYN]) != b"\x00" * DYN:
+                raise InjectError("slot after .dynamic terminator is file-backed and "
+                                  "non-zero; cannot add DT_INIT in place")
+        elif seg_term + DYN > ((c_memsz + 0xFFF) & ~0xFFF):
+            raise InjectError("no mapped zero slot after .dynamic for a new terminator")
+        # else: beyond filesz but within the zero-filled mapped tail -> DT_NULL at runtime
 
         # overwrite DT_NULL -> DT_INIT
         struct.pack_into(DPACK, buf, dyn_off + term * DYN, _DT_INIT, entry_rva)

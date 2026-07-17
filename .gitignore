@@ -13,3 +13,5 @@ sopack/stubs/*.elf
 # Local keystores / scratch
 *.keystore
 *.apk
+*.idsig
+output/

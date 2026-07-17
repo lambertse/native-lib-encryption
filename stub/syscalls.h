@@ -113,6 +113,12 @@ static inline long sopk_syscall6(long n, long a, long b, long c,
 #define SOPK_MAP_FAILED ((void*)-1)
 #define SOPK_O_RDONLY 0
 
+/* Raw syscalls return -errno on failure (a value in [-4095, -1]); detect that range
+ * rather than only == MAP_FAILED (-1), or an EINVAL/EPERM would slip through. */
+static inline int sopk_is_err(void *p) {
+    return (unsigned long)p >= (unsigned long)(-4095L);
+}
+
 static inline void *sopk_mmap_anon(size_t len) {
 #if defined(__arm__)
     /* mmap2 offset is in 4096-byte units; anon => 0. */
@@ -134,6 +140,25 @@ static inline int sopk_mprotect(void *addr, size_t len, int prot) {
 static inline void *sopk_mremap_fixed(void *old, size_t sz, void *dst) {
     return (void *)sopk_syscall5(SOPK_NR_mremap, old, sz, sz,
                                  SOPK_MREMAP_MAYMOVE | SOPK_MREMAP_FIXED, dst);
+}
+
+static inline int sopk_munmap(void *addr, size_t len) {
+    return (int)sopk_syscall2(SOPK_NR_munmap, addr, len);
+}
+
+/* mmap anonymous RW at a FIXED address (fallback for when mremap onto the .text VA is
+ * rejected: unmap the file-backed .text, then map fresh anon pages at the same VA). */
+#define SOPK_MAP_FIXED 0x10
+static inline void *sopk_mmap_fixed_anon(void *addr, size_t len) {
+#if defined(__arm__)
+    return (void *)sopk_syscall6(SOPK_NR_mmap2, (long)addr, (long)len,
+                                 SOPK_PROT_READ | SOPK_PROT_WRITE,
+                                 SOPK_MAP_PRIVATE | SOPK_MAP_ANONYMOUS | SOPK_MAP_FIXED, -1, 0);
+#else
+    return (void *)sopk_syscall6(SOPK_NR_mmap, (long) addr, (long)len,
+                                 SOPK_PROT_READ | SOPK_PROT_WRITE,
+                                 SOPK_MAP_PRIVATE | SOPK_MAP_ANONYMOUS | SOPK_MAP_FIXED, -1, 0);
+#endif
 }
 
 /* ---- debug marker to stderr (compiled in only with -DSOPK_DEBUG) ---- */

@@ -50,6 +50,21 @@ pip install -e .        # installs the `sopack` command + LIEF
 `apksigner`, `zipalign`, `keytool` must be reachable (SDK build-tools + a JDK).
 `build_stubs.sh` uses the NDK when `ANDROID_NDK_HOME` is set, otherwise plain `clang`.
 
+### Required versions
+
+| Tool | Minimum | Notes |
+|------|---------|-------|
+| **NDK** | **r19+** (recommend r26–r28) | Must bundle `lld` — every NDK since r19 (2019) does. A real version looks like `27.0.12077973`; `4.8.0` is **not** a valid NDK and will fail. Install via Android Studio → SDK Manager → SDK Tools → NDK, or `sdkmanager "ndk;27.0.12077973"`. |
+| **SDK build-tools** | **34.0.0+** | Provides `apksigner` (v2/v3 signing) and `zipalign` (`-P` for 16 KB). |
+| **JDK** | **17+** (8 works) | For `keytool` and to run `apksigner`. |
+| **Python** | **3.10+** | Runs the packer. |
+| **LIEF** | **0.15+** | `pip install lief` (tested with 1.0). |
+
+**Don't have/ want the NDK?** The stub is freestanding, so any modern LLVM works instead
+(no Android sysroot needed). On macOS: `brew install llvm`, then
+`export PATH="$(brew --prefix llvm)/bin:$PATH"` and leave `ANDROID_NDK_HOME` unset —
+`build_stubs.sh` falls back to plain `clang`/`lld`/`llvm-objcopy`/`llvm-readelf`.
+
 ---
 
 ## Build the stub blobs (once)
@@ -133,5 +148,8 @@ device's ABI). No line ⇒ decryption didn't run.
   (Python aligner, or `zipalign` if present) — required for Android 15+ devices.
 - **Rebuild stubs** only when you change anything under `stub/`. Packing itself doesn't
   need the NDK/LLVM once `sopack/stubs/*.bin` exist.
+- **Run `build_stubs.sh` with bash**, e.g. `bash stub/build_stubs.sh 24` or
+  `./stub/build_stubs.sh 24` — not `sh stub/build_stubs.sh` (it needs bash, though it
+  now works with the old bash 3.2 that ships on macOS).
 - **Security caveat.** This is obfuscation, not encryption-at-rest security: the key
   ships in the binary and plaintext exists in memory at runtime.

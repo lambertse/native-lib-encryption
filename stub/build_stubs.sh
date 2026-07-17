@@ -13,6 +13,10 @@
 #
 # Usage: ANDROID_NDK_HOME=/path/to/ndk ./build_stubs.sh [API_LEVEL]
 #    or: ./build_stubs.sh            # plain LLVM on PATH
+#
+# Requires an NDK r19+ (recommend r26-r28; must bundle lld — a real version looks like
+# 27.0.12077973, NOT 4.8.0) OR a modern LLVM (clang + lld + llvm-objcopy + llvm-readelf)
+# on PATH. Run with bash (>= 3.2), not sh.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,12 +24,11 @@ OUT="$HERE/../sopack/stubs"
 API="${1:-24}"
 mkdir -p "$OUT"
 
-# ABI -> clang target triple
-declare -A TARGET=(
-    [arm64-v8a]="aarch64-linux-android${API}"
-    [armeabi-v7a]="armv7a-linux-androideabi${API}"
-    [x86_64]="x86_64-linux-android${API}"
-)
+# ABI:triple pairs. Kept as a plain space-separated list (not a bash-4 associative
+# array) so this script also runs on macOS's built-in bash 3.2.
+TARGETS="arm64-v8a:aarch64-linux-android${API} \
+armeabi-v7a:armv7a-linux-androideabi${API} \
+x86_64:x86_64-linux-android${API}"
 
 NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
 if [[ -n "$NDK" ]]; then
@@ -62,14 +65,23 @@ sym_off() {  # sym_off <elf> <name> -> hex offset (== vaddr, image based at 0)
     "$READELF" -sW "$1" | awk -v n="$2" '$8==n {print "0x"$2; exit}'
 }
 
-for ABI in "${!TARGET[@]}"; do
-    TRIPLE="${TARGET[$ABI]}"
+for PAIR in $TARGETS; do
+    ABI="${PAIR%%:*}"
+    TRIPLE="${PAIR#*:}"
     echo "== building stub for $ABI ($TRIPLE) =="
     ELF="$OUT/stub_${ABI}.elf"
     BLOB="$OUT/stub_${ABI}.bin"
     META="$OUT/stub_${ABI}.json"
 
-    "$CLANG" --target="$TRIPLE" "${CFLAGS[@]}" "${LDFLAGS[@]}" \
+    # arm64: force -mcmodel=tiny so the compiler emits `adr` (byte PC-relative) instead
+    # of `adrp+add` (page PC-relative). `adrp` is only correct when the blob loads at a
+    # page-aligned virtual address; some LIEF versions place the injected segment at a
+    # non-page-aligned vaddr, which breaks `adrp` addressing to g_decinfo. `adr` works at
+    # any alignment. (x86_64 RIP-relative and armv7 literal pools are already byte-relative.)
+    EXTRA=""
+    if [ "$ABI" = "arm64-v8a" ]; then EXTRA="-mcmodel=tiny"; fi
+
+    "$CLANG" --target="$TRIPLE" $EXTRA "${CFLAGS[@]}" "${LDFLAGS[@]}" \
         -I"$HERE" "$HERE/stub.c" -o "$ELF"
 
     # Hard requirement: no dynamic relocations and no undefined symbols, or the blob
@@ -83,6 +95,16 @@ for ABI in "${!TARGET[@]}"; do
         echo "ERROR: $ABI stub references undefined (external) symbols:" >&2
         "$READELF" -sW "$ELF" | awk '$7=="UND" && $8!=""' >&2
         exit 1
+    fi
+    # arm64: the blob MUST use adr (byte PC-relative), never adrp (page PC-relative),
+    # or it breaks when a LIEF version places the injected segment at a non-page-aligned
+    # virtual address. -mcmodel=tiny guarantees adr; assert it here.
+    if [ "$ABI" = "arm64-v8a" ]; then
+        OBJDUMP="$(dirname "$READELF")/llvm-objdump"
+        if "$OBJDUMP" -d "$ELF" | grep -qw adrp; then
+            echo "ERROR: $ABI stub uses adrp (page-relative) — must build with -mcmodel=tiny" >&2
+            exit 1
+        fi
     fi
 
     ENTRY_OFF="$(sym_off "$ELF" sopk_entry)"

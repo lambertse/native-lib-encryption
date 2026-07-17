@@ -83,4 +83,18 @@ static inline void sopk_logcat(const char *tag, const char *msg) {
     sopk_syscall1(SOPK_NR_close, fd);
 }
 
+/* Log "<prefix>0x<hex64>" — used to report stage + address/errno while debugging. */
+static inline void sopk_logv(const char *tag, const char *prefix, unsigned long v) {
+    char msg[96];
+    int o = 0;
+    for (int k = 0; prefix[k] && o < 60; k++) msg[o++] = prefix[k];
+    msg[o++] = '0'; msg[o++] = 'x';
+    for (int i = 0; i < 16; i++) {
+        int nib = (int)((v >> ((15 - i) * 4)) & 0xf);
+        msg[o++] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10);
+    }
+    msg[o] = 0;
+    sopk_logcat(tag, msg);
+}
+
 #endif /* SOPK_LOG_H */
