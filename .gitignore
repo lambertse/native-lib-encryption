@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.venv/
+
+# Stub build intermediates (keep the .bin/.json blobs — they are package data)
+sopack/stubs/*.elf
+
+# Local keystores / scratch
+*.keystore
+*.apk

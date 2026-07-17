@@ -1,0 +1,8 @@
+{
+  "abi": "arm64-v8a",
+  "triple": "aarch64-linux-android24",
+  "api": 24,
+  "size": 2227,
+  "entry_off": 0,
+  "decinfo_off": 2099
+}
