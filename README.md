@@ -3,8 +3,8 @@
 `sopack` takes an **existing APK** plus a list of native libraries and produces a
 **self-signed APK** in which each listed `.so` has its code (`.text`) encrypted at
 rest and transparently decrypted at load time — **without any access to the library
-source**. It is the Model-2 ("black-box injection") realization of the design in
-[`Handover.md`](./Handover.md).
+source**. It is a black-box ELF-injection packer; see [`docs/`](./docs/) for the full
+design and reasoning.
 
 > ⚠️ **This is obfuscation, not security.** The decryption key ships inside the
 > binary, and plaintext exists in a readable `R-X` mapping at runtime. Any Frida hook
@@ -38,7 +38,7 @@ For each requested `lib/<abi>/*.so` inside the APK:
    entry is not relocated and, per bionic's `soinfo::call_constructors`, runs **before**
    `DT_INIT_ARRAY` — so the stub decrypts `.text` first and the library's own
    constructors then execute on decrypted code.
-4. **At runtime**, the stub (W^X / SELinux `execmem`-safe, per `Handover.md` §3B):
+4. **At runtime**, the stub (W^X / SELinux `execmem`-safe):
    `mmap`s anonymous RW scratch → copies the encrypted `.text` page window → decrypts
    the exact `.text` sub-range → `mremap(MREMAP_FIXED)` onto the **original `.text`
    VA** → `mprotect R-X` → flushes the I-cache → chains the original init.

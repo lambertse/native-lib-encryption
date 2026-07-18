@@ -1,5 +1,5 @@
 /*
- * phase0.c — standalone runtime-path spike (handover.md Recommendation 1 + 2).
+ * phase0.c — standalone runtime-path spike (see docs/architecture.md §7, step 1).
  *
  * Proves the riskiest assumption BEFORE trusting the injector: that an app can copy
  * file-backed .text into anonymous memory, mremap it back ONTO the original .text VA,

@@ -6,7 +6,7 @@
  * sopk_entry(). The dynamic linker calls DT_INIT after relocation + RELRO, before
  * DT_INIT_ARRAY and before any exported function — a safe, single-threaded window.
  *
- * What it does (W^X / SELinux `execmem` safe, per handover.md §3B):
+ * What it does (W^X / SELinux `execmem` safe — see docs/architecture.md §2a, §4c):
  *   1. Find the target .text at runtime WITHOUT the load bias, using the address of
  *      g_decinfo (which the compiler references PC-relatively) + a signed delta the
  *      injector baked in.
