@@ -4,9 +4,10 @@ Per target .so:
   1. locate `.text`, stream-encrypt its exact bytes in place (length preserving),
   2. append the freestanding stub blob as a fresh R+X PT_LOAD segment,
   3. hijack load-time execution so the stub runs before any encrypted code:
-       - DT_INIT present  -> repoint to stub, chain the original,
-       - else DT_INIT_ARRAY[0] -> overwrite, chain the original,
-       - else add a DT_INIT,
+       - DT_INIT present -> repoint to stub, chain the original,
+       - else            -> add a DT_INIT in place (before DT_INIT_ARRAY),
+     We never hijack DT_INIT_ARRAY: on PIC libs its slots are relocation-populated at
+     load, so a file-slot overwrite is reverted and the stub never runs.
   4. patch the decinfo record (deltas, key, nonce, sizes) into the injected segment,
   5. write the rebuilt ELF.
 
@@ -91,26 +92,18 @@ def _find_text(binary) -> "lief.ELF.Section":
 
 
 def _hijack_existing_init(binary, decinfo_rva: int, entry_rva: int):
-    """Hijack an EXISTING DT_INIT / DT_INIT_ARRAY in place (no .dynamic growth, so no
-    extra segment is created). Returns (flags, delta_init, strategy) or None if the
-    library has no init hook to hijack."""
-    init = binary.get(_tag("INIT"))
-    if init is not None and init.value != 0:
-        orig = init.value
-        init.value = entry_rva
-        return FLAG_CHAIN_INIT, orig - decinfo_rva, "DT_INIT-hijack"
+    """Repoint an EXISTING DT_INIT to the stub and chain the original, in place (no
+    .dynamic growth, so no extra segment is created). Only called when a usable DT_INIT
+    is present.
 
-    init_array = binary.get(_tag("INIT_ARRAY"))
-    if init_array is not None:
-        arr = list(init_array.array)
-        if arr:
-            orig = arr[0]
-            arr[0] = entry_rva
-            init_array.array = arr
-            if orig != 0:
-                return FLAG_CHAIN_INIT, orig - decinfo_rva, "DT_INIT_ARRAY[0]-hijack"
-            return 0, 0, "DT_INIT_ARRAY[0]-fill"
-    return None
+    We deliberately do NOT hijack DT_INIT_ARRAY: on PIC libraries its slots are populated
+    by R_*_RELATIVE relocations at load, so a file-level overwrite is reverted by the
+    loader. Libraries with no DT_INIT get one ADDED instead (see _add_dtinit_inplace),
+    which bionic invokes before DT_INIT_ARRAY."""
+    init = binary.get(_tag("INIT"))
+    orig = init.value
+    init.value = entry_rva
+    return FLAG_CHAIN_INIT, orig - decinfo_rva, "DT_INIT-hijack"
 
 
 def inject_so(in_path: str, out_path: str, abi: str,
@@ -132,17 +125,25 @@ def inject_so(in_path: str, out_path: str, abi: str,
     enc = apply_cipher(cipher_id, plain, key, nonce)
     text.content = list(enc)
 
-    # Does the library already have an init hook? If not, we ADD a DT_INIT — but WITHOUT
-    # growing .dynamic (which makes LIEF spill it into a small 4 KB-aligned segment that
-    # breaks 16 KB loading) and without moving .dynamic into a non-writable segment
-    # (which glibc/bionic reject). Instead we overwrite the existing DT_NULL terminator
-    # in place with DT_INIT, relying on the zero bytes that follow (.bss / padding) as
-    # the new terminator. See _add_dtinit_inplace.
+    # Load-time hook policy. If the library already exposes a usable DT_INIT we repoint it
+    # (chaining the original). Otherwise we ADD a DT_INIT in place — even when the library
+    # has a DT_INIT_ARRAY.
+    #
+    # We deliberately never hijack DT_INIT_ARRAY. On PIC libraries (every Android .so) each
+    # INIT_ARRAY slot is filled at load time by an R_*_RELATIVE relocation, so the file slot
+    # reads 0 and any pointer we write there is silently reverted by the loader (the
+    # relocation addend wins) — the stub never runs and the still-encrypted constructor
+    # executes as garbage (SIGILL). A DT_INIT entry lives in .dynamic, is NOT relocated
+    # (bionic adds load_bias to d_ptr directly), and soinfo::call_constructors invokes
+    # DT_INIT BEFORE DT_INIT_ARRAY — so our stub decrypts .text first and the library's own
+    # constructors then run on decrypted code. We add it WITHOUT growing .dynamic (which
+    # makes LIEF spill it into a 4 KB-aligned segment that breaks 16 KB loading) and without
+    # moving .dynamic to a non-writable segment (which bionic/glibc reject): we overwrite the
+    # existing DT_NULL terminator in place, using the zero word that follows as the new
+    # terminator. See _add_dtinit_inplace.
     has_init = (binary.get(_tag("INIT")) is not None
                 and binary.get(_tag("INIT")).value != 0)
-    ia = binary.get(_tag("INIT_ARRAY"))
-    has_init_array = ia is not None and len(list(ia.array)) > 0
-    no_init = not has_init and not has_init_array
+    add_dtinit = not has_init
 
     # --- 2. append stub as a fresh R+X LOAD segment (raw blob; magic present) ---
     seg = lief.ELF.Segment()
@@ -160,7 +161,7 @@ def inject_so(in_path: str, out_path: str, abi: str,
     entry_rva = seg_rva + stub.entry_off
 
     # --- 3. hijack load-time execution ---
-    if no_init:
+    if add_dtinit:
         flags, delta_init, strategy = 0, 0, "DT_INIT-inplace"
     else:
         flags, delta_init, strategy = _hijack_existing_init(binary, decinfo_rva, entry_rva)
@@ -173,8 +174,8 @@ def inject_so(in_path: str, out_path: str, abi: str,
     binary.write(out_path)
     seg_file_off = int(added.file_offset)
 
-    # --- 5. no-init path: overwrite the DT_NULL terminator with DT_INIT in place ---
-    if no_init:
+    # --- 5. add-DT_INIT path: overwrite the DT_NULL terminator with DT_INIT in place ---
+    if add_dtinit:
         _add_dtinit_inplace(out_path, entry_rva)
 
     # --- 6. patch decinfo into the output file directly (version-independent) ---
@@ -262,13 +263,18 @@ def _add_dtinit_inplace(path: str, entry_rva: int) -> None:
             raise InjectError(".dynamic has no DT_NULL terminator")
 
         # The slot AFTER the (to-be-overwritten) terminator becomes the new terminator.
-        # It must read as DT_NULL (zero) AND be mapped AT RUNTIME. The runtime state is
-        # decided by the containing PT_LOAD's filesz/memsz, NOT by the file bytes:
-        #   * within filesz  -> the file bytes are mapped -> they must be zero (e.g. .bss
-        #                       that is PROGBITS-zero inside the segment);
+        # bionic (and glibc) iterate .dynamic until the first entry whose d_tag == DT_NULL
+        # and IGNORE that entry's d_val — so the slot qualifies as a terminator when only
+        # its d_tag WORD reads as zero at runtime; the d_val may be anything. We only READ
+        # this slot (never overwrite it), so a non-zero d_val there is left intact.
+        #
+        # Runtime zero-ness of the d_tag word is decided by the containing PT_LOAD's
+        # filesz/memsz, NOT by static section names:
+        #   * within filesz  -> the file bytes are mapped -> the d_tag word must be zero
+        #                       (e.g. .dynstr's leading NUL, or intra-segment zero padding);
         #   * beyond filesz  -> the loader zero-fills [filesz .. roundup(memsz,page)], so
-        #                       it reads as DT_NULL regardless of any non-loaded file
-        #                       bytes there (e.g. .shstrtab, which has no SHF_ALLOC).
+        #                       the whole entry reads as DT_NULL regardless of file bytes
+        #                       (e.g. .shstrtab, which has no SHF_ALLOC).
         # We use a 4 KB page for the bound (conservative: real pages >= 4 KB only enlarge
         # the zero-filled, mapped tail).
         new_term_off = dyn_off + (term + 1) * DYN
@@ -281,9 +287,10 @@ def _add_dtinit_inplace(path: str, entry_rva: int) -> None:
         c_off, c_filesz, c_memsz = container
         seg_term = new_term_off - c_off
         if seg_term + DYN <= c_filesz:
-            if bytes(buf[new_term_off:new_term_off + DYN]) != b"\x00" * DYN:
-                raise InjectError("slot after .dynamic terminator is file-backed and "
-                                  "non-zero; cannot add DT_INIT in place")
+            new_tag = struct.unpack_from(DTAG, buf, new_term_off)[0]
+            if new_tag != _DT_NULL:
+                raise InjectError("slot after .dynamic terminator is file-backed with a "
+                                  "non-DT_NULL tag; cannot add DT_INIT in place")
         elif seg_term + DYN > ((c_memsz + 0xFFF) & ~0xFFF):
             raise InjectError("no mapped zero slot after .dynamic for a new terminator")
         # else: beyond filesz but within the zero-filled mapped tail -> DT_NULL at runtime
@@ -355,14 +362,16 @@ def _self_verify(path, plain, info, cipher_id, key, nonce, text_rva, entry_rva,
     # (4) the hook actually points at the stub, and no text relocations were introduced.
     if out.get(_tag("TEXTREL")) is not None:
         raise InjectError("output has DT_TEXTREL (text relocations) — must be absent")
-    if strategy.startswith("DT_INIT-"):
-        init = out.get(_tag("INIT"))
-        if init is None or int(init.value) != entry_rva:
-            raise InjectError("DT_INIT does not point at the stub entry")
-    elif strategy.startswith("DT_INIT_ARRAY"):
-        arr = out.get(_tag("INIT_ARRAY"))
-        if arr is None or not arr.array or int(arr.array[0]) != entry_rva:
-            raise InjectError("DT_INIT_ARRAY[0] does not point at the stub entry")
+    # Loader-aware hook check. The ONLY strategies we emit are DT_INIT-inplace and
+    # DT_INIT-hijack; both must leave DT_INIT pointing at the stub entry. DT_INIT is the
+    # FIRST thing soinfo::call_constructors runs (before DT_INIT_ARRAY) and is not subject
+    # to relocation, so this is exactly what the loader will call first — unlike a file-slot
+    # INIT_ARRAY value, which a load-time R_*_RELATIVE relocation would overwrite.
+    if not strategy.startswith("DT_INIT-"):
+        raise InjectError(f"unexpected init strategy {strategy!r}")
+    init = out.get(_tag("INIT"))
+    if init is None or int(init.value) != entry_rva:
+        raise InjectError("DT_INIT does not point at the stub entry")
 
 
 def _patch_decinfo(path: str, info: DecInfo) -> int:

@@ -25,12 +25,19 @@ For each requested `lib/<abi>/*.so` inside the APK:
    same file offsets, so ELF layout is untouched. Random per-library key + nonce.
 2. **Inject a freestanding stub** (`stub/stub.c`, compiled per ABI to a flat,
    relocation-free blob) as a new **R+X `PT_LOAD`** segment, 16 KB-aligned.
-3. **Hijack load-time execution** so the stub runs before any encrypted code:
-   repoint `DT_INIT` (chaining the original), else overwrite `DT_INIT_ARRAY[0]`, else —
-   for libraries with no init hook at all (e.g. Flutter's `libapp.so`) — add a `DT_INIT`
+3. **Hijack load-time execution** so the stub runs before any encrypted code. If the
+   library exposes a usable `DT_INIT`, repoint it (chaining the original). Otherwise —
+   whether the library has a `DT_INIT_ARRAY` (e.g. `libflutter.so` and most NDK-built
+   C++ libraries) or no init hook at all (e.g. Flutter's `libapp.so`) — add a `DT_INIT`
    **in place** by overwriting the existing `DT_NULL` terminator (relying on the
-   following `.bss`/zero bytes as the new terminator), which keeps `.dynamic` writable
-   and in place and avoids adding a mis-aligned segment that would break 16 KB loading.
+   following zero word as the new terminator), which keeps `.dynamic` writable and in
+   place and avoids adding a mis-aligned segment that would break 16 KB loading. We
+   **never** hijack `DT_INIT_ARRAY`: on position-independent libraries (every Android
+   `.so`) each array slot is filled by an `R_*_RELATIVE` relocation at load, so a file
+   overwrite is silently reverted by the loader and the stub never runs. A `DT_INIT`
+   entry is not relocated and, per bionic's `soinfo::call_constructors`, runs **before**
+   `DT_INIT_ARRAY` — so the stub decrypts `.text` first and the library's own
+   constructors then execute on decrypted code.
 4. **At runtime**, the stub (W^X / SELinux `execmem`-safe, per `Handover.md` §3B):
    `mmap`s anonymous RW scratch → copies the encrypted `.text` page window → decrypts
    the exact `.text` sub-range → `mremap(MREMAP_FIXED)` onto the **original `.text`

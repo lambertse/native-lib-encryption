@@ -101,3 +101,58 @@ def test_no_init_lib_uses_inplace_dtinit(tmp_path):
     lib.sopk_msg.restype = ctypes.c_char_p
     assert lib.sopk_add(2, 3) == 12
     assert lib.sopk_msg() == b"hello from native"
+
+
+def test_init_array_no_dtinit_adds_dtinit_not_array_hijack(tmp_path):
+    """A library with a DT_INIT_ARRAY but NO DT_INIT (the shape of Flutter's libflutter.so
+    and most C++ .so built with the Android NDK) must get a DT_INIT ADDED in place — never
+    a DT_INIT_ARRAY[0] hijack.
+
+    On PIC libraries every INIT_ARRAY slot is populated by an R_*_RELATIVE relocation at
+    load, so overwriting the file slot with the stub pointer is silently reverted by the
+    loader and the still-encrypted constructor runs as garbage (SIGILL). Adding a DT_INIT
+    (which bionic/glibc invoke BEFORE DT_INIT_ARRAY, and which is not relocated) makes the
+    stub decrypt .text first, so the library's own constructors then run on decrypted code.
+
+    We synthesize the shape by building a normal lib (constructor -> INIT_ARRAY, crti ->
+    DT_INIT) and then removing its DT_INIT with LIEF, leaving INIT_ARRAY + a relative reloc
+    on slot 0 and no DT_INIT (glibc's crti always supplies an _init, so it cannot be built
+    directly on a glibc host). The constructor calls a .text function and records the
+    result; reading it back proves the constructor executed on DECRYPTED code.
+    """
+    import lief
+    from sopack.elf_inject import inject_so
+
+    src = tmp_path / "t.c"
+    src.write_text(
+        'static const char msg[] = "hello from native";\n'
+        "static int g_ran = 0;\n"
+        "int sopk_add(int a,int b){return a+b+7;}\n"
+        "int sopk_ran(void){return g_ran;}\n"
+        "const char *sopk_msg(void){return msg;}\n"
+        "__attribute__((constructor)) static void ctor(void){ g_ran = sopk_add(10,20); }\n"
+    )
+    plain = tmp_path / "libia.so"
+    subprocess.run(["clang", "-shared", "-fPIC", "-O2", "-o", str(plain), str(src)],
+                   check=True)
+
+    # strip DT_INIT to reproduce the Android "INIT_ARRAY but no DT_INIT" shape
+    b = lief.parse(str(plain))
+    T = lief.ELF.DynamicEntry.TAG
+    assert b.get(T.INIT) is not None and b.get(T.INIT_ARRAY) is not None
+    b.remove(b.get(T.INIT))
+    noinit = tmp_path / "libia.noinit.so"
+    b.write(str(noinit))
+    b2 = lief.parse(str(noinit))
+    assert b2.get(T.INIT) is None and b2.get(T.INIT_ARRAY) is not None
+
+    enc = tmp_path / "libia.enc.so"
+    r = inject_so(str(noinit), str(enc), "arm64-v8a", cipher="chacha20")
+    assert r.strategy == "DT_INIT-inplace"   # NOT a DT_INIT_ARRAY hijack
+
+    lib = ctypes.CDLL(str(enc))
+    lib.sopk_msg.restype = ctypes.c_char_p
+    assert lib.sopk_add(2, 3) == 12
+    # would be 0 (or SIGILL) if the stub didn't decrypt before INIT_ARRAY ran:
+    assert lib.sopk_ran() == 37
+    assert lib.sopk_msg() == b"hello from native"
