@@ -30,7 +30,13 @@ def _read_libs(path: str) -> list[str]:
 
 
 def _cmd_pack(args: argparse.Namespace) -> int:
-    libs = _read_libs(args.libs) if args.libs else args.lib
+    if args.libs:
+        libs = _read_libs(args.libs)
+    else:
+        # --lib is repeatable AND accepts a comma-separated list (like --abi), so
+        # `--lib a.so,b.so`, `--lib a.so --lib b.so`, and a mix all work.
+        libs = [name.strip() for entry in (args.lib or [])
+                for name in entry.split(",") if name.strip()]
     if not libs:
         raise SystemExit("error: provide --libs FILE or one or more --lib NAME")
     abis = tuple(args.abi.split(",")) if args.abi else SUPPORTED_ABIS
@@ -75,7 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
     pk.add_argument("-o", "--output", required=True, help="output APK path")
     g = pk.add_mutually_exclusive_group()
     g.add_argument("--libs", help="text file listing .so to encrypt (one per line)")
-    g.add_argument("--lib", action="append", help="a .so to encrypt (repeatable)")
+    g.add_argument("--lib", action="append",
+                   help="a .so to encrypt; repeatable and/or comma-separated "
+                        "(e.g. --lib libfoo.so,libbar.so)")
     pk.add_argument("--cipher", choices=["chacha20", "xor"], default="chacha20")
     pk.add_argument("--abi", help=f"comma list; default {','.join(SUPPORTED_ABIS)}")
     pk.add_argument("--min-sdk", type=int, default=None,
