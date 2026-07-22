@@ -45,6 +45,13 @@ def _seg_type_load():
         return lief.ELF.SEGMENT_TYPES.LOAD
 
 
+def _seg_type_dynamic():
+    try:
+        return lief.ELF.Segment.TYPE.DYNAMIC
+    except AttributeError:
+        return lief.ELF.SEGMENT_TYPES.DYNAMIC
+
+
 def _seg_flags_rx():
     try:
         F = lief.ELF.Segment.FLAGS
@@ -98,7 +105,7 @@ def _hijack_existing_init(binary, decinfo_rva: int, entry_rva: int):
 
     We deliberately do NOT hijack DT_INIT_ARRAY: on PIC libraries its slots are populated
     by R_*_RELATIVE relocations at load, so a file-level overwrite is reverted by the
-    loader. Libraries with no DT_INIT get one ADDED instead (see _add_dtinit_inplace),
+    loader. Libraries with no DT_INIT get one ADDED instead (see _add_dtinit),
     which bionic invokes before DT_INIT_ARRAY."""
     init = binary.get(_tag("INIT"))
     orig = init.value
@@ -106,8 +113,24 @@ def _hijack_existing_init(binary, decinfo_rva: int, entry_rva: int):
     return FLAG_CHAIN_INIT, orig - decinfo_rva, "DT_INIT-hijack"
 
 
+class _NeedGrow(InjectError):
+    """Internal signal: the library has no usable DT_INIT, its .dynamic terminator slot is
+    unusable, and it has no redundant DT_HASH to repurpose — so the raw post-write add is
+    impossible and the caller must retry, adding DT_INIT via LIEF (which grows .dynamic)."""
+
+
 def inject_so(in_path: str, out_path: str, abi: str,
               cipher: str = "chacha20", log: bool = False) -> InjectResult:
+    try:
+        return _inject_once(in_path, out_path, abi, cipher, log, grow=False)
+    except _NeedGrow:
+        # Last-resort fallback (e.g. a gnu-hash-only x86_64 lib with no usable terminator
+        # slot): re-inject from scratch, adding a real DT_INIT dynamic entry via LIEF.
+        return _inject_once(in_path, out_path, abi, cipher, log, grow=True)
+
+
+def _inject_once(in_path: str, out_path: str, abi: str, cipher: str,
+                 log: bool, grow: bool) -> InjectResult:
     stub: Stub = load_stub(abi)
     cipher_id = CIPHER_IDS[cipher]
 
@@ -140,12 +163,22 @@ def inject_so(in_path: str, out_path: str, abi: str,
     # makes LIEF spill it into a 4 KB-aligned segment that breaks 16 KB loading) and without
     # moving .dynamic to a non-writable segment (which bionic/glibc reject): we overwrite the
     # existing DT_NULL terminator in place, using the zero word that follows as the new
-    # terminator. See _add_dtinit_inplace.
+    # terminator. When that word is a file-backed non-zero value (x86-64's GOT[0]=&_DYNAMIC),
+    # we instead repurpose a redundant DT_HASH entry. See _add_dtinit.
     has_init = (binary.get(_tag("INIT")) is not None
                 and binary.get(_tag("INIT")).value != 0)
     add_dtinit = not has_init
+    if grow and not add_dtinit:
+        raise InjectError("grow fallback requested for a library that already has DT_INIT")
 
-    # --- 2. append stub as a fresh R+X LOAD segment (raw blob; magic present) ---
+    # --- 2a. grow fallback: add the DT_INIT dynamic entry via LIEF FIRST (placeholder
+    #        value), so the stub segment placed next — and thus entry_rva — is computed
+    #        against the already-grown .dynamic. The value is fixed up below (layout-neutral).
+    grow_entry = None
+    if grow:
+        grow_entry = binary.add(lief.ELF.DynamicEntry(_tag("INIT"), 0))
+
+    # --- 2b. append stub as a fresh R+X LOAD segment (raw blob; magic present) ---
     seg = lief.ELF.Segment()
     seg.type = _seg_type_load()
     seg.flags = _seg_flags_rx()
@@ -161,7 +194,13 @@ def inject_so(in_path: str, out_path: str, abi: str,
     entry_rva = seg_rva + stub.entry_off
 
     # --- 3. hijack load-time execution ---
-    if add_dtinit:
+    if grow:
+        # LIEF wrote a real DT_INIT; just point it at the stub (scalar, no relayout).
+        entry_obj = grow_entry if grow_entry is not None else binary.get(_tag("INIT"))
+        entry_obj.value = entry_rva
+        flags, delta_init, strategy = 0, 0, "DT_INIT-grow-dynamic"
+    elif add_dtinit:
+        # strategy is decided post-write by _add_dtinit (inplace vs repurpose-hash)
         flags, delta_init, strategy = 0, 0, "DT_INIT-inplace"
     else:
         flags, delta_init, strategy = _hijack_existing_init(binary, decinfo_rva, entry_rva)
@@ -174,9 +213,11 @@ def inject_so(in_path: str, out_path: str, abi: str,
     binary.write(out_path)
     seg_file_off = int(added.file_offset)
 
-    # --- 5. add-DT_INIT path: overwrite the DT_NULL terminator with DT_INIT in place ---
-    if add_dtinit:
-        _add_dtinit_inplace(out_path, entry_rva)
+    # --- 5. add-DT_INIT path: overwrite the DT_NULL terminator with DT_INIT in place,
+    #        or (x86-64 etc.) repurpose a redundant DT_HASH. Returns the strategy used.
+    #        Raises _NeedGrow when neither works -> inject_so retries with grow=True. ---
+    if add_dtinit and not grow:
+        strategy = _add_dtinit(out_path, entry_rva)
 
     # --- 6. patch decinfo into the output file directly (version-independent) ---
     info = DecInfo(
@@ -189,7 +230,7 @@ def inject_so(in_path: str, out_path: str, abi: str,
     # --- 7. desktop self-verification: turn silent on-device failures into errors ---
     _self_verify(out_path, plain, info, cipher_id, key, nonce,
                  text_rva, entry_rva, seg_rva, seg_file_off + stub.decinfo_off,
-                 found_off, strategy)
+                 found_off, strategy, abi)
 
     return InjectResult(abi=abi, text_rva=text_rva, text_size=text_size,
                         seg_rva=seg_rva, entry_rva=entry_rva,
@@ -197,15 +238,28 @@ def inject_so(in_path: str, out_path: str, abi: str,
 
 
 _DT_NULL, _DT_INIT, _SHT_DYNAMIC, _PT_DYNAMIC, _PT_LOAD = 0, 12, 6, 2, 1
+_DT_HASH, _DT_GNU_HASH = 4, 0x6FFFFEF5   # SysV hash / GNU hash dynamic tags
 
 
-def _add_dtinit_inplace(path: str, entry_rva: int) -> None:
+def _add_dtinit(path: str, entry_rva: int) -> str:
     """Add a DT_INIT to a library that has no init hook, WITHOUT growing/moving
-    .dynamic. We overwrite the existing DT_NULL terminator in place with DT_INIT and
-    rely on the zero bytes that follow (.bss / padding, which read as DT_NULL at
-    runtime) as the new terminator — then formally extend PT_DYNAMIC/.dynamic to
-    include that new terminator so tools agree with the loader. Keeps .dynamic in its
-    original (writable, mapped) segment, so no extra or mis-aligned segment is created.
+    .dynamic, and return the strategy actually used.
+
+    Primary (`DT_INIT-inplace`): overwrite the existing DT_NULL terminator with DT_INIT
+    and rely on the zero word that follows (.bss / padding / zero-filled tail, which
+    reads as DT_NULL at runtime) as the new terminator — then formally extend
+    PT_DYNAMIC/.dynamic to include it so tools agree with the loader.
+
+    Fallback (`DT_INIT-repurpose-hash`): when the word after the terminator is a
+    file-backed non-zero value (e.g. x86-64, whose psABI packs a non-zero
+    `GOT[0] = &_DYNAMIC` right after .dynamic), the terminator slot cannot be reused.
+    Instead repurpose a REDUNDANT `DT_HASH` entry as DT_INIT — valid ONLY when
+    `DT_GNU_HASH` is also present (a gnu-hash-only library is a configuration bionic/glibc
+    load natively; a sysv-hash-only library would be bricked). This leaves the terminator
+    and the entry count untouched, so no PT_DYNAMIC/section resize is needed.
+
+    Either way .dynamic stays in its original (writable, mapped) segment — no extra or
+    mis-aligned segment is created. Raises InjectError when neither strategy applies.
     Class-aware raw ELF little-endian surgery (ELF32 for armeabi-v7a, ELF64 otherwise)."""
     import struct
     with open(path, "r+b") as f:
@@ -286,37 +340,57 @@ def _add_dtinit_inplace(path: str, entry_rva: int) -> None:
             raise InjectError(".dynamic is not inside a PT_LOAD segment")
         c_off, c_filesz, c_memsz = container
         seg_term = new_term_off - c_off
+        slot_usable = True
         if seg_term + DYN <= c_filesz:
-            new_tag = struct.unpack_from(DTAG, buf, new_term_off)[0]
-            if new_tag != _DT_NULL:
-                raise InjectError("slot after .dynamic terminator is file-backed with a "
-                                  "non-DT_NULL tag; cannot add DT_INIT in place")
+            # file-backed: the d_tag word must already read as zero at runtime
+            slot_usable = (struct.unpack_from(DTAG, buf, new_term_off)[0] == _DT_NULL)
         elif seg_term + DYN > ((c_memsz + 0xFFF) & ~0xFFF):
-            raise InjectError("no mapped zero slot after .dynamic for a new terminator")
+            slot_usable = False                 # past the zero-filled mapped tail
         # else: beyond filesz but within the zero-filled mapped tail -> DT_NULL at runtime
 
-        # overwrite DT_NULL -> DT_INIT
-        struct.pack_into(DPACK, buf, dyn_off + term * DYN, _DT_INIT, entry_rva)
+        if slot_usable:
+            # PRIMARY: overwrite DT_NULL -> DT_INIT; the following zero word is the new
+            # terminator. Formally extend PT_DYNAMIC/.dynamic to cover it.
+            struct.pack_into(DPACK, buf, dyn_off + term * DYN, _DT_INIT, entry_rva)
+            new_filesz = (term + 2) * DYN
+            if new_filesz > dyn_filesz:
+                struct.pack_into(W, buf, ph_dyn + P_FILESZ, new_filesz)
+                struct.pack_into(W, buf, ph_dyn + P_MEMSZ, new_filesz)
+            # and the SHT_DYNAMIC section header, so readelf/LIEF agree with the loader
+            for i in range(e_shnum):
+                s = e_shoff + i * e_shentsize
+                if struct.unpack_from("<I", buf, s + 4)[0] == _SHT_DYNAMIC:
+                    if new_filesz > struct.unpack_from(W, buf, s + SH_SIZE)[0]:
+                        struct.pack_into(W, buf, s + SH_SIZE, new_filesz)
+                    break
+            f.seek(0)
+            f.write(buf)
+            return "DT_INIT-inplace"
 
-        # formally extend PT_DYNAMIC to cover the new terminator
-        new_filesz = (term + 2) * DYN
-        if new_filesz > dyn_filesz:
-            struct.pack_into(W, buf, ph_dyn + P_FILESZ, new_filesz)
-            struct.pack_into(W, buf, ph_dyn + P_MEMSZ, new_filesz)
-        # and the SHT_DYNAMIC section header, so readelf/LIEF agree with the loader
-        for i in range(e_shnum):
-            s = e_shoff + i * e_shentsize
-            if struct.unpack_from("<I", buf, s + 4)[0] == _SHT_DYNAMIC:
-                if new_filesz > struct.unpack_from(W, buf, s + SH_SIZE)[0]:
-                    struct.pack_into(W, buf, s + SH_SIZE, new_filesz)
-                break
+        # FALLBACK: terminator slot unusable -> repurpose a redundant DT_HASH (guarded by
+        # DT_GNU_HASH presence). Only the DT_HASH slot's tag/value change; the terminator
+        # and entry count are left as-is, so no PT_DYNAMIC/.dynamic resize is needed.
+        has_gnu_hash = False
+        hash_slot = None
+        for i in range(dyn_filesz // DYN):
+            t = struct.unpack_from(DTAG, buf, dyn_off + i * DYN)[0]
+            if t == _DT_GNU_HASH:
+                has_gnu_hash = True
+            elif t == _DT_HASH:
+                hash_slot = dyn_off + i * DYN
+        if has_gnu_hash and hash_slot is not None:
+            struct.pack_into(DPACK, buf, hash_slot, _DT_INIT, entry_rva)
+            f.seek(0)
+            f.write(buf)
+            return "DT_INIT-repurpose-hash"
 
-        f.seek(0)
-        f.write(buf)
+        raise _NeedGrow(
+            "no usable .dynamic terminator slot after DT_NULL, and no redundant DT_HASH "
+            "to repurpose (requires DT_GNU_HASH present) — retrying with LIEF grow")
 
 
 def _self_verify(path, plain, info, cipher_id, key, nonce, text_rva, entry_rva,
-                 seg_rva, expected_decinfo_off, found_decinfo_off, strategy):
+                 seg_rva, expected_decinfo_off, found_decinfo_off, strategy, abi):
     """Re-parse the output and assert every invariant the runtime stub depends on."""
     # (5) magic scan landed exactly where LIEF placed the segment's decinfo.
     if found_decinfo_off != expected_decinfo_off:
@@ -340,15 +414,22 @@ def _self_verify(path, plain, info, cipher_id, key, nonce, text_rva, entry_rva,
     if dec != plain:
         raise InjectError("round-trip decrypt mismatch (cipher/metadata/write chain)")
 
-    # (3) 16 KB page congruence for EVERY LOAD segment (fails only on 16 KB devices).
+    # (3) 16 KB page congruence for EVERY LOAD segment — but ONLY on arm64-v8a. 16 KB
+    # page-size hardware is arm64-exclusive (Pixel 8+/armv9, Android 15+); those devices
+    # are 64-bit-only and cannot execute armeabi-v7a at all, and no shipping x86_64 device
+    # runs 16 KB pages either. So congruence with the input's pre-existing 4 KB-aligned
+    # LOAD segments (common on 32-bit and some x86_64 libs) is irrelevant off arm64, and
+    # enforcing it there would abort a pack over a device class that can't exist. The
+    # injected segment itself is always SEGMENT_ALIGN-aligned (line 152) on every ABI.
     load_t = _seg_type_load()
-    for s in out.segments:
-        if s.type != load_t:
-            continue
-        if int(s.alignment) % SEGMENT_ALIGN != 0:
-            raise InjectError(f"LOAD seg align {int(s.alignment)} not multiple of {SEGMENT_ALIGN}")
-        if (int(s.virtual_address) - int(s.file_offset)) % SEGMENT_ALIGN != 0:
-            raise InjectError("LOAD seg vaddr/offset not 16 KB-congruent")
+    if abi == "arm64-v8a":
+        for s in out.segments:
+            if s.type != load_t:
+                continue
+            if int(s.alignment) % SEGMENT_ALIGN != 0:
+                raise InjectError(f"LOAD seg align {int(s.alignment)} not multiple of {SEGMENT_ALIGN}")
+            if (int(s.virtual_address) - int(s.file_offset)) % SEGMENT_ALIGN != 0:
+                raise InjectError("LOAD seg vaddr/offset not 16 KB-congruent")
     inj = next((s for s in out.segments
                 if s.type == load_t and int(s.virtual_address) == seg_rva), None)
     if inj is None:
@@ -359,11 +440,32 @@ def _self_verify(path, plain, info, cipher_id, key, nonce, text_rva, entry_rva,
     if not (fl & int(F.R)) or not (fl & int(F.X)) or (fl & int(F.W)):
         raise InjectError(f"injected segment flags not R+X (=0x{fl:x})")
 
+    # (3b) PT_DYNAMIC must stay inside a WRITABLE PT_LOAD. The DT_INIT-grow-dynamic
+    # fallback adds a dynamic entry via LIEF, which — when .dynamic has no trailing slack
+    # (the common real-lib case, e.g. libsurface_util_jni) — RELOCATES .dynamic into a new
+    # segment. bionic rejects a library whose .dynamic is not in a loaded, writable range,
+    # and self-verify's other checks (round-trip, DT_INIT==entry) are blind to this. So
+    # assert containment explicitly. inplace/repurpose leave .dynamic in place -> pass
+    # trivially; this makes a future no-slack lib that LIEF mis-lays fail LOUDLY at pack
+    # time instead of silently on-device.
+    dyn = next((s for s in out.segments if s.type == _seg_type_dynamic()), None)
+    if dyn is not None:
+        dv, dsz = int(dyn.virtual_address), int(dyn.virtual_size)
+        host = next((s for s in out.segments
+                     if s.type == load_t and (int(s.flags) & int(F.W))
+                     and int(s.virtual_address) <= dv
+                     and dv + dsz <= int(s.virtual_address) + int(s.virtual_size)), None)
+        if host is None:
+            raise InjectError(
+                f"PT_DYNAMIC (0x{dv:x}+0x{dsz:x}) is not contained in a writable PT_LOAD "
+                f"after {strategy} — the loader would reject this library")
+
     # (4) the hook actually points at the stub, and no text relocations were introduced.
     if out.get(_tag("TEXTREL")) is not None:
         raise InjectError("output has DT_TEXTREL (text relocations) — must be absent")
-    # Loader-aware hook check. The ONLY strategies we emit are DT_INIT-inplace and
-    # DT_INIT-hijack; both must leave DT_INIT pointing at the stub entry. DT_INIT is the
+    # Loader-aware hook check. The strategies we emit (DT_INIT-hijack, DT_INIT-inplace,
+    # DT_INIT-repurpose-hash, DT_INIT-grow-dynamic) must all leave DT_INIT pointing at the
+    # stub entry. DT_INIT is the
     # FIRST thing soinfo::call_constructors runs (before DT_INIT_ARRAY) and is not subject
     # to relocation, so this is exactly what the loader will call first — unlike a file-slot
     # INIT_ARRAY value, which a load-time R_*_RELATIVE relocation would overwrite.

@@ -249,13 +249,15 @@ general correctness fix: "`INIT_ARRAY` but no `DT_INIT`" is the shape of libflut
 and **most** NDK-built C++ libraries.
 
 **How "add a `DT_INIT` in place" works without breaking 16 KB loading.** The naive way
-— ask LIEF to add a dynamic entry — grows `.dynamic`, which makes LIEF spill it into a
-new 4 KB-aligned segment that breaks 16 KB loading; and repointing `PT_DYNAMIC` into a
-different segment makes bionic/glibc reject the library. Instead
-`_add_dtinit_inplace()` does raw, class-aware (ELF32/ELF64) surgery: it **overwrites
-the existing `DT_NULL` terminator with `DT_INIT`** and relies on the following word
-being a `DT_NULL` at runtime as the new terminator. `.dynamic` stays writable and in
-place; only the 16 KB stub segment is added.
+— ask LIEF to add a dynamic entry — grows `.dynamic`, which (when it has no trailing
+slack) makes LIEF relocate it into a new segment: on older LIEF a 4 KB-aligned one that
+breaks 16 KB loading, and moving `PT_DYNAMIC` risks loaders that reject a `.dynamic`
+outside a writable range. So the **preferred** path, `_add_dtinit()`, does raw,
+class-aware (ELF32/ELF64) surgery: it **overwrites the existing `DT_NULL` terminator with
+`DT_INIT`** and relies on the following word being a `DT_NULL` at runtime as the new
+terminator. `.dynamic` stays writable and in place; only the 16 KB stub segment is added.
+(When even that is impossible, the LIEF-grow path *is* used as a last-resort fallback —
+guarded by a `PT_DYNAMIC`-containment self-verify check; see §5c.)
 
 > **Insight (no-init layout):** whether the slot after the terminator reads as
 > `DT_NULL` at runtime is decided by the containing `PT_LOAD`'s `filesz`/`memsz`
@@ -263,8 +265,60 @@ place; only the 16 KB stub segment is added.
 > non-`SHF_ALLOC` section like `.shstrtab` sitting after `.dynamic` in the file is not
 > loaded. And bionic stops at the first entry whose **`d_tag` word** is zero and
 > ignores its `d_val`, so a follow-slot with `tag=0` but a non-zero value (seen on
-> armv7 libflutter) is a valid terminator. `_add_dtinit_inplace()` checks exactly these
-> runtime conditions and refuses loudly when they don't hold.
+> armv7 libflutter) is a valid terminator. `_add_dtinit()` checks exactly these runtime
+> conditions and, when they don't hold, moves on to the repurpose / grow fallbacks below.
+
+**Why the in-place add is architecture-sensitive — x86_64 is the odd one out.** The
+in-place trick needs the word *immediately after* the `.dynamic` `DT_NULL` terminator to
+read as a `DT_NULL` at runtime. On PIC Android libraries the linker packs `.got` /
+`.got.plt` directly after `.dynamic`, so *that* word is the reserved first GOT slot —
+and whether it is zero is decided by the **per-architecture psABI**, not by anything we
+control:
+
+- **AArch64 (arm64-v8a) and ARM32 (armeabi-v7a):** the psABI leaves the reserved GOT[0]
+  entry **zero in the file**; the dynamic loader fills it at runtime. So the slot after
+  the terminator reads `0` → a valid new `DT_NULL`. In-place add works.
+- **x86-64 (and i386):** the System V x86 psABI **mandates `GOT[0] = &_DYNAMIC`** (the
+  first `.got.plt` word holds the address of the `.dynamic` section). The static linker
+  writes this **non-zero, non-relocated** value at link time — it is not a load-time
+  `R_*_RELATIVE` slot, so the loader never clears it. The word after the terminator is
+  reliably non-zero → **cannot** serve as a `DT_NULL`, so the in-place add is impossible
+  and `_add_dtinit()` moves on to a fallback.
+
+This is not a property of a particular library; it is inherent to the x86 GOT ABI.
+Concretely, the same `libloadTA.so` (no usable `DT_INIT`) packs cleanly on arm64-v8a and
+armeabi-v7a but needs a fallback on x86_64 — the slot after its terminator is `0x0` on
+both ARM targets and `&_DYNAMIC` (`0x4d18`) on x86_64. Any x86-family library whose
+`.got.plt` follows `.dynamic` and that lacks a usable `DT_INIT` hits this wall.
+
+**Two fallbacks — the full add-`DT_INIT` decision chain.** `_add_dtinit()` (raw
+post-write surgery) and a LIEF grow retry together give three add strategies, tried in
+order of least disruption:
+
+1. **`DT_INIT-inplace`** — the terminator slot is a runtime `DT_NULL`: overwrite the
+   terminator, use the following zero word as the new terminator. (ARM libs, and x86_64
+   libs whose slot happens to be zero.)
+2. **`DT_INIT-repurpose-hash`** — the slot is unusable but the lib has **both** `DT_HASH`
+   and `DT_GNU_HASH`: overwrite the redundant `DT_HASH` entry's tag/value with
+   `DT_INIT`, leaving the terminator and entry count untouched. Guarded on `DT_GNU_HASH`
+   presence — a GNU-hash-only lib is a configuration bionic/glibc load natively, but a
+   *SysV-hash-only* lib would be bricked, so that case is **not** repurposed (it falls to
+   grow). No `PT_DYNAMIC`/section resize.
+3. **`DT_INIT-grow-dynamic`** — slot unusable *and* no redundant `DT_HASH` (a
+   GNU-hash-only or SysV-hash-only lib): `_add_dtinit()` raises the internal `_NeedGrow`
+   signal and `inject_so` re-injects, adding a **real `DT_INIT` dynamic entry via LIEF**
+   (added *before* the stub segment so `entry_rva` is computed against the grown
+   `.dynamic`; its value is then fixed up, layout-neutrally). Note: an older LIEF spilled
+   a grown `.dynamic` into a fresh 4 KB-aligned segment / repointed `PT_DYNAMIC` and some
+   loaders rejected the result; on LIEF ≥ 1.0 the entry lands in `.dynamic`'s existing
+   slack with `PT_DYNAMIC` unmoved, and glibc loads it — **verified by dlopen on the host;
+   x86_64 bionic still needs on-device confirmation** (the mechanism is validated, the
+   Android policy path is not). A grown `.dynamic` staying 4 KB-aligned would only matter
+   on 16 KB devices, which are arm64-only (§2d), and this fallback only runs off arm64.
+
+Because 16 KB page hardware is arm64-only, x86_64 (and armeabi-v7a) also skip the
+per-segment 16 KB-congruence assertion in `_self_verify` — only `arm64-v8a` output is
+required to be 16 KB-clean.
 
 ### 5d. Patch the metadata and self-verify
 
@@ -275,7 +329,11 @@ emits a file:
 
 - round-trip: decrypting the output `.text` reproduces the original plaintext;
 - `.text` vaddr is unchanged (so `delta_text` is valid);
-- every `PT_LOAD` is 16 KB congruent, and the injected segment is `R+X`;
+- every `PT_LOAD` is 16 KB congruent **(asserted on `arm64-v8a` only** — 16 KB page
+  hardware is arm64-exclusive; see §2d, §5c), and the injected segment is `R+X`;
+- `PT_DYNAMIC` is contained in a **writable** `PT_LOAD` — the `DT_INIT-grow-dynamic`
+  fallback can make LIEF relocate `.dynamic`, and bionic rejects a `.dynamic` outside a
+  loaded writable range (a failure the round-trip / `DT_INIT` checks are blind to);
 - no `DT_TEXTREL`;
 - **loader-aware hook check:** the strategy is a `DT_INIT-*` one and `DT_INIT` actually
   points at the stub entry — i.e. what the loader will call *first*, not a file-slot
@@ -352,6 +410,16 @@ is the final confirmation.
 - **Per-library fragility.** Section-stripped libraries or exotic init code are refused
   loudly rather than silently corrupted. LIEF-rebuilt ELFs occasionally trip strict
   loaders, so a real `dlopen`/on-device check is always warranted.
+- **x86_64 libraries with no usable `DT_INIT`.** The in-place `DT_INIT` add requires a
+  zero word after the `.dynamic` terminator; the x86 psABI's `GOT[0] = &_DYNAMIC` denies
+  it (§5c). These are now handled by two fallbacks — `DT_INIT-repurpose-hash` (redundant
+  `DT_HASH`, guarded on `DT_GNU_HASH`) and `DT_INIT-grow-dynamic` (real `DT_INIT` added
+  via LIEF). Verification levels differ: `grow-dynamic` is **run** under host glibc (dlopen
+  + call, including a forced `PT_DYNAMIC`-spill case); `repurpose-hash` is verified
+  statically (strategy + self-verify) and by **analogy** to the grow dlopen (both yield an
+  effectively gnu-hash-only `.dynamic`) — its own test can't dlopen because the forced
+  unusable-slot sentinel corrupts the image. Neither is exercised on an Android x86_64
+  **bionic** emulator; do that before shipping x86_64 output.
 - **Encrypting stock engine libraries is usually not worth it.** `libflutter.so`, for
   example, is the public, byte-identical Flutter engine — encrypting it protects
   nothing proprietary while adding load-time cost and fragility. Encrypt the library

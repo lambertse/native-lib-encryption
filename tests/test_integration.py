@@ -156,3 +156,110 @@ def test_init_array_no_dtinit_adds_dtinit_not_array_hijack(tmp_path):
     # would be 0 (or SIGILL) if the stub didn't decrypt before INIT_ARRAY ran:
     assert lib.sopk_ran() == 37
     assert lib.sopk_msg() == b"hello from native"
+
+
+# --- fallbacks for libraries with no usable DT_INIT terminator slot -------------------
+# On x86-64 the psABI packs a non-zero GOT[0]=&_DYNAMIC right after .dynamic, so the word
+# after the DT_NULL terminator is not a usable new terminator and the plain in-place add
+# fails. Two fallbacks cover this: repurpose a redundant DT_HASH (Tier 1) or add a real
+# DT_INIT via LIEF, growing .dynamic (Tier 2). aarch64 fixtures put a zero word there, so
+# we force the unusable-slot condition to exercise the Tier 1 decision deterministically.
+
+_NOINIT_SRC = (
+    'static const char msg[] = "hello fallback";\n'
+    "int sopk_add(int a,int b){return a+b+7;}\n"
+    "const char *sopk_msg(void){return msg;}\n"
+)
+
+
+def _compile_noinit(tmp_path, hash_style):
+    plain = tmp_path / f"libni_{hash_style}.so"
+    (tmp_path / "t.c").write_text(_NOINIT_SRC)
+    subprocess.run(["clang", "-shared", "-fPIC", "-O2", "-nostartfiles",
+                    f"-Wl,--hash-style={hash_style}", "-o", str(plain),
+                    str(tmp_path / "t.c")], check=True)
+    return plain
+
+
+def _stage_with_unusable_slot(plain, out, abi, sentinel=0x1122):
+    """Add the stub segment (as inject does), write, then force the word after the
+    .dynamic DT_NULL terminator to a non-zero value — reproducing x86-64's GOT[0] so the
+    in-place terminator reuse is impossible. Returns entry_rva for _add_dtinit()."""
+    import struct
+    import lief
+    import sopack.elf_inject as ei
+
+    b = lief.parse(str(plain))
+    stub = ei.load_stub(abi)
+    seg = lief.ELF.Segment()
+    seg.type = ei._seg_type_load()
+    seg.flags = ei._seg_flags_rx()
+    seg.alignment = ei.SEGMENT_ALIGN
+    seg.content = list(stub.blob)
+    added = b.add(seg)
+    entry_rva = int(added.virtual_address) + stub.entry_off
+    b.write(str(out))
+
+    buf = bytearray(out.read_bytes())
+    phoff = struct.unpack_from("<Q", buf, 0x20)[0]
+    phnum = struct.unpack_from("<H", buf, 0x38)[0]
+    phent = struct.unpack_from("<H", buf, 0x36)[0]
+    doff = dfsz = None
+    for i in range(phnum):
+        p = phoff + i * phent
+        if struct.unpack_from("<I", buf, p)[0] == 2:      # PT_DYNAMIC
+            doff = struct.unpack_from("<Q", buf, p + 8)[0]
+            dfsz = struct.unpack_from("<Q", buf, p + 32)[0]
+    for i in range(dfsz // 16):
+        if struct.unpack_from("<q", buf, doff + i * 16)[0] == 0:   # DT_NULL
+            struct.pack_into("<q", buf, doff + (i + 1) * 16, sentinel)
+            break
+    out.write_bytes(buf)
+    return entry_rva
+
+
+def test_repurpose_hash_when_slot_unusable(tmp_path):
+    """Terminator slot unusable + both DT_HASH and DT_GNU_HASH present -> the redundant
+    DT_HASH is repurposed as DT_INIT (pointing at the stub), terminator left intact."""
+    import lief
+    from sopack.elf_inject import _add_dtinit
+
+    plain = _compile_noinit(tmp_path, "both")
+    staged = tmp_path / "staged_both.so"
+    entry_rva = _stage_with_unusable_slot(plain, staged, "arm64-v8a")
+
+    assert _add_dtinit(str(staged), entry_rva) == "DT_INIT-repurpose-hash"
+    out = lief.parse(str(staged))
+    init = out.get(lief.ELF.DynamicEntry.TAG.INIT)
+    assert init is not None and int(init.value) == entry_rva
+    # a redundant DT_HASH was consumed; DT_GNU_HASH remains for symbol resolution
+    assert out.get(lief.ELF.DynamicEntry.TAG.GNU_HASH) is not None
+
+
+def test_repurpose_guard_refuses_without_gnu_hash(tmp_path):
+    """A sysv-hash-only (no DT_GNU_HASH) lib must NOT have its only hash repurposed — that
+    would brick symbol resolution. _add_dtinit signals _NeedGrow so inject_so falls back."""
+    from sopack.elf_inject import _add_dtinit, _NeedGrow
+
+    plain = _compile_noinit(tmp_path, "sysv")
+    staged = tmp_path / "staged_sysv.so"
+    entry_rva = _stage_with_unusable_slot(plain, staged, "arm64-v8a")
+    with pytest.raises(_NeedGrow):
+        _add_dtinit(str(staged), entry_rva)
+
+
+def test_grow_dynamic_fallback_runs(tmp_path):
+    """Last-resort Tier 2: a no-init, gnu-hash-only lib (no terminator slot, no redundant
+    DT_HASH) gets a real DT_INIT added via LIEF (growing .dynamic). The grow path must
+    produce a loadable library whose stub decrypts .text before the added DT_INIT returns."""
+    from sopack.elf_inject import _inject_once
+
+    plain = _compile_noinit(tmp_path, "gnu")
+    enc = tmp_path / "libni_gnu.enc.so"
+    r = _inject_once(str(plain), str(enc), "arm64-v8a", "chacha20", False, grow=True)
+    assert r.strategy == "DT_INIT-grow-dynamic"
+
+    lib = ctypes.CDLL(str(enc))
+    lib.sopk_msg.restype = ctypes.c_char_p
+    assert lib.sopk_add(2, 3) == 12
+    assert lib.sopk_msg() == b"hello fallback"
