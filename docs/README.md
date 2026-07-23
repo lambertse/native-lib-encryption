@@ -6,6 +6,9 @@
   that shape the design, the three components (runtime stub, ELF injector, APK
   repackager), the reasoning and the hard-won insights behind each decision, and how it
   was built and validated.
+- **[static-analysis-hardening.md](./static-analysis-hardening.md)** — every technique
+  used to make static analysis of a packed `.so` harder (metadata whitening, string hygiene;
+  and why section-header stripping was rejected), with the code and the honest limits.
 - **[troubleshooting.md](./troubleshooting.md)** — concrete failure modes (SIGILL at
   load, missing logcat line, signing/tamper issues, toolchain errors) with causes and
   fixes.

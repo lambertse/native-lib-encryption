@@ -4,9 +4,23 @@
  * for byte. Keep it packed, little-endian, and fixed-size.
  *
  * The struct is emitted into the stub blob (section .sopk_info) with `magic`
- * pre-set. After the injector appends the stub blob to the target .so, it locates
- * this struct by scanning for `magic` and overwrites the data fields (deltas, key,
- * nonce, sizes). The stub reads it PC-relatively at runtime — see stub.c.
+ * pre-set. After the injector appends the stub blob to the target .so, it overwrites
+ * the data fields (deltas, key, nonce, sizes) at the KNOWN blob offset (no magic scan)
+ * and then WHITENS the whole 128-byte record — see the whitening note below. The stub
+ * reads it PC-relatively at runtime — see stub.c.
+ *
+ * At-rest whitening (v2, anti-static-analysis). The shipped record is XOR-masked with a
+ * ChaCha20 keystream whose key is a checksum the stub computes over ITS OWN code bytes
+ * at load (the span [sopk_entry, g_decinfo); mirrored in sopack/cipher.py ⇄
+ * stub/stub_cipher.h). Consequences: (1) the constant `magic` never appears in the
+ * shipped file, so the old "grep SOPK, read the 128-byte struct, lift the key" attack
+ * finds nothing; (2) key/nonce/sizes are noise until an analyst reproduces the
+ * checksum+keystream derivation by reversing the stub. `magic`/`version` reappear only
+ * after a correct de-whiten, so they double as an integrity sentinel: a tampered stub
+ * (or an unpatched blob) de-whitens to garbage, the magic check fails, and the stub
+ * fails open (chains the original init) instead of running still-encrypted code.
+ * This is obfuscation, not cryptographic protection — the stub ships identical in every
+ * packed app, so reversing it once yields a universal offline unpacker for that version.
  *
  * Key trick: we never need the host library's load bias. Everything the stub must
  * reach (.text, original init) is expressed as a byte delta FROM THE ADDRESS OF
@@ -19,11 +33,18 @@
 #include <stdint.h>
 
 #define SOPK_MAGIC   0x4B504F53u   /* "SOPK" little-endian */
-#define SOPK_VERSION 1u
+#define SOPK_VERSION 2u            /* v2: record is whitened at rest (see below) */
 
 /* cipher_id values */
 #define SOPK_CIPHER_XOR      0u
 #define SOPK_CIPHER_CHACHA20 1u
+
+/* Whitening span: number of stub code/rodata bytes IMMEDIATELY BEFORE g_decinfo that the
+ * self-checksum (which derives the de-whitening key) covers. Anchored on &g_decinfo only
+ * (a data symbol the compiler reaches PC-relatively; a function symbol like &sopk_entry
+ * emits an unresolved arm64 relocation). Every stub blob is far larger than this, and the
+ * injector never rewrites these bytes. MUST match WHITEN_SPAN in sopack/cipher.py. */
+#define SOPK_WHITEN_SPAN 1024u
 
 /* flags bits */
 #define SOPK_FLAG_CHAIN_INIT  (1u << 0)  /* delta_init valid: tail-call original init */

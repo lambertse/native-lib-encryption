@@ -6,7 +6,7 @@ import struct
 from dataclasses import dataclass, field
 
 MAGIC = 0x4B504F53  # "SOPK" little-endian
-VERSION = 1
+VERSION = 2         # v2: record whitened at rest (see stub/decinfo.h)
 
 # flags
 FLAG_CHAIN_INIT = 1 << 0

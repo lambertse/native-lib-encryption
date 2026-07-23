@@ -80,21 +80,37 @@ void sopk_entry(int argc, char **argv, char **envp) {
     volatile sopk_decinfo *src = &g_decinfo;
     uintptr_t self = (uintptr_t)src;
 
-    uint32_t magic     = src->magic;
-    uint64_t text_size = src->text_size;
-    uint32_t cipher_id = src->cipher_id;
-    uint32_t flags     = src->flags;
-    int64_t  delta_text = src->delta_text;
-    int64_t  delta_init = src->delta_init;
+    /* De-whiten the record first. The shipped 128 bytes are XOR-masked with a keystream
+     * keyed by a checksum over our OWN code — the span [sopk_entry, g_decinfo), which the
+     * injector never rewrites. So the magic/key/etc. never appear in the file; they only
+     * reappear here after a correct de-whiten. A tampered stub checksums differently ->
+     * garbage de-whiten -> the magic gate below fails -> fail open. Copy the raw bytes out
+     * of the volatile record byte-by-byte, then de-whiten in a non-volatile local. */
+    uint8_t raw[sizeof(sopk_decinfo)];
+    const volatile uint8_t *rp = (const volatile uint8_t *)src;
+    for (size_t i = 0; i < sizeof(raw); i++) raw[i] = rp[i];
+
+    const uint8_t *span = (const uint8_t *)src - SOPK_WHITEN_SPAN;  /* code/rodata window */
+    uint8_t wkey[32];
+    sopk_whiten_key(span, SOPK_WHITEN_SPAN, wkey);
+    sopk_chacha20_apply(raw, sizeof(raw), wkey, SOPK_WHITEN_NONCE);
+
+    const sopk_decinfo *di = (const sopk_decinfo *)raw;
+    uint32_t magic     = di->magic;
+    uint64_t text_size = di->text_size;
+    uint32_t cipher_id = di->cipher_id;
+    uint32_t flags     = di->flags;
+    int64_t  delta_text = di->delta_text;
+    int64_t  delta_init = di->delta_init;
     uint8_t  key[32], nonce[16];
-    for (int i = 0; i < 32; i++) key[i] = src->key[i];
-    for (int i = 0; i < 16; i++) nonce[i] = src->nonce[i];
+    for (int i = 0; i < 32; i++) key[i] = di->key[i];
+    for (int i = 0; i < 16; i++) nonce[i] = di->nonce[i];
 
     int dolog = (flags & SOPK_FLAG_LOG) != 0;
     sopk_dbg("[sopk] A:entry\n");
-    if (dolog) sopk_logcat("sopack", "A:entry");
+    if (dolog) sopk_logcat("A:entry");
     if (magic != SOPK_MAGIC || text_size == 0) {
-        if (dolog) sopk_logv("sopack", "A:not-patched magic=", magic);
+        if (dolog) sopk_logv("A:not-patched magic=", magic);
         goto chain;                                       /* not patched — just chain */
     }
 
@@ -105,18 +121,18 @@ void sopk_entry(int argc, char **argv, char **envp) {
     uintptr_t win_lo = sopk_align_down(text, pg);
     uintptr_t win_hi = sopk_align_up(text + tlen, pg);
     size_t    win_len = win_hi - win_lo;
-    if (dolog) { sopk_logv("sopack", "B:pg=", pg);
-                 sopk_logv("sopack", "B:text=", text);
-                 sopk_logv("sopack", "B:len=", tlen); }
+    if (dolog) { sopk_logv("B:pg=", pg);
+                 sopk_logv("B:text=", text);
+                 sopk_logv("B:len=", tlen); }
 
     /* 1. anon RW scratch */
     sopk_dbg("[sopk] B:mmap\n");
     void *scratch = sopk_mmap_anon(win_len);
     if (sopk_is_err(scratch)) {
-        if (dolog) sopk_logv("sopack", "C:mmap FAILED ret=", (unsigned long)scratch);
+        if (dolog) sopk_logv("C:mmap FAILED ret=", (unsigned long)scratch);
         goto chain;                                       /* fail open: leave as-is */
     }
-    if (dolog) sopk_logv("sopack", "C:mmap ok=", (unsigned long)scratch);
+    if (dolog) sopk_logv("C:mmap ok=", (unsigned long)scratch);
 
     /* 2. copy the page window verbatim (encrypted .text + any plaintext neighbors) */
     sopk_dbg("[sopk] C:memcpy\n");
@@ -126,39 +142,39 @@ void sopk_entry(int argc, char **argv, char **envp) {
     sopk_dbg("[sopk] D:decrypt\n");
     uint8_t *text_in_scratch = (uint8_t *)scratch + (text - win_lo);
     sopk_decrypt(text_in_scratch, tlen, cipher_id, key, nonce);
-    if (dolog) sopk_logv("sopack", "D:decrypt done first8=",
+    if (dolog) sopk_logv("D:decrypt done first8=",
                          *(unsigned long *)text_in_scratch);
 
     /* 4. move decrypted pages onto the ORIGINAL .text VA (anon dest => execmem path) */
     sopk_dbg("[sopk] E:mremap\n");
     void *placed = sopk_mremap_fixed(scratch, win_len, (void *)win_lo);
     if (sopk_is_err(placed)) {
-        if (dolog) sopk_logv("sopack", "E:mremap FAILED ret=", (unsigned long)placed);
+        if (dolog) sopk_logv("E:mremap FAILED ret=", (unsigned long)placed);
         /* Fallback: unmap the file-backed .text window and map fresh anon pages at the
          * same VA, then copy the decrypted window in. Same execmem result via a
          * different kernel path (some devices reject MREMAP_FIXED over a file map). */
         sopk_munmap((void *)win_lo, win_len);
         void *fx = sopk_mmap_fixed_anon((void *)win_lo, win_len);
         if (sopk_is_err(fx)) {
-            if (dolog) sopk_logv("sopack", "E2:mmap-fixed FAILED ret=", (unsigned long)fx);
+            if (dolog) sopk_logv("E2:mmap-fixed FAILED ret=", (unsigned long)fx);
             goto chain;
         }
         sopk_memcpy((void *)win_lo, scratch, win_len);
         sopk_munmap(scratch, win_len);
-        if (dolog) sopk_logv("sopack", "E2:mmap-fixed fallback ok=", (unsigned long)fx);
+        if (dolog) sopk_logv("E2:mmap-fixed fallback ok=", (unsigned long)fx);
     } else if (dolog) {
-        sopk_logv("sopack", "E:mremap ok=", (unsigned long)placed);
+        sopk_logv("E:mremap ok=", (unsigned long)placed);
     }
 
     /* 5. RW -> R-X, then flush I-cache before anything executes there */
     sopk_dbg("[sopk] F:mprotect\n");
     int mp = sopk_mprotect((void *)win_lo, win_len, SOPK_PROT_READ | SOPK_PROT_EXEC);
-    if (dolog && mp != 0) sopk_logv("sopack", "F:mprotect FAILED ret=", (unsigned long)(long)mp);
+    if (dolog && mp != 0) sopk_logv("F:mprotect FAILED ret=", (unsigned long)(long)mp);
     sopk_dbg("[sopk] G:flush\n");
     sopk_clear_icache((void *)text, (void *)(text + tlen));
     sopk_dbg("[sopk] H:done\n");
 
-    if (dolog) sopk_logcat("sopack", "H:native .text decrypted OK");
+    if (dolog) sopk_logcat("H:native .text decrypted OK");
 
 chain:
     if (flags & SOPK_FLAG_CHAIN_INIT) {

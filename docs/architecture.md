@@ -28,11 +28,15 @@ Legu. The techniques (encrypt `.text`, inject an executable segment, hijack the
 library's init hook, decrypt at load) are established, but every step is constrained
 by how modern Android actually loads and protects code. Those constraints are next.
 
-> **Security posture, stated up front.** The decryption key ships inside the binary,
-> and after decryption the plaintext lives in a readable `R-X` mapping. Anyone with
-> Frida or a `/proc/self/maps` dump recovers everything. This is **anti-static-analysis
-> obfuscation, not cryptographic protection.** Re-signing also gives the APK a **new
-> signing identity** (see §6).
+> **Security posture, stated up front.** The decryption key ships inside the binary
+> (whitened at rest — §9 — not in plaintext), and after decryption the plaintext lives in
+> a readable `R-X` mapping. Anyone with Frida or a `/proc/self/maps` dump recovers
+> everything. This is **anti-static-analysis obfuscation, not cryptographic protection.**
+> The stub ships **byte-identical in every packed app** and contains the whole
+> de-obfuscation recipe, so an analyst reverses it **once** and has a universal offline
+> unpacker for that version — the hardening in §9 raises the *cost* of that one-time
+> reverse (grep-and-decrypt → a real RE session); it does not remove the ceiling.
+> Re-signing also gives the APK a **new signing identity** (see §6).
 
 ---
 
@@ -268,12 +272,15 @@ place; only the 16 KB stub segment is added.
 
 ### 5d. Patch the metadata and self-verify
 
-The injector writes the finalized `sopk_decinfo` (deltas, key, nonce, sizes, flags)
-into the blob by scanning for the magic, then runs `_self_verify()`, which re-parses
-the output and asserts **every invariant the runtime depends on** before the tool
+The injector writes the finalized `sopk_decinfo` (deltas, key, nonce, sizes, flags) at
+its **known blob offset** (`seg_file_off + decinfo_off`) — after asserting the placeholder
+magic is there — then **whitens** it in place (§9b). It then runs `_self_verify()`, which
+re-parses the output and asserts **every invariant the runtime depends on** before the tool
 emits a file:
 
 - round-trip: decrypting the output `.text` reproduces the original plaintext;
+- whitening round-trip: de-whitening the shipped 128 bytes reproduces the packed record,
+  and the `SOPK` magic needle appears **nowhere** in the output;
 - `.text` vaddr is unchanged (so `delta_text` is valid);
 - every `PT_LOAD` is 16 KB congruent, and the injected segment is `R+X`;
 - no `DT_TEXTREL`;
@@ -337,13 +344,17 @@ packed and verified end-to-end.
 **What still requires your hardware:** the on-device Android SELinux `execmem`
 behavior. The container validates everything except Android's SELinux policy; a real
 device (watch `adb logcat` for `avc` denials and the optional `sopack` decrypt line)
-is the final confirmation.
+is the final confirmation. Also note: the aarch64 `dlopen` test cross-checks the
+Python↔C whitening mirror (§9b) only for **arm64**; the armv7/x86_64 whitening is locked
+only by the Python-side KAT (identical integer arithmetic, so low risk, but never run
+against the C stub) — confirm those ABIs on device or under qemu-user.
 
 ---
 
 ## 8. Boundaries and limitations
 
-- **Obfuscation only.** The key ships in the binary; plaintext is readable at runtime.
+- **Obfuscation only.** The key ships in the binary (whitened — §9); plaintext is readable
+  at runtime.
 - **New signing identity.** No update-install over the original; signature-pinned apps
   will notice.
 - **Decrypt happens at `DT_INIT`**, i.e. after relocation but before `DT_INIT_ARRAY`.
@@ -359,7 +370,100 @@ is the final confirmation.
 
 ---
 
-## 9. File map
+## 9. Anti-static-analysis hardening
+
+The default posture is obfuscation (§1). Three measures raise the bar for a **static**
+analyst — someone reading the APK without running it — while keeping the freestanding /
+prebuilt-blob / 128-byte-contract architecture intact.
+
+### 9a. Why the old layout was trivial to defeat
+
+The v1 record was a fixed 128-byte `sopk_decinfo` beginning with the constant magic
+`SOPK` (`0x4B504F53`). Extraction was: grep the file for the magic, read the struct at
+that offset, lift `key[32]` / `nonce[16]` / `cipher_id`, and — from `delta_text` /
+`text_size` — learn exactly where `.text` is and how big. A ~10-line offline script then
+decrypts `.text` without ever running the app. The magic and the plaintext key were two
+crown-jewel signposts.
+
+### 9b. Whitening the metadata record (the primary measure)
+
+The 128-byte contract is unchanged; only its **at-rest representation** changes. The whole
+record is XOR-masked with a ChaCha20 keystream whose **key is a checksum the stub computes
+over its own code bytes** at load. No new secret is stored anywhere — the derivation lives
+in the (freestanding) stub.
+
+- **Span.** `sopk_whiten_key` (FNV-1a-64 folded through splitmix64 to 32 bytes, so every key
+  byte depends on every span byte) runs over the `SOPK_WHITEN_SPAN` (1024) bytes immediately
+  **before** `g_decinfo` — real code/rodata the injector never rewrites. The span is
+  anchored on `&g_decinfo` alone; anchoring on a function symbol (`&sopk_entry`) emits an
+  unresolved arm64 relocation that the build guard rejects. Mirrored in `sopack/cipher.py` ⇄
+  `stub/stub_cipher.h`; the fixed nonce is `SOPK_WHITEN_NONCE`.
+- **Pack time** (`elf_inject.py`): patch decinfo at its **known** blob offset
+  (`seg_file_off + decinfo_off`, the value `_self_verify` already trusts) — the magic scan
+  is gone — then `whiten()` the 128 bytes in place. `_self_verify` de-whitens the shipped
+  bytes back to the packed record and asserts the magic needle appears **nowhere** in the
+  output.
+- **Load time** (`stub.c`): copy the volatile record to a local, `sopk_whiten_key` over the
+  span, `sopk_chacha20_apply` to de-whiten, then the existing `magic == SOPK && text_size != 0`
+  gate runs on the de-whitened locals. **The magic/version are a post-de-whiten sentinel** —
+  present only after a correct derivation, never in the file. A tampered stub checksums
+  differently → garbage de-whiten → magic mismatch → **fail open** (chain the original init),
+  the same safe degradation as an unpatched blob. (Anti-tamper is a free side effect, not the
+  goal — a dynamic analyst never patches the stub, they dump decrypted `.text` from memory.)
+
+What this buys: the grep-magic-read-key attack finds nothing; recovering the key now
+requires reproducing the checksum-and-keystream derivation, i.e. reversing the stub.
+
+### 9c. Section-header stripping — researched, rejected on Android 14+, removed
+
+Whitening hides the key but **not** where `.text` is — the ELF **section header** still
+gives its name, offset and size, so a pass to detach the section table was implemented and
+tested. **Two on-device tests (Android 16 / target_sdk 36) killed it:** (1) zeroing
+`e_shoff`/`e_shnum`/`e_shstrndx` → `linker: "...libapp.so" has invalid e_shstrndx`; (2) after
+keeping `e_shstrndx` and zeroing only `e_shoff`/`e_shnum` → `linker: "...has no section
+headers"` (bionic `ReadSectionHeaders` rejects `e_shnum == 0`). Both → lib never loads →
+Flutter `SIGSEGV`. glibc `dlopen` on the host passed both, so host tests can't catch this.
+**Conclusion:** bionic (Android 14+) requires a section header table to exist; detaching it
+is not viable, so the feature was **removed**. It was also marginal: once whitening holds,
+`.text`'s location (derivable from the un-strippable program headers + `PT_DYNAMIC`/`.dynsym`)
+gives an analyst nothing. See [`static-analysis-hardening.md`](./static-analysis-hardening.md)
+§Method 3.
+
+### 9d. String hygiene
+
+The logcat **tag** `"sopack"` is the one constant that would name the packer in a `strings`
+dump (which scans raw bytes, section table or not). It is stored XOR-obfuscated in
+`stub_log.h` and decoded on-stack, so the name never appears in a packed lib. The staged
+`--log` debug labels (`A:entry`, …) remain in cleartext — they are generic markers, only
+emitted under `--log`, and not a reliable packer fingerprint; fuller message obfuscation is
+a straightforward extension of the same helper.
+
+### 9e. The ceiling, and two ways to break it (not the default)
+
+Everything above lives in the "prebuilt blob + clean architecture" envelope, which shares
+one hard limit: the stub is identical across every packed app and holds the *complete*
+recipe, so **reverse it once, unpack every app** at that version. Two options break that
+ceiling but leave the clean envelope:
+
+- **Polymorphic per-pack stub.** Compile a *different* stub per pack (randomized whitening
+  constants / checksum seed, instruction scheduling, junk / opaque predicates) so reversing
+  one app does not crack the others. This is the only in-binary way to break the ceiling.
+  **Cost:** needs the `build_stubs.sh` toolchain (clang+lld+llvm) **at pack time**, not just
+  the shipped blob — it breaks the prebuilt-blob model, slows packs, and must re-run the
+  no-reloc/no-`adrp` guards per pack. (Per-pack *data* randomization — a random whitening
+  salt, junk in `reserved` — is cheap but does **not** break the ceiling; the logic is still
+  identical across apps.)
+- **External / server-derived key.** Keep the key out of the `.so`: store a `key_id` + salt,
+  have the app derive the key (PBKDF2 from a **server** secret or user credential) and write
+  it to `/data/user/<userId>/<pkg>/files/.sopk_<key_id>` before `System.loadLibrary`; the
+  stub reads it via raw `openat`/`read` and fails open if absent. **Static resistance is real
+  only if the secret is out-of-band** (server/user) — an embedded secret is still in the
+  APK's dex, so no gain. **Cost:** a whole app-integration surface (new CLI flags, a keyfile
+  reader, a `.keys.json` manifest, reference integration code); not "clean". Composes with
+  whitening. (This is the "external-key mode" that earlier docs described but the repo never
+  shipped.)
+
+## 10. File map
 
 ```
 sopack/               the tool (Python)

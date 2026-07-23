@@ -86,3 +86,46 @@ def gen_key_nonce() -> tuple[bytes, bytes]:
     key = os.urandom(32)
     nonce16 = os.urandom(12) + b"\x00\x00\x00\x00"
     return key, nonce16
+
+
+# ---- decinfo whitening (at-rest obfuscation) --------------------------------------
+# The 128-byte decinfo record is XOR-masked with a ChaCha20 keystream whose KEY is a
+# checksum over the stub's own code bytes (the span blob[entry_off:decinfo_off]). This
+# MUST match stub/stub_cipher.h (sopk_whiten_key + SOPK_WHITEN_NONCE) byte for byte: the
+# desktop side whitens, the injected stub recomputes the same key from its own code and
+# de-whitens. See stub/decinfo.h for the rationale.
+_MASK64 = 0xFFFFFFFFFFFFFFFF
+
+# Number of stub bytes immediately before g_decinfo that the self-checksum covers.
+# Mirror of SOPK_WHITEN_SPAN in stub/decinfo.h.
+WHITEN_SPAN = 1024
+
+# Fixed 16-byte ChaCha nonce block for whitening (mirror of SOPK_WHITEN_NONCE).
+WHITEN_NONCE = bytes([
+    0x9e, 0x37, 0x79, 0xb9, 0x7f, 0x4a, 0x7c, 0x15,
+    0xf1, 0x35, 0x7a, 0xed, 0x03, 0x9d, 0x2c, 0x1a,
+])
+
+
+def whiten_key(span: bytes) -> bytes:
+    """32-byte whitening key = FNV-1a-64 over `span`, splitmix64-expanded to 32 bytes so
+    every output byte depends on every input byte (mirror of C sopk_whiten_key)."""
+    h = 0xcbf29ce484222325                       # FNV-1a-64 offset basis
+    for b in span:
+        h = ((h ^ b) * 0x00000100000001b3) & _MASK64   # FNV prime
+    out = bytearray()
+    s = h
+    for _ in range(4):                           # splitmix64 -> 32 bytes
+        s = (s + 0x9e3779b97f4a7c15) & _MASK64
+        z = s
+        z = ((z ^ (z >> 30)) * 0xbf58476d1ce4e5b9) & _MASK64
+        z = ((z ^ (z >> 27)) * 0x94d049bb133111eb) & _MASK64
+        z = z ^ (z >> 31)
+        out += struct.pack("<Q", z & _MASK64)
+    return bytes(out)
+
+
+def whiten(record: bytes, span: bytes) -> bytes:
+    """XOR-mask (or unmask — it is its own inverse) the packed decinfo `record` with the
+    ChaCha20 keystream keyed by whiten_key(span)."""
+    return apply_cipher(CIPHER_CHACHA20, record, whiten_key(span), WHITEN_NONCE)

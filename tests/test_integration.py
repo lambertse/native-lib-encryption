@@ -63,6 +63,9 @@ def test_inject_and_run(tmp_path):
     assert lib.sopk_add(100, 200) == 307
     assert lib.sopk_msg() == b"hello from native"   # .rodata ref resolves correctly
 
+    # the whitening removed the plaintext signpost: no "SOPK" magic anywhere in the file.
+    assert b"SOPK" not in enc.read_bytes()
+
 
 def test_xor_cipher_also_runs(tmp_path):
     from sopack.elf_inject import inject_so

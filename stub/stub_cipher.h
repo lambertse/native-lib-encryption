@@ -91,4 +91,34 @@ static inline void sopk_decrypt(uint8_t *buf, size_t n, uint32_t cipher_id,
         sopk_xor_apply(buf, n, key);
 }
 
+/* ---- decinfo whitening (at-rest obfuscation) ---------------------------------------
+ * The 128-byte decinfo record is XOR-masked with a ChaCha20 keystream whose KEY is a
+ * checksum over the stub's own code bytes. Both the checksum (sopk_whiten_key) and the
+ * fixed nonce below MUST match sopack/cipher.py byte for byte. De-whitening is just
+ * sopk_chacha20_apply() over the 128 bytes with (whiten_key, SOPK_WHITEN_NONCE).
+ *
+ * Checksum: FNV-1a-64 over the span, then splitmix64 expanded to 32 bytes so every key
+ * byte depends on every span byte (tamper anywhere -> wrong key -> garbage de-whiten).
+ * No new primitive on the wire — only this small mixing function is added on both sides.
+ */
+static const uint8_t SOPK_WHITEN_NONCE[16] = {
+    0x9e, 0x37, 0x79, 0xb9, 0x7f, 0x4a, 0x7c, 0x15,
+    0xf1, 0x35, 0x7a, 0xed, 0x03, 0x9d, 0x2c, 0x1a,
+};
+
+static inline void sopk_whiten_key(const uint8_t *span, size_t n, uint8_t out[32]) {
+    uint64_t h = 0xcbf29ce484222325ULL;             /* FNV-1a-64 offset basis */
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ (uint64_t)span[i]) * 0x00000100000001b3ULL;   /* FNV prime */
+    uint64_t s = h;
+    for (int j = 0; j < 4; j++) {                   /* splitmix64 -> 32 bytes */
+        s += 0x9e3779b97f4a7c15ULL;
+        uint64_t z = s;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        z = z ^ (z >> 31);
+        for (int k = 0; k < 8; k++) out[j * 8 + k] = (uint8_t)(z >> (8 * k));
+    }
+}
+
 #endif /* SOPK_STUB_CIPHER_H */

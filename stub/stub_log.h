@@ -42,9 +42,21 @@
 #  define SOPK_LOGD_PATH "/dev/socket/logdw"
 #endif
 
-/* Emit one INFO logcat line with the given tag + message. Best-effort; silent on any
- * error so it can never destabilise the host process. */
-static inline void sopk_logcat(const char *tag, const char *msg) {
+/* String hygiene: the logcat tag is the one constant that would name the packer in a
+ * `strings` dump (section headers are stripped, but `strings` scans raw bytes). Store it
+ * XOR-obfuscated and decode on-stack so "sopack" never appears in cleartext in the blob.
+ * (The staged debug messages below are generic markers, only emitted under --log.) */
+#define SOPK_TAG_XOR 0x5a
+static const unsigned char SOPK_TAG_OBF[] = { 0x29, 0x35, 0x2a, 0x3b, 0x39, 0x31 }; /* "sopack" */
+
+/* Emit one INFO logcat line with the (de-obfuscated) sopack tag + message. Best-effort;
+ * silent on any error so it can never destabilise the host process. */
+static inline void sopk_logcat(const char *msg) {
+    char tag[sizeof(SOPK_TAG_OBF) + 1];
+    for (unsigned i = 0; i < sizeof(SOPK_TAG_OBF); i++)
+        tag[i] = (char)(SOPK_TAG_OBF[i] ^ SOPK_TAG_XOR);
+    tag[sizeof(SOPK_TAG_OBF)] = 0;
+
     long fd = sopk_syscall3(SOPK_NR_socket, SOPK_AF_UNIX, SOPK_SOCK_DGRAM, 0);
     if (fd < 0) return;
 
@@ -84,7 +96,7 @@ static inline void sopk_logcat(const char *tag, const char *msg) {
 }
 
 /* Log "<prefix>0x<hex64>" — used to report stage + address/errno while debugging. */
-static inline void sopk_logv(const char *tag, const char *prefix, unsigned long v) {
+static inline void sopk_logv(const char *prefix, unsigned long v) {
     char msg[96];
     int o = 0;
     for (int k = 0; prefix[k] && o < 60; k++) msg[o++] = prefix[k];
@@ -94,7 +106,7 @@ static inline void sopk_logv(const char *tag, const char *prefix, unsigned long 
         msg[o++] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10);
     }
     msg[o] = 0;
-    sopk_logcat(tag, msg);
+    sopk_logcat(msg);
 }
 
 #endif /* SOPK_LOG_H */

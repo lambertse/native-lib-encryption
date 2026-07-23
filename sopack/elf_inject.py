@@ -23,9 +23,9 @@ from dataclasses import dataclass
 
 import lief
 
-from .cipher import CIPHER_IDS, apply_cipher, gen_key_nonce
+from .cipher import CIPHER_IDS, WHITEN_SPAN, apply_cipher, gen_key_nonce, whiten
 from .metadata import (DecInfo, FLAG_CHAIN_INIT, FLAG_LOG, FLAG_NEED_ICACHE,
-                       MAGIC, VERSION)
+                       MAGIC, SIZE as DECINFO_SIZE, VERSION)
 from .stubs import Stub, load_stub
 
 # 16 KB — mandatory max-page-size alignment for the injected LOAD segment so the lib
@@ -110,6 +110,21 @@ def inject_so(in_path: str, out_path: str, abi: str,
               cipher: str = "chacha20", log: bool = False) -> InjectResult:
     stub: Stub = load_stub(abi)
     cipher_id = CIPHER_IDS[cipher]
+    # Whitening span: the WHITEN_SPAN stub bytes immediately before g_decinfo — real
+    # code/rodata the injector never rewrites (only g_decinfo, at decinfo_off, is patched).
+    # The stub recomputes the same checksum over these bytes at runtime. See cipher.whiten.
+    if stub.decinfo_off < WHITEN_SPAN or stub.decinfo_off > len(stub.blob):
+        raise InjectError(
+            f"stub layout invalid for whitening: decinfo_off={stub.decinfo_off} "
+            f"span={WHITEN_SPAN} size={len(stub.blob)}")
+    whiten_span = stub.blob[stub.decinfo_off - WHITEN_SPAN:stub.decinfo_off]
+    # Guard against a future stub edit parking a large low-entropy (e.g. zeroed) constant
+    # right before g_decinfo, which would silently weaken the whitening key to a near-fixed
+    # value. Real stub code/rodata has many distinct bytes.
+    if len(set(whiten_span)) < 16:
+        raise InjectError(
+            f"whitening span is low-entropy ({len(set(whiten_span))} distinct bytes) — "
+            "the stub layout before g_decinfo changed; the whitening key would be weak")
 
     binary = lief.parse(in_path)
     if binary is None:
@@ -178,18 +193,18 @@ def inject_so(in_path: str, out_path: str, abi: str,
     if add_dtinit:
         _add_dtinit_inplace(out_path, entry_rva)
 
-    # --- 6. patch decinfo into the output file directly (version-independent) ---
+    # --- 6. patch decinfo at its KNOWN blob offset, then WHITEN it in place ---
     info = DecInfo(
         cipher_id=cipher_id, flags=flags,
         delta_text=text_rva - decinfo_rva, text_size=text_size,
         delta_init=delta_init, key=key, nonce=nonce,
     )
-    found_off = _patch_decinfo(out_path, info)
+    decinfo_off = seg_file_off + stub.decinfo_off
+    _patch_decinfo(out_path, info, decinfo_off, whiten_span)
 
     # --- 7. desktop self-verification: turn silent on-device failures into errors ---
     _self_verify(out_path, plain, info, cipher_id, key, nonce,
-                 text_rva, entry_rva, seg_rva, seg_file_off + stub.decinfo_off,
-                 found_off, strategy)
+                 text_rva, entry_rva, seg_rva, decinfo_off, whiten_span, strategy)
 
     return InjectResult(abi=abi, text_rva=text_rva, text_size=text_size,
                         seg_rva=seg_rva, entry_rva=entry_rva,
@@ -316,13 +331,32 @@ def _add_dtinit_inplace(path: str, entry_rva: int) -> None:
 
 
 def _self_verify(path, plain, info, cipher_id, key, nonce, text_rva, entry_rva,
-                 seg_rva, expected_decinfo_off, found_decinfo_off, strategy):
+                 seg_rva, decinfo_off, whiten_span, strategy):
     """Re-parse the output and assert every invariant the runtime stub depends on."""
-    # (5) magic scan landed exactly where LIEF placed the segment's decinfo.
-    if found_decinfo_off != expected_decinfo_off:
-        raise InjectError(
-            f"decinfo offset mismatch: scan={found_decinfo_off} "
-            f"expected={expected_decinfo_off} (LIEF bookkeeping / magic collision)")
+    with open(path, "rb") as f:
+        file_bytes = f.read()
+
+    # (5a) whitening-span immutability: the WHITEN_SPAN bytes before decinfo IN THE OUTPUT
+    # FILE must equal the pristine blob span the packer whitened with — because that is the
+    # exact region the stub re-checksums at runtime. If LIEF (or any write) perturbed it,
+    # the stub would derive a different key and fail open on-device; catch it here instead.
+    file_span = file_bytes[decinfo_off - WHITEN_SPAN:decinfo_off]
+    if file_span != whiten_span:
+        raise InjectError("whitening span differs in output — a pack-time write hit the "
+                          "checksummed region; the stub would derive the wrong key")
+
+    # (5b) the whitened record round-trips: de-whitening the shipped 128 bytes with the
+    # key derived from the OUTPUT-FILE span (what the stub will use) must reproduce exactly
+    # what we packed. A mismatch means the Python↔C whitening contract or the write chain
+    # is broken.
+    stored = file_bytes[decinfo_off:decinfo_off + DECINFO_SIZE]
+    if whiten(stored, file_span) != info.pack():
+        raise InjectError("whitened decinfo does not de-whiten to the packed record")
+
+    # (5c) the plaintext signpost is gone: the magic+version needle must not appear
+    # ANYWHERE in the file (the old grep-SOPK-read-the-key attack now finds nothing).
+    if _MAGIC_NEEDLE in file_bytes:
+        raise InjectError("decinfo magic still present in output — whitening did not take")
 
     out = lief.parse(path)
     if out is None:
@@ -374,20 +408,22 @@ def _self_verify(path, plain, info, cipher_id, key, nonce, text_rva, entry_rva,
         raise InjectError("DT_INIT does not point at the stub entry")
 
 
-def _patch_decinfo(path: str, info: DecInfo) -> int:
-    """Locate the placeholder decinfo in the freshly written file and overwrite the
-    128-byte record with the finalized metadata. The needle is magic+version (8 bytes,
-    matching the stub's g_decinfo initializer), which makes a chance collision with
-    random encrypted .text negligible. Scanning avoids depending on LIEF's post-add
-    file-offset bookkeeping."""
-    needle = MAGIC.to_bytes(4, "little") + VERSION.to_bytes(4, "little")
+_MAGIC_NEEDLE = MAGIC.to_bytes(4, "little") + VERSION.to_bytes(4, "little")
+
+
+def _patch_decinfo(path: str, info: DecInfo, decinfo_off: int, span: bytes) -> None:
+    """Overwrite the 128-byte record at its KNOWN blob offset with the finalized metadata,
+    then WHITEN it in place. We no longer scan for a magic: the offset is computed from
+    LIEF's segment file_offset + the blob's decinfo_off (the same value _self_verify
+    trusts). We assert the placeholder magic is present at that offset first (proves we
+    are writing the right spot), then write the whitened record — after which the magic no
+    longer appears in the file (that is the whole point; see stub/decinfo.h)."""
     with open(path, "r+b") as f:
-        blob = f.read()
-        idx = blob.find(needle)
-        if idx < 0:
-            raise InjectError("could not locate injected decinfo (magic not found)")
-        if blob.find(needle, idx + 1) >= 0:
-            raise InjectError("ambiguous decinfo: placeholder signature appears twice")
-        f.seek(idx)
-        f.write(info.pack())
-    return idx
+        f.seek(decinfo_off)
+        placeholder = f.read(DECINFO_SIZE)
+        if placeholder[:len(_MAGIC_NEEDLE)] != _MAGIC_NEEDLE:
+            raise InjectError(
+                f"placeholder decinfo not at expected offset 0x{decinfo_off:x} "
+                "(LIEF file-offset bookkeeping changed?)")
+        f.seek(decinfo_off)
+        f.write(whiten(info.pack(), span))
