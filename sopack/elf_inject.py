@@ -107,8 +107,12 @@ def _hijack_existing_init(binary, decinfo_rva: int, entry_rva: int):
 
 
 def inject_so(in_path: str, out_path: str, abi: str,
-              cipher: str = "chacha20", log: bool = False) -> InjectResult:
-    stub: Stub = load_stub(abi)
+              cipher: str = "chacha20", log: bool = False,
+              stub_dir: "str | None" = None) -> InjectResult:
+    # stub_dir != None -> use a freshly built (obfuscated/polymorphic) stub set instead of
+    # the shipped prebuilt blobs. The injector is otherwise offset-driven, so a differently
+    # shaped/sized blob needs no special handling here.
+    stub: Stub = load_stub(abi, stub_dir=stub_dir)
     cipher_id = CIPHER_IDS[cipher]
     # Whitening span: the WHITEN_SPAN stub bytes immediately before g_decinfo — real
     # code/rodata the injector never rewrites (only g_decinfo, at decinfo_off, is patched).

@@ -112,6 +112,7 @@ class RepackResult:
     injected: list[InjectResult] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)   # entry names not matched
     output: str = ""
+    obf_seed: int | None = None   # per-pack O-MVLL seed when --obfuscate was used
 
 
 def _is_target(entry: str, abi: str, so: str, wanted: set[str], abis: set[str]) -> bool:
@@ -127,6 +128,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
               keystore: KeystoreInfo | None = None,
               min_sdk: int | None = None,
               log: bool = False,
+              obfuscate: bool = False,
               logger=print) -> RepackResult:
     wanted = set(wanted_libs)
     abis_set = set(abis)
@@ -135,6 +137,16 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
     with tempfile.TemporaryDirectory(prefix="sopack-") as tmp:
         unsigned = os.path.join(tmp, "unsigned.apk")
         aligned = os.path.join(tmp, "aligned.apk")
+
+        # --obfuscate: build ONE fresh, seeded, O-MVLL-obfuscated stub set for this pack and
+        # inject every lib with it (per-pack polymorphism — a different stub shape per app).
+        stub_dir = None
+        if obfuscate:
+            from .obfuscate import build_obfuscated_stubs
+            stub_dir = os.path.join(tmp, "obfstubs")
+            os.makedirs(stub_dir, exist_ok=True)
+            seed = build_obfuscated_stubs(stub_dir, seed=None, logger=logger)
+            result.obf_seed = seed
 
         matched_any = False
         with zipfile.ZipFile(in_apk, "r") as zin, \
@@ -153,7 +165,8 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                     dst = os.path.join(tmp, "out.so")
                     with open(src, "wb") as f:
                         f.write(data)
-                    ir = inject_so(src, dst, abi, cipher=cipher, log=log)
+                    ir = inject_so(src, dst, abi, cipher=cipher, log=log,
+                                   stub_dir=stub_dir)
                     with open(dst, "rb") as f:
                         data = f.read()
                     result.injected.append(ir)

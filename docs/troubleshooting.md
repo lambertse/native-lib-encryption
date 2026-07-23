@@ -164,3 +164,19 @@ a real NDK, or unset `ANDROID_NDK_HOME` to fall back to plain LLVM on `PATH`.
 NDK r27's clang treats `-Wint-conversion` as an error. The stub already casts pointers
 to `long` in the fixed-`mmap` path; if you hit this after editing `syscalls.h`, add the
 explicit `(long)` cast. Rebuild with `bash stub/build_stubs.sh`.
+
+## `--obfuscate needs the O-MVLL/NDK toolchain … not set`
+
+`--obfuscate` requires `ANDROID_NDK_HOME`, `OMVLL_PLUGIN`, and `OMVLL_PYTHONPATH` at pack
+time (the plain build does not). Use the [`assets/Dockerfile`](../assets/Dockerfile) image
+(it sets them), or point them at a matching NDK + O-MVLL plugin — the versions **must**
+match (the plugin is compiled against a specific NDK's LLVM) and the plugin's glibc must be
+satisfied (O-MVLL 1.6.0 needs GLIBC_2.35; 1.8.0+ needs 2.38). O-MVLL is x86_64-only, so on
+arm64 hosts it runs under emulation (Docker Desktop Rosetta / qemu).
+
+## `--obfuscate` fails with `TypeError: incompatible function arguments`
+
+O-MVLL occasionally aborts a compile for a particular RNG state (~1 in 5 seeds). The pack
+path chooses seeds at random and **retries automatically** with fresh seeds, so a single
+transient failure is invisible. If *every* seed fails, the cause is not the flake — check
+the stderr the error prints (usually a guard failure or a toolchain/version mismatch).

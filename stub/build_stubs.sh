@@ -20,7 +20,9 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="$HERE/../sopack/stubs"
+# Output dir: default ships into the package; SOPK_STUB_OUT lets the --obfuscate pack path
+# build a fresh (seeded, obfuscated) stub set into a temp dir without touching the shipped one.
+OUT="${SOPK_STUB_OUT:-$HERE/../sopack/stubs}"
 API="${1:-24}"
 mkdir -p "$OUT"
 
@@ -61,6 +63,21 @@ LDFLAGS=(
     -Wl,-T,"$HERE/stub.ld"
 )
 
+# Optional O-MVLL obfuscation (opt-in). Set OMVLL_PLUGIN to the O-MVLL pass-plugin .so to
+# compile the stub through it; the plugin reads OMVLL_CONFIG (default: stub/omvll_config.py)
+# and OMVLL_PYTHONPATH from the environment. Only the guard-safe pass set is enabled by the
+# config (arithmetic/MBA, control-flow-flattening, control-flow-breaking, function-outline);
+# the no-reloc / no-undef / no-adrp guards below still gate every build. The obfuscator is
+# x86_64-only, so this path typically runs the NDK clang under emulation (see
+# assets/Dockerfile). SOPK_SEED (optional) makes the obfuscation shape per-build (polymorphism).
+OMVLL_FLAGS=()
+if [[ -n "${OMVLL_PLUGIN:-}" ]]; then
+    [[ -f "$OMVLL_PLUGIN" ]] || { echo "ERROR: OMVLL_PLUGIN=$OMVLL_PLUGIN not found" >&2; exit 1; }
+    export OMVLL_CONFIG="${OMVLL_CONFIG:-$HERE/omvll_config.py}"
+    OMVLL_FLAGS=(-fpass-plugin="$OMVLL_PLUGIN")
+    echo "obfuscation: O-MVLL ($OMVLL_PLUGIN)  config=$OMVLL_CONFIG  seed=${SOPK_SEED:-<none>}"
+fi
+
 sym_off() {  # sym_off <elf> <name> -> hex offset (== vaddr, image based at 0)
     "$READELF" -sW "$1" | awk -v n="$2" '$8==n {print "0x"$2; exit}'
 }
@@ -81,7 +98,15 @@ for PAIR in $TARGETS; do
     EXTRA=""
     if [ "$ABI" = "arm64-v8a" ]; then EXTRA="-mcmodel=tiny"; fi
 
-    "$CLANG" --target="$TRIPLE" $EXTRA "${CFLAGS[@]}" "${LDFLAGS[@]}" \
+    # O-MVLL is applied to arm64-v8a only. It supports AArch64/AArch32 but NOT x86_64, and
+    # the full pass set exhausts AArch32's smaller register file in the freestanding stub
+    # ("ran out of registers"); armv7 obfuscation would need a lighter, 32-bit-specific set.
+    THIS_OMVLL=()
+    if [[ ${#OMVLL_FLAGS[@]} -gt 0 && "$ABI" == "arm64-v8a" ]]; then
+        THIS_OMVLL=("${OMVLL_FLAGS[@]}")
+    fi
+
+    "$CLANG" --target="$TRIPLE" $EXTRA "${THIS_OMVLL[@]}" "${CFLAGS[@]}" "${LDFLAGS[@]}" \
         -I"$HERE" "$HERE/stub.c" -o "$ELF"
 
     # Hard requirement: no dynamic relocations and no undefined symbols, or the blob

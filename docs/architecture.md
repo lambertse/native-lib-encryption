@@ -445,14 +445,23 @@ one hard limit: the stub is identical across every packed app and holds the *com
 recipe, so **reverse it once, unpack every app** at that version. Two options break that
 ceiling but leave the clean envelope:
 
-- **Polymorphic per-pack stub.** Compile a *different* stub per pack (randomized whitening
-  constants / checksum seed, instruction scheduling, junk / opaque predicates) so reversing
-  one app does not crack the others. This is the only in-binary way to break the ceiling.
-  **Cost:** needs the `build_stubs.sh` toolchain (clang+lld+llvm) **at pack time**, not just
-  the shipped blob — it breaks the prebuilt-blob model, slows packs, and must re-run the
-  no-reloc/no-`adrp` guards per pack. (Per-pack *data* randomization — a random whitening
-  salt, junk in `reserved` — is cheap but does **not** break the ceiling; the logic is still
-  identical across apps.)
+- **Polymorphic per-pack stub — implemented, opt-in via `--obfuscate`.** With `--obfuscate`,
+  `sopack` recompiles the stub per pack through **O-MVLL** with a fresh random seed, so every
+  app ships a structurally different, heavily-obfuscated stub (control-flow flattening +
+  MBA + control-flow breaking on the decrypt/whiten logic) — reversing one app yields no
+  unpacker for the next. Only the **reloc-free** O-MVLL pass set is enabled, so every build
+  still passes the no-reloc / no-undef / no-`adrp` guards; passes that need writable globals
+  or libc (opaque-constants, indirect-branch, basic-block-duplicate → `lrand48`) are excluded
+  because the freestanding R+X blob can't host them. Obfuscation is scoped to **arm64-v8a**
+  (AArch32 exhausts registers; x86_64 is unsupported by O-MVLL). **Cost:** needs the NDK +
+  O-MVLL toolchain **at pack time** (x86_64-only, so typically run under emulation — see
+  `assets/Dockerfile`), and packs are slower. Default (no `--obfuscate`) is unchanged: the
+  shipped prebuilt blob, no toolchain. See [`static-analysis-hardening.md`](./static-analysis-hardening.md)
+  §"Per-pack polymorphism". **Honest ceiling:** this breaks *reuse*, not per-app
+  reversibility — a determined analyst + LLM still reverses any single app's stub; the win is
+  that the cost is now per-app, not amortized to ~0. (Per-pack *data*-only randomization — a
+  random whitening salt, junk in `reserved` — is cheap but does **not** break the ceiling; the
+  logic stays identical across apps.)
 - **External / server-derived key.** Keep the key out of the `.so`: store a `key_id` + salt,
   have the app derive the key (PBKDF2 from a **server** secret or user credential) and write
   it to `/data/user/<userId>/<pkg>/files/.sopk_<key_id>` before `System.loadLibrary`; the

@@ -95,6 +95,8 @@ sopack pack in.apk \
 - `--cipher` — `chacha20` (default) or `xor`.
 - `--log` — the stub emits a logcat confirmation on the device (see §5). Omit for a
   silent stub.
+- `--obfuscate` — recompile a **per-pack-unique, heavily-obfuscated (polymorphic)** arm64
+  stub via O-MVLL instead of shipping the prebuilt blob (see §4a). Off by default.
 - `--keystore` — auto-generated on first use (self-signed, password `sopack`). Reuse
   the same file to keep a stable signing identity across rebuilds. Defaults to
   `~/.sopack/debug.keystore`.
@@ -103,6 +105,32 @@ sopack pack in.apk \
 The injector runs a **self-verification** on every library (round-trip decrypt, vaddr
 stability, 16 KB congruence, correct hook target, no `TEXTREL`) and aborts with a clear
 error rather than emitting a silently-broken `.so`.
+
+### 4a. `--obfuscate` (polymorphic stub)
+
+By default the stub is byte-identical across every packed app, so reversing it once yields
+a universal offline unpacker. `--obfuscate` breaks that: it recompiles the stub per pack
+through [O-MVLL](https://github.com/open-obfuscator/o-mvll) with a fresh random seed —
+control-flow flattening + MBA + control-flow breaking on the decrypt/whiten logic — so every
+app's stub is structurally unique and individually far more expensive to reverse. See
+[`static-analysis-hardening.md`](./static-analysis-hardening.md) §Method 5 for the honest
+scope and ceiling.
+
+It is **opt-in** and needs the obfuscation toolchain at pack time (the plain build in §2 does
+not). The toolchain is x86_64-only; the supported, reproducible way to get it — including
+Rosetta emulation on Apple-Silicon — is the container in
+[`../assets/Dockerfile`](../assets/Dockerfile):
+
+```bash
+docker build -f assets/Dockerfile/Dockerfile -t sopack .
+docker run --rm -v "$PWD:/work" -w /work sopack \
+    pack in.apk --lib libapp.so --abi arm64-v8a -o out.apk --obfuscate
+```
+
+To run it outside Docker, set `ANDROID_NDK_HOME`, `OMVLL_PLUGIN`, and `OMVLL_PYTHONPATH` to a
+matching NDK + O-MVLL plugin (see the Dockerfile for the exact versions); `--obfuscate` fails
+fast with an actionable message if they are unset. Obfuscation is applied to **arm64-v8a**
+only (other ABIs get the normal stub), and packing is slower (a full stub recompile per pack).
 
 ---
 

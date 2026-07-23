@@ -29,9 +29,13 @@ pip install -e .                            # install the CLI (pulls in LIEF)
 
 # Pack an APK
 sopack pack in.apk --lib libfoo.so,libbar.so -o out.apk \
-    [--abi arm64-v8a,...] [--cipher chacha20|xor] [--min-sdk N] [--log] \
+    [--abi arm64-v8a,...] [--cipher chacha20|xor] [--min-sdk N] [--log] [--obfuscate] \
     [--keystore PATH --ks-alias A --ks-pass P --key-pass P] [--verify]
 sopack pack in.apk --libs libs.txt -o out.apk        # or a file, one .so per line
+# --obfuscate (opt-in): recompile a per-pack-unique, O-MVLL-obfuscated (polymorphic) arm64
+# stub instead of shipping the prebuilt blob. Needs the NDK + O-MVLL toolchain at pack time
+# (ANDROID_NDK_HOME, OMVLL_PLUGIN, OMVLL_PYTHONPATH) — x86_64-only, run via the container in
+# assets/Dockerfile. See docs/static-analysis-hardening.md §Method 5. Default off = unchanged.
 # Note: section-header stripping was researched and REMOVED — modern Android bionic
 # (Android 14+) requires a section table to exist and rejects a stripped lib at load
 # (confirmed on-device). Whitening (below) is the load-safe hardening. See

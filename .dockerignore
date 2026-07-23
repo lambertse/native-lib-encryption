@@ -1,0 +1,11 @@
+# Build context hygiene for assets/Dockerfile/Dockerfile.
+# Keep the image small: never copy the sample APKs / prebuilt .so fixtures / VCS metadata.
+.git
+assets/
+output/
+**/*.apk
+**/*.so.orig
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+*.egg-info/

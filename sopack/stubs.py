@@ -28,15 +28,16 @@ class StubMissingError(FileNotFoundError):
     pass
 
 
-def load_stub(abi: str) -> Stub:
+def load_stub(abi: str, stub_dir: "str | Path | None" = None) -> Stub:
     if abi not in SUPPORTED_ABIS:
         raise ValueError(f"unsupported ABI {abi!r}; supported: {SUPPORTED_ABIS}")
-    blob_path = _STUB_DIR / f"stub_{abi}.bin"
-    meta_path = _STUB_DIR / f"stub_{abi}.json"
+    base = Path(stub_dir) if stub_dir is not None else _STUB_DIR
+    blob_path = base / f"stub_{abi}.bin"
+    meta_path = base / f"stub_{abi}.json"
     if not blob_path.exists() or not meta_path.exists():
         raise StubMissingError(
             f"stub for {abi} not built. Run stub/build_stubs.sh with the NDK first "
-            f"(expected {blob_path.name} + {meta_path.name} in {_STUB_DIR})."
+            f"(expected {blob_path.name} + {meta_path.name} in {base})."
         )
     meta = json.loads(meta_path.read_text())
     blob = blob_path.read_bytes()

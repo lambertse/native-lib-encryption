@@ -50,10 +50,14 @@ def _cmd_pack(args: argparse.Namespace) -> int:
                           store_pass=args.ks_pass, key_pass=args.key_pass or args.ks_pass)
 
     print(f"sopack {__version__}: packing {args.input} -> {args.output}")
-    print(f"  cipher={args.cipher}  abis={','.join(abis)}")
+    print(f"  cipher={args.cipher}  abis={','.join(abis)}"
+          f"{'  obfuscate=on' if args.obfuscate else ''}")
     res = repackage(args.input, args.output, libs, cipher=args.cipher,
-                    abis=abis, keystore=ks, min_sdk=args.min_sdk, log=args.log)
+                    abis=abis, keystore=ks, min_sdk=args.min_sdk, log=args.log,
+                    obfuscate=args.obfuscate)
 
+    if res.obf_seed is not None:
+        print(f"  obfuscation seed (this pack): {res.obf_seed}")
     print(f"\nInjected {len(res.injected)} librar{'y' if len(res.injected)==1 else 'ies'}:")
     for ir in res.injected:
         print(f"  [{ir.abi}] .text rva=0x{ir.text_rva:x} size={ir.text_size} "
@@ -90,6 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="override apksigner minSdkVersion (if manifest detection fails)")
     pk.add_argument("--log", action="store_true",
                     help="stub emits a logcat line (tag 'sopack') on successful decrypt")
+    pk.add_argument("--obfuscate", action="store_true",
+                    help="recompile a heavily-obfuscated, per-pack-unique (polymorphic) stub "
+                         "via O-MVLL (needs the NDK+O-MVLL toolchain; see assets/Dockerfile). "
+                         "Default off = ship the prebuilt stub.")
     pk.add_argument("--keystore", help="keystore path (auto-generated if missing)")
     pk.add_argument("--ks-alias", default="sopack")
     pk.add_argument("--ks-pass", default="sopack")

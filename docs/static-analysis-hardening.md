@@ -17,6 +17,7 @@ SELinux `avc` denial, and neither `SOPK` nor `sopack` appears in the shipped lib
 | 2 | [No magic at rest](#method-2--no-magic-at-rest-patch-by-known-offset-not-by-scanning) — patch by known offset, verify the signpost is gone | ✅ shipped | Nothing to `grep` for; a pack-time guard proves it |
 | 3 | [Section-header stripping](#method-3--section-header-stripping--researched-rejected-removed) | ❌ removed | Incompatible with Android 14+ bionic; also low value once (1) holds |
 | 4 | [String hygiene](#method-4--string-hygiene-drop-the-packers-name) — obfuscate the `sopack` tag | ✅ shipped | Packer name absent from a `strings` dump |
+| 5 | [Per-pack polymorphism](#method-5--per-pack-polymorphic-stub-obfuscate) — recompile a unique, obfuscated stub per pack | ✅ shipped (opt-in `--obfuscate`) | No universal unpacker; each app is a fresh, heavily-obfuscated reverse |
 
 The contract version was bumped `SOPK_VERSION` 1 → 2 (`stub/decinfo.h` ⇄ `sopack/metadata.py`);
 the 128-byte layout is unchanged — only its at-rest *representation* is whitened.
@@ -29,13 +30,15 @@ the 128-byte layout is unchanged — only its at-rest *representation* is whiten
 - **Out of scope (always wins, by design):** a *dynamic* analyst. After load, plaintext
   `.text` lives in a readable `R-X` mapping; Frida or a `/proc/self/maps` dump recovers
   everything. This is obfuscation, not cryptographic protection.
-- **The ceiling:** the decryption stub ships **byte-identical in every packed app** and
-  contains the *complete* de-obfuscation recipe. So an analyst reverses the stub **once**
-  and has a universal offline unpacker for every app at that sopack version. The measures
-  below raise the one-time reversing cost (grep-and-decrypt → a real RE session); they do
-  **not** remove the ceiling. Two ways to break it (polymorphic per-pack stub; external /
-  server-derived key) are described in [`architecture.md`](./architecture.md) §9e — both
-  leave the "clean, prebuilt-blob" architecture and are not the default.
+- **The ceiling:** by default the decryption stub ships **byte-identical in every packed
+  app** and contains the *complete* de-obfuscation recipe. So an analyst reverses the stub
+  **once** and has a universal offline unpacker for every app at that sopack version. Methods
+  1–4 raise the one-time reversing cost (grep-and-decrypt → a real RE session) but do **not**
+  remove the ceiling. **Method 5 (`--obfuscate`) does** — it makes the stub per-pack unique,
+  converting that one-time cost into a per-app cost — at the price of leaving the
+  "clean, prebuilt-blob" envelope (it needs a compiler toolchain at pack time). It is opt-in
+  and not the default. (The other ceiling-breaker, an external / server-derived key, is
+  described in [`architecture.md`](./architecture.md) §9e.)
 
 ### What the old (v1) layout gave away
 
@@ -221,6 +224,57 @@ static inline void sopk_logcat(const char *msg) {
 The staged `--log` debug labels (`A:entry`, …) remain in cleartext: they are generic
 markers, emitted only under `--log`, and not a reliable packer fingerprint. Extending the
 same helper to obfuscate them is straightforward if wanted.
+
+---
+
+## Method 5 — Per-pack polymorphic stub (`--obfuscate`)
+
+**Files:** `sopack/cli.py` (`--obfuscate`), `sopack/obfuscate.py`, `sopack/apk.py`,
+`stub/build_stubs.sh`, `stub/omvll_config.py`. **Opt-in, off by default.**
+
+Methods 1–4 harden a stub that is still **identical across every app**, so one reverse
+unpacks all. `--obfuscate` attacks that directly: it recompiles the stub **per pack** through
+[O-MVLL](https://github.com/open-obfuscator/o-mvll) with a fresh random seed, so every packed
+app ships a structurally unique, heavily-obfuscated stub. Reversing one app's stub yields no
+reusable unpacker for the next — the one-time cost becomes a per-app cost.
+
+Two levers combine:
+
+- **Obfuscation** — control-flow flattening + mixed-boolean-arithmetic + control-flow
+  breaking are applied to the decrypt/whiten crown-jewels (`sopk_entry`, which inlines
+  `sopk_decrypt` and the whitening-key derivation, and `sopk_chacha20_apply`). This roughly
+  doubles the instruction count and destroys the clean control-flow an analyst (or LLM) leans
+  on. Measured elsewhere: CFF+MBA raises LLM analysis cost/time ~4–5×.
+- **Polymorphism** — O-MVLL's RNG is seeded from `SOPK_SEED` (a fresh random value per pack),
+  plus `shuffle_functions`. Two packs of the same library differ in ~85–90% of stub bytes,
+  yet each is reproducible from its seed and still decrypts correctly.
+
+**Only the reloc-free pass set is enabled**, because the stub is a flat **R+X** blob that
+nothing links at load (the `execmem` design): no relocations, no runtime-mutable globals, no
+`adrp`. `build_stubs.sh`'s existing guards remain the acceptance gate, and the excluded passes
+were determined empirically against them:
+
+| O-MVLL pass | usable in the freestanding stub? |
+| ----------- | -------------------------------- |
+| arithmetic (MBA), control-flow-flattening, control-flow-breaking, function-outline | ✅ reloc-free, no `adrp` |
+| basic-block-duplicate | ❌ emits a call to libc `lrand48` (undefined in a `nostdlib` blob) |
+| opaque-constants, indirect-branch/call | ❌ need writable globals / GOT the R+X blob can't host |
+
+Scope and cost:
+
+- Obfuscation is applied to **arm64-v8a only** — AArch32 exhausts its register file under the
+  full pass set ("ran out of registers"), and O-MVLL does not target x86_64. Those ABIs get
+  the normal (unobfuscated) stub.
+- The O-MVLL plugin + a matching NDK are **x86_64-only and not bundled**; `--obfuscate`
+  requires `ANDROID_NDK_HOME`, `OMVLL_PLUGIN`, `OMVLL_PYTHONPATH` in the environment and fails
+  fast with an actionable message otherwise. The reproducible way to get them (incl. Rosetta
+  emulation on Apple Silicon) is the image in [`assets/Dockerfile`](../assets/Dockerfile).
+- Packing is slower (a full stub recompile per pack). The default path is untouched: no flag →
+  the shipped prebuilt blob, no toolchain.
+
+**Honest ceiling (unchanged framing):** this breaks *reuse*, not per-app reversibility. A
+determined analyst with an LLM still reverses any single app's stub; the value is that the
+cost no longer amortizes to ~0 across a version. Dynamic analysis still wins outright.
 
 ---
 
