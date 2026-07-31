@@ -91,19 +91,22 @@ Three components + a thin CLI (`sopack/cli.py`):
     only decrypts if both sides agree); `test_metadata.py` pins the Python side via KAT.
 
 - **Init-hijack policy (the core correctness insight).** If the library has a usable
-  `DT_INIT`, repoint it and chain the original. Otherwise add a `DT_INIT` **in place** by
-  overwriting the `.dynamic` `DT_NULL` terminator. **Never hijack `DT_INIT_ARRAY`**: on
-  every (position-independent) Android `.so` each array slot is written by an
-  `R_*_RELATIVE` relocation at load, so a file overwrite is reverted by the loader and the
-  stub never runs (this was the `libflutter.so` SIGILL). `DT_INIT` is not relocated and
-  bionic runs it before `DT_INIT_ARRAY`. **When adding a `DT_INIT` (no usable original),
-  `_add_dtinit` picks the least-disruptive of three strategies: `DT_INIT-inplace` (reuse
-  the zero word after the terminator); `DT_INIT-repurpose-hash` when that word is a
-  file-backed non-zero (x86-64's `GOT[0] = &_DYNAMIC`) and the lib has both `DT_HASH` +
-  `DT_GNU_HASH` (overwrite the redundant `DT_HASH`; guarded so a SysV-hash-only lib is
-  never bricked); else `DT_INIT-grow-dynamic` (raise `_NeedGrow` → `inject_so` re-injects
-  with a real `DT_INIT` added via LIEF). The last two are desktop/host-glibc verified;
-  x86_64 bionic still needs on-device confirmation. See `docs/architecture.md` §5c.**
+  `DT_INIT`, repoint it to the stub and chain the original (`DT_INIT-hijack`). Otherwise
+  add a `DT_INIT` **in place** (`DT_INIT-inplace`, via `_add_dtinit_inplace`): overwrite the
+  `.dynamic` `DT_NULL` terminator with `DT_INIT` and rely on the following zero word as the
+  new terminator (raw, class-aware ELF surgery). This keeps `.dynamic` writable and in
+  place, so no mis-aligned segment is added. **Never hijack `DT_INIT_ARRAY`**: on every
+  (position-independent) Android `.so` each array slot is written by an `R_*_RELATIVE`
+  relocation at load, so a file overwrite is reverted by the loader and the stub never runs
+  (this was the `libflutter.so` SIGILL). `DT_INIT` is not relocated and bionic runs it
+  before `DT_INIT_ARRAY`. When the in-place terminator slot is genuinely unusable
+  (file-backed with a non-`DT_NULL` tag — some x86-64 no-init libs), the tool **refuses
+  loudly** rather than corrupt the lib. `DT_INIT-hijack` and `DT_INIT-inplace` are the
+  **only** strategies `master` emits (`_self_verify` enforces this). See
+  `docs/architecture.md` §5c. *(A 3-tier chain that also handles those x86-64 cases —
+  `DT_INIT-repurpose-hash` / `DT_INIT-grow-dynamic` — lives on the unmerged
+  `feature/dtinit-repurpose-hash` branch, documented in
+  `docs/copilot-docs/docs_x86_64-dtinit-support.md`; it is not in `master`.)*
 
 - **The stub must never gain a relocation, undefined symbol, or (arm64) `adrp`.** It has no
   load bias: it reaches `.text` and the original init via signed byte deltas from the

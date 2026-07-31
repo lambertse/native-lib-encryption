@@ -16,3 +16,4 @@ sopack/stubs/*.elf
 *.idsig
 output/
 .DS_Store
+libvosWrapperEx-arm64.so

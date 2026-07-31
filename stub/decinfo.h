@@ -11,7 +11,7 @@
  *
  * At-rest whitening (v2, anti-static-analysis). The shipped record is XOR-masked with a
  * ChaCha20 keystream whose key is a checksum the stub computes over ITS OWN code bytes
- * at load (the span [sopk_entry, g_decinfo); mirrored in sopack/cipher.py ⇄
+ * at load (the SOPK_WHITEN_SPAN bytes immediately before g_decinfo; mirrored in sopack/cipher.py ⇄
  * stub/stub_cipher.h). Consequences: (1) the constant `magic` never appears in the
  * shipped file, so the old "grep SOPK, read the 128-byte struct, lift the key" attack
  * finds nothing; (2) key/nonce/sizes are noise until an analyst reproduces the

@@ -81,7 +81,8 @@ void sopk_entry(int argc, char **argv, char **envp) {
     uintptr_t self = (uintptr_t)src;
 
     /* De-whiten the record first. The shipped 128 bytes are XOR-masked with a keystream
-     * keyed by a checksum over our OWN code — the span [sopk_entry, g_decinfo), which the
+     * keyed by a checksum over our OWN code — the SOPK_WHITEN_SPAN bytes immediately
+     * before g_decinfo (see `span` below), which the
      * injector never rewrites. So the magic/key/etc. never appear in the file; they only
      * reappear here after a correct de-whiten. A tampered stub checksums differently ->
      * garbage de-whiten -> the magic gate below fails -> fail open. Copy the raw bytes out

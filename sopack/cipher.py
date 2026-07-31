@@ -90,7 +90,7 @@ def gen_key_nonce() -> tuple[bytes, bytes]:
 
 # ---- decinfo whitening (at-rest obfuscation) --------------------------------------
 # The 128-byte decinfo record is XOR-masked with a ChaCha20 keystream whose KEY is a
-# checksum over the stub's own code bytes (the span blob[entry_off:decinfo_off]). This
+# checksum over the stub's own code bytes (the span blob[decinfo_off - WHITEN_SPAN:decinfo_off]). This
 # MUST match stub/stub_cipher.h (sopk_whiten_key + SOPK_WHITEN_NONCE) byte for byte: the
 # desktop side whitens, the injected stub recomputes the same key from its own code and
 # de-whitens. See stub/decinfo.h for the rationale.
