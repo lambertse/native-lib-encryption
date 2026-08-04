@@ -65,11 +65,11 @@ cd "$SOPACK"
 python3 -m pytest tests/ -q
 ```
 
-**PASS:** all tests pass. Some SKIP by design rather than fail, and the reason names the
-missing precondition: the two full-injection tests need a host `wb_keygen` (they seal a real
-white-box blob), and the optional large-library variant needs a real `.so` in `assets/`.
-Everything else — including the guards and the `.dynstr` re-sort behaviour the mode depends
-on — runs off the committed `tests/fixtures/mini_arm64.so` with no setup. What this covers:
+**PASS:** all tests pass. Two SKIP by design rather than fail, and the reason says why: the
+full-injection tests need a host `wb_keygen`, because they seal a real white-box blob and there
+is nothing meaningful to fake. Everything else — including the guards and the `.dynstr` re-sort
+behaviour the mode depends on — runs off the committed `tests/fixtures/mini_arm64.so` with no
+setup at all. What this covers:
 
 - `test_cipher.py` — AES core vs FIPS-197; **`aes128_ctr` vs a vector captured from the real
   2.0.0 `wbc_unwrap_key`** (the key-wrap contract); openssl fast paths == pure Python for

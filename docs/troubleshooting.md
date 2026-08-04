@@ -82,6 +82,35 @@ per-library limitation of the in-place method; report the library.
 
 ---
 
+## `the injection produced a LOAD segment that breaks 16 KB loading` (arm64)
+
+**Cause:** sopack's own output, not your library. The check re-reads the input first and would
+have said *"is not 16 KB-page compatible to begin with"* if the input were at fault — so this
+wording means the input was clean and the injection introduced the bad segment.
+
+**Known trigger: the LIEF version.** Some LIEF builds relocate or add a 4 KB-aligned segment
+when the appended segment does not fit the existing layout. It is layout- and size-dependent, so
+it shows up on larger libraries while smaller ones pack cleanly. This is the same hazard that
+makes `_inject_wbaes` avoid LIEF's `add_library` entirely (see `docs/architecture.md` §11f);
+`add(seg)` is normally safe, but not on every LIEF version.
+
+Observed once on a macOS host packing a 1.7 MB arm64 library that another host — same file, same
+sopack commit, LIEF `1.0.0` — packed to clean 16 KB output. So when reporting it, include:
+
+```bash
+python3 -c "import lief; print(lief.__version__)"
+readelf -lW <input.so>  | awk '/LOAD/{print $NF}'      # the input's alignments
+readelf -lW <packed.so> | awk '/LOAD/{print $NF}'      # and the output's
+```
+
+**Workarounds, in order:** pin a LIEF version that produces clean output; leave that library out
+of `--lib`; or pack it only for a device class that does not require 16 KB pages.
+
+**Do not disable the check.** It is refusing to emit an APK that would fail to load on 16 KB-page
+hardware, which Play requires 64-bit apps to support — the failure is the guard working.
+
+---
+
 ## No `sopack` line in logcat at all
 
 Not necessarily a failure. Check, in order:
