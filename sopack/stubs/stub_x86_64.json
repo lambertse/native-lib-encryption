@@ -1,7 +1,7 @@
 {
   "abi": "x86_64",
-  "triple": "x86_64-linux-android29",
-  "api": 29,
+  "triple": "x86_64-linux-android24",
+  "api": 24,
   "size":     8341,
   "entry_off": 1277,
   "decinfo_off": 8213

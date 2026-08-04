@@ -510,7 +510,7 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
             f"injection changed the target's dynamic symbol names ({detail}) — DT_STRTAB and "
             "the .dynsym offsets are out of sync, so dlsym() would fail on device")
     # (c) 16 KB congruence for arm64 (the only 16 KB-page device class) + no text relocs.
-    _assert_16k_and_no_textrel(tgt, abi)
+    _assert_16k_and_no_textrel(tgt, abi, orig_path=in_path)
 
     hlp = lief.parse(helper_path)
     if hlp is None:
@@ -539,17 +539,43 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
         raise InjectError("helper region ChaCha20 nonce missing or all-zero")
 
 
-def _assert_16k_and_no_textrel(binary, abi):
+def _16k_violations(binary) -> list[str]:
+    """LOAD segments that would stop this `.so` loading on a 16 KB-page device."""
     load_t = _seg_type_load()
+    bad = []
+    for s in binary.segments:
+        if s.type != load_t:
+            continue
+        if int(s.alignment) % SEGMENT_ALIGN != 0:
+            bad.append(f"align {int(s.alignment)}")
+        elif (int(s.virtual_address) - int(s.file_offset)) % SEGMENT_ALIGN != 0:
+            bad.append(f"vaddr 0x{int(s.virtual_address):x} not congruent with "
+                       f"offset 0x{int(s.file_offset):x}")
+    return bad
+
+
+def _assert_16k_and_no_textrel(binary, abi, orig_path: str | None = None):
+    """16 KB page hardware is arm64-only, so this gates arm64-v8a output only — armeabi-v7a and
+    x86_64 inputs commonly ship 4 KB LOADs and must not be rejected over a device class that
+    cannot run them.
+
+    `orig_path` lets the failure distinguish the two very different causes. If the INPUT already
+    violates the rule, that is a property of the library we were handed: no amount of packer
+    correctness can fix it, and saying "LOAD seg align 4096" without that context sends the
+    reader looking for a bug in the injection."""
     if abi == "arm64-v8a":
-        for s in binary.segments:
-            if s.type != load_t:
-                continue
-            if int(s.alignment) % SEGMENT_ALIGN != 0:
+        bad = _16k_violations(binary)
+        if bad:
+            pre = _16k_violations(lief.parse(orig_path)) if orig_path else []
+            if pre:
                 raise InjectError(
-                    f"LOAD seg align {int(s.alignment)} not multiple of {SEGMENT_ALIGN}")
-            if (int(s.virtual_address) - int(s.file_offset)) % SEGMENT_ALIGN != 0:
-                raise InjectError("LOAD seg vaddr/offset not 16 KB-congruent")
+                    f"{os.path.basename(orig_path)} is not 16 KB-page compatible to begin with: "
+                    f"its own LOAD segments already violate the rule ({'; '.join(pre)}) before "
+                    "any injection, so the packed output cannot either. Rebuild that library "
+                    "with -Wl,-z,max-page-size=16384, or pack it only for 4 KB device classes.")
+            raise InjectError(
+                f"the injection produced a LOAD segment that breaks 16 KB loading "
+                f"({'; '.join(bad)}) — the input was clean, so this one is ours")
     if binary.get(_tag("TEXTREL")) is not None:
         raise InjectError("output has DT_TEXTREL (text relocations) — must be absent")
 

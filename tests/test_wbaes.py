@@ -137,6 +137,37 @@ def test_dynsym_count_handles_a_gnu_hash_only_lib():
     assert len(_dynsym_names(FIXTURE)) == 3
 
 
+def test_16k_failure_blames_the_input_when_the_input_is_at_fault(tmp_path):
+    """`_assert_16k_and_no_textrel` fires on the packed output, but the offending LOAD segment is
+    often inherited from the input — and then no packer fix can help. A bare
+    "LOAD seg align 4096" sent a reader hunting for an injection bug that was not there, so the
+    two causes must read differently.
+
+    The 4 KB input is synthesised by rewriting p_align in the fixture's program headers, so this
+    needs no compiler."""
+    src = tmp_path / "input_4k.so"
+    data = bytearray(open(FIXTURE, "rb").read())
+    e_phoff = int.from_bytes(data[0x20:0x28], "little")
+    e_phentsize = int.from_bytes(data[0x36:0x38], "little")
+    e_phnum = int.from_bytes(data[0x38:0x3A], "little")
+    patched = 0
+    for i in range(e_phnum):
+        p = e_phoff + i * e_phentsize
+        if int.from_bytes(data[p:p + 4], "little") == 1:            # PT_LOAD
+            data[p + 0x30:p + 0x38] = (4096).to_bytes(8, "little")  # p_align
+            patched += 1
+    assert patched, "fixture has no PT_LOAD to patch"
+    src.write_bytes(bytes(data))
+
+    assert elf_inject._16k_violations(lief.parse(str(src))), "patching p_align had no effect"
+    with pytest.raises(InjectError, match="not 16 KB-page compatible to begin with"):
+        elf_inject._assert_16k_and_no_textrel(lief.parse(str(src)), "arm64-v8a",
+                                              orig_path=str(src))
+    # ...and with no orig_path to compare against, it must NOT blame the input
+    with pytest.raises(InjectError, match="this one is ours"):
+        elf_inject._assert_16k_and_no_textrel(lief.parse(str(src)), "arm64-v8a")
+
+
 def test_fixture_keeps_the_properties_the_tests_depend_on():
     """The fixture is only useful while it keeps all three properties `mini_arm64.c`
     documents. A regenerated fixture that lost one would make the tests above pass while
@@ -173,6 +204,13 @@ def test_wbaes_injection_surgery(monkeypatch, tmp_path, target):
     src = FIXTURE if target == "fixture" else _BIG_SO
     if not os.path.exists(src):
         pytest.skip(f"no {target} target at {src}")
+    # `big` is whatever .so happens to be in the (gitignored) assets/ on this machine, so it may
+    # not be 16 KB-page compatible. Injection cannot fix an input that already violates that,
+    # and the assertions below would then be testing the input rather than the packer.
+    pre = elf_inject._16k_violations(lief.parse(src))
+    if pre:
+        pytest.skip(f"{os.path.basename(src)} is not 16 KB-page compatible to begin with "
+                    f"({'; '.join(pre)}) — nothing here would be testing sopack")
     monkeypatch.setattr(elf_inject, "helper_skeleton_path",
                         lambda abi: _marked_skeleton(tmp_path, src))
     target_name = os.path.basename(src)
