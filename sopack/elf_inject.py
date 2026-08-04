@@ -19,6 +19,8 @@ Requires LIEF >= 0.15. LIEF's enum names shifted across versions; _E() shims tha
 """
 from __future__ import annotations
 
+import os
+import struct
 from dataclasses import dataclass
 
 import lief
@@ -27,7 +29,8 @@ from .cipher import CIPHER_IDS, CIPHER_WBAES, WHITEN_SPAN, apply_cipher, gen_key
 from .metadata import (DecInfo, FLAG_CHAIN_INIT, FLAG_LOG, FLAG_NEED_ICACHE,
                        MAGIC, SIZE as DECINFO_SIZE, VERSION)
 from .provision import provision_text
-from .rt_meta import (HELPER_BUILD_MARKER, REGION_VERSION, WRAPPED_KEY_BYTES, Region)
+from .rt_meta import (HELPER_BUILD_MARKER, REGION_MAGIC, REGION_VERSION, WRAPPED_KEY_BYTES,
+                      Region)
 from .stubs import Stub, helper_skeleton_path, load_stub
 
 # Bionic-provided libraries an injected helper may depend on WITHOUT bundling anything
@@ -155,16 +158,13 @@ def _needed_names(binary) -> list[str]:
 
 class _LoaderView:
     """A read-only view of a `.so` the way the LOADER sees it: program headers plus
-    `.dynamic`, and never section headers.
+    `.dynamic`, never section headers.
 
-    That distinction is the whole point. The wbaes path supersedes `.dynstr` with an appended
-    copy, so the `.dynstr` SECTION header and `DT_STRTAB` can legitimately point at different
-    bytes — and only `DT_STRTAB` is what bionic (and `dlsym`) actually use. Anything asserting
-    a runtime property must read it this way.
-    """
+    The wbaes path supersedes `.dynstr` with an appended copy, so its section header and
+    `DT_STRTAB` legitimately point at different bytes, and only `DT_STRTAB` is what `dlsym`
+    uses. Anything asserting a runtime property must read it this way."""
 
     def __init__(self, path: str):
-        import struct
         with open(path, "rb") as f:
             self.buf = buf = f.read()
         self.is64 = is64 = buf[4] == 2
@@ -210,7 +210,7 @@ class _LoaderView:
                 return o + (va - v)
         return None
 
-    def _str_at(self, base: int, off: int) -> str:
+    def str_at(self, base: int, off: int) -> str:
         end = self.buf.index(b"\x00", base + off)
         return self.buf[base + off:end].decode("utf-8", "replace")
 
@@ -222,24 +222,17 @@ class _LoaderView:
         base = self.strtab_off()
         if base is None:
             return []
-        return [self._str_at(base, o) for o in self.needed_offs]
+        return [self.str_at(base, o) for o in self.needed_offs]
 
     def dynsym_count(self) -> int | None:
         """Number of `.dynsym` entries.
 
-        `DT_HASH`'s `nchain` IS the count, so use it when present. Otherwise fall back to the
-        `.dynsym` SECTION header size — which is safe here even though this class otherwise
-        refuses to trust section headers, because sopack never moves or rewrites `.dynsym`. The
-        distinction that matters is: take the COUNT from the section header (untouched), take the
-        STRINGS from `DT_STRTAB` (which this tool does relocate).
+        `DT_HASH`'s `nchain` IS the count. Otherwise use the `.dynsym` SECTION header size —
+        safe despite this class's rule, because sopack never moves or rewrites `.dynsym`: count
+        from the untouched section header, strings from the relocated `DT_STRTAB`.
 
-        `DT_GNU_HASH` deliberately gets no fallback. It only ever covers *defined, exported*
-        symbols from `symoffset` onwards, so it cannot see undefined imports at all — and when a
-        library exports nothing (exactly our helper skeleton, built `-fvisibility=hidden` with
-        `--exclude-libs`) the bucket array is empty and the usual chain-walk reads whatever
-        follows, silently returning a too-small number. That under-count made this function
-        report 10 symbols for a 20-symbol `.so` and hid three unresolved `wbc_*` imports."""
-        import struct
+        Deliberately NO `DT_GNU_HASH` fallback — it covers only defined exported symbols, so it
+        under-counts (badly, for a library that exports nothing). See CLAUDE.md's invariant."""
         if _DT_HASH in self.tags:
             o = self.vaddr_to_off(self.tags[_DT_HASH])
             if o is not None:
@@ -247,7 +240,6 @@ class _LoaderView:
         return self._dynsym_count_from_shdr()
 
     def _dynsym_count_from_shdr(self) -> int | None:
-        import struct
         buf, is64, W = self.buf, self.is64, self.W
         e_shoff = struct.unpack_from(W, buf, 0x28 if is64 else 0x20)[0]
         e_shentsize = struct.unpack_from("<H", buf, 0x3A if is64 else 0x2E)[0]
@@ -285,54 +277,42 @@ def _effective_strtab(path: str) -> bytes:
     return v.buf[base:base + strsz]
 
 
-def _undefined_dynsyms(path: str) -> list[str]:
-    """Names of UNDEFINED dynamic symbols (`st_shndx == SHN_UNDEF`), i.e. what this `.so`
-    expects the loader to resolve for it. Used to catch a helper skeleton that was linked
-    against the wrong `libwbcrypto.a`."""
-    import struct
+def _walk_dynsyms(path: str, undefined_only: bool = False) -> list[str]:
+    """Dynamic symbol names, resolved exactly as `dlsym` would: `DT_SYMTAB` indexed against
+    `DT_STRTAB`, count from `_LoaderView.dynsym_count`, section headers ignored.
+
+    `undefined_only` keeps just the `SHN_UNDEF` entries — what this `.so` needs the loader to
+    resolve for it. Returns [] for a `.so` with no dynamic symbols at all, but RAISES if it has
+    a `DT_SYMTAB` whose length cannot be established: both callers are guards, and a guard that
+    silently inspects nothing is how the bug in §11f shipped."""
     v = _LoaderView(path)
     symtab_va, strtab = v.tags.get(_DT_SYMTAB), v.strtab_off()
     if symtab_va is None or strtab is None:
         return []
-    symtab = v.vaddr_to_off(symtab_va)
-    n = v.dynsym_count()
+    symtab, n = v.vaddr_to_off(symtab_va), v.dynsym_count()
     if symtab is None or n is None:
-        return []
+        raise InjectError(
+            f"{os.path.basename(path)} has a DT_SYMTAB whose entry count cannot be determined, "
+            "so its symbols cannot be verified")
     ent = 24 if v.is64 else 16
     out = []
     for i in range(n):
         st_name, _info, _other, shndx = struct.unpack_from("<IBBH", v.buf, symtab + i * ent)
-        if st_name and shndx == 0:
-            out.append(v._str_at(strtab, st_name))
+        if st_name and (shndx == 0 or not undefined_only):   # index 0 is the reserved symbol
+            out.append(v.str_at(strtab, st_name))
     return out
 
 
 def _dynsym_names(path: str) -> list[str]:
-    """Every `.dynsym` entry's name, resolved exactly as `dlsym` would (DT_SYMTAB indexed
-    against DT_STRTAB, count from the loader's hash table). Section headers are ignored.
+    """Every dynamic symbol name — pins the invariant that an injection must never change the
+    target's exported symbol names (see `_self_verify_wbaes`)."""
+    return _walk_dynsyms(path)
 
-    This exists to pin the invariant that an injection must never change the target's exported
-    symbol names — see `_self_verify_wbaes`. Returns [] if the file has no dynamic symbols;
-    raises InjectError if it has them but the count cannot be determined, because silently
-    checking nothing is how the original bug shipped."""
-    import struct
-    v = _LoaderView(path)
-    symtab_va, strtab = v.tags.get(_DT_SYMTAB), v.strtab_off()
-    if symtab_va is None or strtab is None:
-        return []
-    symtab = v.vaddr_to_off(symtab_va)
-    n = v.dynsym_count()
-    if symtab is None or n is None:
-        raise InjectError(
-            f"{os.path.basename(path)} has a DT_SYMTAB but no usable DT_HASH/DT_GNU_HASH, so "
-            "its symbol names cannot be verified")
-    ent = 24 if v.is64 else 16
-    out = []
-    for i in range(n):
-        st_name = struct.unpack_from("<I", v.buf, symtab + i * ent)[0]
-        if st_name:                       # index 0 is the reserved undefined symbol
-            out.append(v._str_at(strtab, st_name))
-    return out
+
+def _undefined_dynsyms(path: str) -> list[str]:
+    """Symbols this `.so` imports — catches a helper skeleton linked against a 1.x
+    `libwbcrypto.a`, which links cleanly and then cannot load."""
+    return _walk_dynsyms(path, undefined_only=True)
 
 
 def _helper_soname_for(target_soname: str) -> str:
@@ -356,7 +336,7 @@ def _emit_helper(abi: str, helper_soname: str, region_bytes: bytes,
     with open(skeleton, "rb") as f:
         if HELPER_BUILD_MARKER not in f.read():
             raise InjectError(
-                f"helper skeleton {skeleton.name} lacks the v{REGION_VERSION} build marker "
+                f"helper skeleton {os.path.basename(str(skeleton))} lacks the v{REGION_VERSION} build marker "
                 f"({HELPER_BUILD_MARKER.hex()}) — it was built from an older stub/sopk_rt.c "
                 "and would fail open at load, leaving encrypted .text to crash the app. "
                 "Rebuild it from the current stub/sopk_rt.c against whitebox-cryptography "
@@ -370,7 +350,7 @@ def _emit_helper(abi: str, helper_soname: str, region_bytes: bytes,
     stray = [n for n in _needed_names(binary) if n not in _BIONIC_ALLOWED]
     if stray:
         raise InjectError(
-            f"helper skeleton {skeleton.name} has non-bionic DT_NEEDED {stray} — the "
+            f"helper skeleton {os.path.basename(str(skeleton))} has non-bionic DT_NEEDED {stray} — the "
             "white-box was not statically linked in (libwbcrypto/libc++/libsodium must be "
             "static). Rebuild the skeleton.")
 
@@ -383,7 +363,7 @@ def _emit_helper(abi: str, helper_soname: str, region_bytes: bytes,
                          if n.startswith(("wbc_", "sodium_"))})
     if unresolved:
         raise InjectError(
-            f"helper skeleton {skeleton.name} imports {unresolved} instead of defining them — "
+            f"helper skeleton {os.path.basename(str(skeleton))} imports {unresolved} instead of defining them — "
             "it was linked against a 1.x libwbcrypto.a (or none). The helper would fail to "
             "load, taking the target's dlopen down with it. Rebuild assets/wbc/ from "
             "whitebox-cryptography >= 2.0.0 (scripts/build_android.sh) and link with "
@@ -413,9 +393,8 @@ def _inject_wbaes(in_path: str, out_path: str, abi: str,
 
     # The soname the on-device helper matches via dl_iterate_phdr basename. Prefer the APK
     # file name bionic will report; fall back to DT_SONAME, then the input basename.
-    import os as _os
     target_soname = (target_name or _dynamic_soname(binary)
-                     or _os.path.basename(in_path))
+                     or os.path.basename(in_path))
 
     # 1. encrypt .text under a freshly wrapped session key (host provisioning).
     text = _find_text(binary)
@@ -433,14 +412,9 @@ def _inject_wbaes(in_path: str, out_path: str, abi: str,
     #    add(seg), then raw-repoint DT_STRTAB/DT_STRSZ and add DT_NEEDED in place — keeping
     #    .dynamic and PT_DYNAMIC where they are.
     #
-    #    The string table we copy MUST be the one LIEF emits, not the one we read here.
-    #    `write()` rebuilds .dynstr with the strings sorted and rewrites every st_name in
-    #    .dynsym to match its new layout. Copying the PRE-write bytes and then repointing
-    #    DT_STRTAB at them leaves every offset pointing mid-string, so dlsym() returns NULL
-    #    for every symbol — an APK that loads and then crashes (this shipped once: Flutter
-    #    null-dereferenced its Dart snapshot pointers in performNativeAttach). So we reserve
-    #    a placeholder segment, let LIEF write, then read the EFFECTIVE table back out of the
-    #    file via DT_STRTAB and fill the placeholder with that.
+    #    The copied table MUST come from _effective_strtab (post-write), not from the section
+    #    read here — see that function's docstring. Hence: reserve a placeholder segment, let
+    #    LIEF write, then fill the placeholder with the table LIEF actually emitted.
     helper_soname = _helper_soname_for(target_soname)
     dynstr = binary.get_section(".dynstr")
     if dynstr is None:
@@ -524,12 +498,9 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
     # (b) DT_NEEDED points at the helper — resolved via DT_STRTAB, as the loader does.
     if helper_soname not in _needed_via_strtab(target_path):
         raise InjectError(f"DT_NEEDED {helper_soname!r} missing from target")
-    # (b2) EVERY existing exported symbol name still resolves to the same string. This mode
-    # supersedes .dynstr with an appended copy, so a mismatch here means dlsym() returns the
-    # wrong name (or NULL) for symbols the app looks up — an APK that loads and then crashes
-    # far from the cause. It shipped exactly once: LIEF re-sorts .dynstr during write() and
-    # rewrites st_name to match, so a copy taken before the write desynchronised every offset
-    # and Flutter null-dereferenced its Dart snapshot pointers. Cheap check, unmissable bug.
+    # (b2) EVERY existing exported symbol name still resolves to the same string. A mismatch
+    # means dlsym() returns the wrong name or NULL — an APK that loads and then crashes far
+    # from the cause. Cheap check; see docs/architecture.md §11f for the incident.
     before, after = _dynsym_names(in_path), _dynsym_names(target_path)
     if before != after:
         bad = next(((x, y) for x, y in zip(before, after) if x != y), None)
@@ -586,7 +557,6 @@ def _assert_16k_and_no_textrel(binary, abi):
 def _extract_region(helper_path: str) -> bytes:
     """Read the appended region back out of an emitted helper by locating the read-only
     PT_LOAD whose file bytes start with the region magic (mirrors the ctor's magic-scan)."""
-    from .rt_meta import HDR_SIZE, REGION_MAGIC
     magic = REGION_MAGIC.to_bytes(4, "little")
     b = lief.parse(helper_path)
     F = _seg_flags()
@@ -716,7 +686,7 @@ def inject_so(in_path: str, out_path: str, abi: str,
 
 _DT_NULL, _DT_INIT, _SHT_DYNAMIC, _PT_DYNAMIC, _PT_LOAD = 0, 12, 6, 2, 1
 _DT_NEEDED, _DT_STRTAB, _DT_STRSZ = 1, 5, 10
-_DT_HASH, _DT_SYMTAB, _DT_GNU_HASH, _SHT_DYNSYM = 4, 6, 0x6FFFFEF5, 11
+_DT_HASH, _DT_SYMTAB, _SHT_DYNSYM = 4, 6, 11
 
 
 def _add_needed_inplace(path: str, name_off: int, new_strtab_vaddr: int,
@@ -730,7 +700,6 @@ def _add_needed_inplace(path: str, name_off: int, new_strtab_vaddr: int,
     following zero word as the new terminator — the same in-place trick as
     _add_dtinit_inplace (and the same loud refusal when there is no usable terminator slot).
     Class-aware raw ELF little-endian surgery."""
-    import struct
     with open(path, "r+b") as f:
         buf = bytearray(f.read())
         is64 = buf[4] == 2
@@ -843,7 +812,6 @@ def _add_dtinit_inplace(path: str, entry_rva: int) -> None:
     include that new terminator so tools agree with the loader. Keeps .dynamic in its
     original (writable, mapped) segment, so no extra or mis-aligned segment is created.
     Class-aware raw ELF little-endian surgery (ELF32 for armeabi-v7a, ELF64 otherwise)."""
-    import struct
     with open(path, "r+b") as f:
         buf = bytearray(f.read())
         is64 = buf[4] == 2   # e_ident[EI_CLASS]: 1=ELF32, 2=ELF64

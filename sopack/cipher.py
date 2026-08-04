@@ -93,16 +93,9 @@ def _fastpath_ok(out: bytes, data: bytes, reference) -> bool:
     """Accept an openssl result only if its length matches AND a prefix matches the
     pure-Python reference. `reference(n)` returns the first n bytes we would have produced.
 
-    Checking the length alone is NOT enough, and the gap is a silent one. A build whose
-    16-byte IV convention differs from ours — e.g. ChaCha20's original counter(8)||nonce(8)
-    layout rather than openssl's counter(4, LE)||nonce(12) — accepts the same arguments and
-    returns the SAME LENGTH with wrong bytes. Nothing downstream would notice:
-    `_self_verify_wbaes` only checks the file holds the ciphertext the packer produced, not
-    that the packer produced the right ciphertext, so the corruption would ship and surface
-    as a crashing app on device. This matters in practice because the pack host's `openssl`
-    is not one implementation (macOS ships LibreSSL, Linux ships OpenSSL 3.x).
-
-    Cost is one keystream block per call, against a multi-MB payload — free in context."""
+    The prefix check is the load-bearing half: an openssl whose 16-byte IV convention differs
+    from ours returns the SAME LENGTH with wrong bytes, which nothing downstream would catch.
+    The pack host's openssl is not one implementation (macOS LibreSSL, Linux OpenSSL 3.x)."""
     if len(out) != len(data):
         return False
     n = min(len(data), _FASTPATH_CHECK)

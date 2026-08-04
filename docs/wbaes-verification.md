@@ -51,8 +51,11 @@ cd "$SOPACK"
 python3 -m pytest tests/ -q
 ```
 
-**PASS:** `31 passed` (or `29 passed, 2 skipped` if `$SOPACK_WBKEYGEN` is unset — the real
-wbaes injection tests skip without a host wb_keygen). What this covers:
+**PASS:** all tests pass. Some SKIP by design rather than fail, and the reason names the
+missing precondition: the two full-injection tests need a host `wb_keygen` (they seal a real
+white-box blob), and the optional large-library variant needs a real `.so` in `assets/`.
+Everything else — including the guards and the `.dynstr` re-sort behaviour the mode depends
+on — runs off the committed `tests/fixtures/mini_arm64.so` with no setup. What this covers:
 
 - `test_cipher.py` — AES core vs FIPS-197; **`aes128_ctr` vs a vector captured from the real
   2.0.0 `wbc_unwrap_key`** (the key-wrap contract); openssl fast paths == pure Python for
@@ -64,12 +67,12 @@ wbaes injection tests skip without a host wb_keygen). What this covers:
   build marker in Python matches the one in the C header, and a foreign region version is
   rejected loudly.
 - `test_wbaes.py` — a REAL wbaes injection on an arm64 `.so`: `.text` encrypted, the raw
-  `DT_NEEDED` added, both target and helper stay 16 KB-aligned, region round-trips; **that all
-  2,991 of the target's exported symbol names survive** (the defect that produced a
+  `DT_NEEDED` added, both target and helper stay 16 KB-aligned, region round-trips; **that
+  every one of the target's exported symbol names survives** (the defect that produced a
   loading-then-crashing APK) and that reintroducing it fails the pack; that a skeleton without
   the build marker is refused; **that a skeleton with unresolved `wbc_*` imports is refused**
-  (the 1.x-archive trap below); and that the symbol count is right for `DT_GNU_HASH`-only libs
-  and for libraries that export nothing.
+  (the 1.x-archive trap below); and that the symbol count is right for `DT_GNU_HASH`-only
+  libraries and for ones that export nothing.
 
 ---
 
@@ -265,8 +268,9 @@ Six things about that link line, all load-bearing:
   bionic cannot resolve them, `dlopen` of the *helper* fails, and therefore `dlopen` of the
   **target** fails too — surfacing as a crash inside whatever was loading the target, nowhere
   near the real cause. `--no-undefined` turns it into `undefined reference to 'wbc_unwrap_key'`
-  at build time. This is why step 1 above is a prerequisite and not a suggestion: the
-  `assets/wbc/` committed in this repo is 1.x and **must** be regenerated first.
+  at build time. This is why step 1 above is a prerequisite and not a suggestion: nothing
+  under `assets/` is tracked (it holds large third-party binaries), so the archive is
+  whatever you last built there — check it before blaming the link.
 
 - **Do not link `libwbvm.a` / `libwbprovision.a`.** Those carry the *provisioning* surface
   (`wbc_seal_key`, the white-box generator, the reference AES) which must never ship in an
@@ -445,15 +449,7 @@ the app still runs.
 
 ## Appendix — where the time goes
 
-Measured on an aarch64 Linux host at `-O2`, 5.5 MiB `.text` (a Flutter `libapp.so`):
-
-| step | cost | scales with `.text`? |
-|---|---|---|
-| `wbc_open` (Argon2id + Unseal) | ~230 ms | no |
-| `wbc_unwrap_key` (2 white-box blocks) | ~1.4 ms | no |
-| ChaCha20 over `.text` | ~15 ms | yes (~360 MB/s) |
-| **total** | **~245 ms** | |
-
-For comparison, the pre-2.0.0 design pushed `.text` itself through the white-box at
-~0.02–0.06 MB/s — minutes for the same library, which is why 2.0.0 removed that API and this
-mode was rewritten around key wrapping.
+The per-phase cost breakdown (and why only the ChaCha20 term scales with `.text` size) lives
+in [`architecture.md` §11b](./architecture.md#11b-why-the-white-box-does-not-decrypt-text-the-redesign-that-mattered).
+Build the skeleton with `-DSOPK_RT_LOG` and the helper logs its own version of that table per
+library at load, which is how you compare a device against those host figures.

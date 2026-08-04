@@ -92,7 +92,13 @@ sopack pack in.apk \
   (`lib/arm64-v8a/libapp.so`) targets one ABI. For many libraries you can instead use
   `--libs libs.txt` (one entry per line; `#` comments allowed).
 - `--abi` — omit to encrypt all three ABIs by default.
-- `--cipher` — `chacha20` (default) or `xor`.
+- `--cipher` — `chacha20` (default), `xor`, or `wbaes`. The first two use the freestanding
+  stub. `wbaes` is white-box AES-128 key wrapping via an injected helper: it ships no
+  portable key, but it needs a host `wb_keygen` (`--wb-keygen` or `$SOPACK_WBKEYGEN`), a
+  per-ABI helper skeleton you build yourself, and whitebox-cryptography >= 2.0.0. See
+  [wbaes-verification.md](./wbaes-verification.md) before using it.
+- `--wb-keygen` — path to a HOST `wb_keygen` (for `--cipher wbaes`); otherwise
+  `$SOPACK_WBKEYGEN`, otherwise one on `PATH`.
 - `--log` — the stub emits a logcat confirmation on the device (see §5). Omit for a
   silent stub.
 - `--keystore` — auto-generated on first use (self-signed, password `sopack`). Reuse

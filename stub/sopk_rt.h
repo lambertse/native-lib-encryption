@@ -9,13 +9,11 @@
  * constructor BEFORE the target's own init; the ctor decrypts the target's `.text` in
  * place (mremap onto the original VA) and returns.
  *
- * KEY WRAPPING (wbcrypto 2.0.0). The white-box is NOT used on the bulk data — it runs at
- * well under 1 MB/s, so a multi-MB `.text` took minutes. 2.0.0 removed the bulk entry
- * points (wbc_crypt_ctr / wbc_encrypt_ecb) for exactly that reason. Instead the white-box
- * unwraps a 32-byte session key in two blocks (~1 ms, payload-independent) and that key
- * drives sopack's own ChaCha20 over `.text` (~380 MB/s). The long-term AES-128 key is
- * still never reconstructed; only the session key exists in memory, and only between the
- * unwrap and the wipe.
+ * KEY WRAPPING (wbcrypto 2.0.0). The white-box is NOT used on the bulk data: it unwraps a
+ * 32-byte session key in two blocks (payload-independent) and that key drives sopack's own
+ * ChaCha20 over `.text`. The long-term AES-128 key is still never reconstructed; only the
+ * session key exists in memory, and only between the unwrap and the wipe. Why it is done
+ * this way, and why not the SDK's own AEAD: docs/architecture.md §11b-c.
  *
  * How the ctor finds its data: the packer appends ONE read-only PT_LOAD to the helper
  * whose bytes are a `sopk_rt_region` (below), starting with SOPK_RT_REGION_MAGIC. The

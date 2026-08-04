@@ -86,14 +86,12 @@ freestanding stub, so decryption moves to a normal-linkage **helper** injected a
 decrypts `.text` in place (same mmap→decrypt→mremap-onto-VA→mprotect R-X→icache dance as the
 stub, but with libc).
 
-**The white-box never touches bulk data.** It runs at well under 1 MB/s — every 16-byte block
-is thousands of obfuscated VM instructions — so a 5.5 MB `libapp.so` took *minutes* inside a
-constructor. 2.0.0 deleted the bulk entry points (`wbc_crypt_ctr`, `wbc_encrypt_ecb`) to make
-that shape unexpressible. Instead the white-box wraps a **32-byte session key** (two blocks,
-~1.4 ms, independent of payload size) and that key drives sopack's own ChaCha20 over `.text`
-(~360 MB/s). Measured on an aarch64 host for a 5.5 MiB `.text`: `wbc_open` ~230 ms (Argon2id,
-~93% of the total and the term that scales with **library count**, not size),
-`wbc_unwrap_key` 1.4 ms, ChaCha20 15 ms — **~245 ms total**. Pieces:
+**The white-box never touches bulk data.** It runs at well under 1 MB/s, so a 5.5 MB
+`libapp.so` took *minutes* inside a constructor; 2.0.0 deleted the bulk entry points
+(`wbc_crypt_ctr`, `wbc_encrypt_ecb`) to make that shape unexpressible. Instead it wraps a
+**32-byte session key** (two blocks, fixed cost) and that key drives sopack's own ChaCha20 over
+`.text`. The cost breakdown, and why `wbc_open`'s Argon2id dominates and scales with **library
+count** rather than size, is in `docs/architecture.md` §11b. Pieces:
 
 - **Host provisioning** (`sopack/provision.py`): per target, generate a long-term key `kek`
   and seal it with a **host** `wb_keygen` (the delivered `assets/wbc/wb_keygen` is an *Android*
@@ -204,12 +202,10 @@ one blob + one helper carrying N regions; deliberately deferred until device num
   detect the bug.
 
 - **The `.text` cipher must stay length-preserving.** `.text` ciphertext lives in the target's
-  own section bytes, so the bulk cipher has to be a stream cipher (ChaCha20). This is why
-  wbaes mode does NOT use the SDK's `wbc_bulk_seal`/`wbc_bulk_open`: XChaCha20-Poly1305 adds
-  40 bytes (24-byte nonce + 16-byte tag) that cannot fit, and its non-overlapping in/out
-  contract would force a second full-size buffer inside a constructor. It is also *slower*
-  here (17.0 ms vs 14.5 ms per 5.5 MiB — the Poly1305 tag buys integrity we do not need,
-  since the threat model is obfuscation only).
+  own section bytes, so the bulk cipher has to be a stream cipher. That is why wbaes mode does
+  NOT use the SDK's `wbc_bulk_seal`/`wbc_bulk_open` even though they are its documented data
+  mover — the AEAD's 40 bytes of framing have nowhere to live. Full reasoning in
+  `docs/architecture.md` §11c; do not "simplify" this back to the AEAD without reading it.
 
 - **At-rest whitening of `sopk_decinfo` (anti-static-analysis).** The shipped record is
   XOR-masked with a ChaCha20 keystream whose key is a checksum (`sopk_whiten_key`, FNV-1a-64

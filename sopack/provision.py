@@ -132,16 +132,15 @@ def provision_text(plain: bytes, wb_keygen: str | None = None) -> Provisioned:
     kek, sk, wrap_iv, nonce16 = gen_wbaes_params()
     passphrase = secrets.token_hex(16)    # 32 hex chars — argv-safe, < SOPK_MAX_PASS
     seed = secrets.randbits(64)
-    try:
-        blob = _seal(kek, passphrase, seed, tool)
-        # Byte-identical to wbc_wrap_key(ctx, sk, wrapped) on device: the white-box IS
-        # AES-128 under kek, and the wrap is plain CTR with the IV prepended.
-        wrapped = wrap_iv + aes128_ctr(sk, kek, wrap_iv)
-        ciphertext = apply_cipher(CIPHER_CHACHA20, plain, sk, nonce16)
-        wpass = whiten_pass(passphrase.encode("ascii"), blob)
-    finally:
-        # best-effort wipe of both secrets (neither may ship)
-        kek = b"\x00" * len(kek)          # noqa: F841 — drop the reference to the secret
-        sk = b"\x00" * len(sk)            # noqa: F841
+    blob = _seal(kek, passphrase, seed, tool)
+    # Byte-identical to wbc_wrap_key(ctx, sk, wrapped) on device: the white-box IS AES-128
+    # under kek, and the wrap is plain CTR with the IV prepended.
+    wrapped = wrap_iv + aes128_ctr(sk, kek, wrap_iv)
+    ciphertext = apply_cipher(CIPHER_CHACHA20, plain, sk, nonce16)
+    wpass = whiten_pass(passphrase.encode("ascii"), blob)
+    # `kek` and `sk` are deliberately NOT "wiped" here. Rebinding them would drop our
+    # reference without overwriting the `bytes` objects, so it would only look diligent —
+    # CPython gives no way to scrub an immutable value. They die with the frame; what
+    # actually matters is that neither is ever written to the output.
     return Provisioned(ciphertext=ciphertext, wrapped=wrapped, nonce16=nonce16,
                        blob=blob, wpass=wpass)

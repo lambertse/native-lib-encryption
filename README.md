@@ -14,8 +14,20 @@ design and reasoning.
 > new certificate.
 
 ```
-sopack pack in.apk --libs libs.txt -o out.apk [--cipher chacha20|xor] [--abi ...]
+sopack pack in.apk --libs libs.txt -o out.apk [--cipher chacha20|xor|wbaes] [--abi ...]
 ```
+
+## Two modes
+
+`--cipher chacha20` (default) and `xor` use the **freestanding stub** described below: the
+key ships inside the library, whitened at rest.
+
+`--cipher wbaes` instead protects the key with a **white-box AES-128**, so no portable key
+ships at all. It needs a different delivery mechanism (a normal-linkage helper injected as a
+`DT_NEEDED`, because the white-box runtime needs libc) and a per-ABI helper you build
+yourself. See [`docs/architecture.md`](./docs/architecture.md) §11 for how it works and
+[`docs/wbaes-verification.md`](./docs/wbaes-verification.md) for the setup and verification
+procedure. The rest of this page describes the stub mode.
 
 ## How it works
 
@@ -59,8 +71,11 @@ sopack/               Python package (the tool)
   cli.py              `sopack pack …`
   apk.py              unzip → inject → zipalign → apksigner; keystore mgmt
   elf_inject.py       LIEF: encrypt .text, add segment, hijack init, patch metadata
-  cipher.py           ChaCha20 / XOR — MUST match stub/stub_cipher.h
+  cipher.py           ChaCha20 / XOR — MUST match stub/stub_cipher.h; plus AES-128-CTR,
+                      which is the wbaes key-wrap primitive
   metadata.py         decinfo pack/parse — MUST match stub/decinfo.h
+  provision.py        wbaes: seal a key via wb_keygen, wrap a session key under it
+  rt_meta.py          wbaes: sopk_rt_region pack/parse — MUST match stub/sopk_rt.h
   stubs.py            loads the prebuilt per-ABI blobs
   stubs/              stub_<abi>.bin + stub_<abi>.json  (built by build_stubs.sh)
 stub/                 the injectable runtime stub (C)
@@ -70,7 +85,9 @@ stub/                 the injectable runtime stub (C)
   decinfo.h           the 128-byte injector<->stub contract
   stub.ld             link at vaddr 0 → single R+X image
   build_stubs.sh      NDK build → flat blobs + offsets (fails on any relocation)
-tests/                cipher KAT (RFC 8439) + metadata layout
+  sopk_rt.c/.h        wbaes: the DT_NEEDED helper and its injector<->helper contract
+tests/                cipher KATs, metadata + region layout, wbaes injection, dlopen
+  fixtures/           committed aarch64 .so so the wbaes tests need no local APK
 ```
 
 ## Build & run

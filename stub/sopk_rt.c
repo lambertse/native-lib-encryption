@@ -3,33 +3,11 @@
  * `--cipher wbaes` mode. Requires whitebox-cryptography >= 2.0.0 (key wrapping). The USER
  * builds this per ABI with the Android NDK + O-MVLL, statically linking the white-box VM:
  *
- *   $NDK/toolchains/llvm/prebuilt/<host>/bin/clang++ \
- *       --target=aarch64-linux-android24 -fPIC -shared -O2 \
- *       -fvisibility=hidden -Wl,--exclude-libs,ALL -Wl,--no-undefined \
- *       -static-libstdc++ \
- *       -I<wbc>/include -I<sopack>/stub \
- *       -x c sopk_rt.c -x none \
- *       <wbc>/build-android/libwbcrypto.a \
- *       -o libsopk_rt.so
- *       # (add the O-MVLL plugin flags to the clang++ invocation)
- *
- * Link-line notes, all load-bearing:
- *   * clang++, NOT clang, and libc++ linked STATICALLY. libwbcrypto.a is C++, so the C driver
- *     leaves the whole C++ runtime unresolved (operator new/delete, __cxa_*, std::runtime_error,
- *     typeinfo, vtables, __gxx_personality_v0). Static, because a libc++_shared.so dependency
- *     would be another .so to ship and sopack's dependency-closure guard rejects it.
- *   * -x c forces C for this file (the C++ driver would otherwise compile it as C++); -x none
- *     restores by-extension handling so the archive after it is still treated as an archive.
- *   * -Wl,--no-undefined is not optional: a -shared link permits unresolved symbols, so a 1.x
- *     libwbcrypto.a (no wbc_unwrap_key/wbc_wipe) links CLEANLY and the helper then fails to
- *     load on device, taking the target's dlopen down with it.
- *   * libwbcrypto.a is the RUNTIME set and now bundles libsodium, so no separate Android
- *     libsodium.a is needed (it was, before 2.0.0).
- *   * do NOT link libwbvm.a / libwbprovision.a — those carry the PROVISIONING surface
- *     (wbc_seal_key, the white-box generator, the reference AES), which must never ship.
- *   * -Wl,--exclude-libs,ALL is what actually hides the wbc_* symbols. WBC_API expands to
- *     visibility("default") inside the archive's own objects, baked in when the archive was
- *     built, so neither -fvisibility=hidden nor -DWBC_STATIC here can remove them.
+ * THE BUILD COMMAND AND ITS RATIONALE LIVE IN docs/wbaes-verification.md PHASE 4. It is not
+ * repeated here, because two copies drift: use that one. In outline it is clang++ (not clang —
+ * libwbcrypto.a is C++) with a static libc++, `-x c` for this file, and --no-undefined,
+ * --exclude-libs, linking only libwbcrypto.a. Every one of those flags is load-bearing and the
+ * doc says why, along with the three checks that prove the result is correct.
  *
  * Result: a normal Android .so whose ONLY DT_NEEDED are bionic libs (libc/libm/libdl,
  * + liblog if built with -DSOPK_RT_LOG) and which exports nothing. sopack then, per
@@ -107,17 +85,10 @@ static const uint8_t sopk_rt_build_marker[SOPK_RT_BUILD_MARKER_LEN] =
 #define SOPK_LOG(...) ((void)0)
 #endif
 
-/* Per-phase timing, tied to the same switch as the logging.
- *
- * The macros exist so the timing does not need its own #ifdef blocks scattered through the
- * ctor. In a release build SOPK_TIMER/SOPK_RESET expand to a no-op statement and no clock is
- * read; SOPK_ELAPSED never expands at all, because SOPK_LOG discards its arguments — which is
- * also why declaring the timer variables only under SOPK_RT_LOG cannot produce an
- * unused-variable warning either way.
- *
- * Only the ChaCha20 phase should scale with .text size. wbc_open is Argon2id (fixed, and the
- * dominant term); wbc_unwrap_key is two white-box blocks (fixed). Host reference for 5.5 MB:
- * ~190 ms / ~1 ms / ~12 ms. A device ratio far from that says which phase to look at. */
+/* Per-phase timing, on the same switch as the logging. Macros rather than inline #ifdefs so
+ * the ctor stays readable; declaration and initialiser must live in ONE macro (SOPK_MEASURE)
+ * so both vanish together in a release build. Only the ChaCha20 phase scales with .text size:
+ * wbc_open is Argon2id and wbc_unwrap_key is two white-box blocks, both fixed. */
 #ifdef SOPK_RT_LOG
 #include <time.h>
 static double sopk_now_ms(void) {
@@ -127,14 +98,10 @@ static double sopk_now_ms(void) {
 }
 #define SOPK_TIMER(v)         double v = sopk_now_ms()
 #define SOPK_RESET(v)         ((v) = sopk_now_ms())
-#define SOPK_ELAPSED(v)       (sopk_now_ms() - (v))
-/* declare `ms` holding the milliseconds since `t` — must be a single macro, so that in a
- * release build the declaration disappears together with its initialiser */
-#define SOPK_MEASURE(ms, t)   double ms = SOPK_ELAPSED(t)
+#define SOPK_MEASURE(ms, t)   double ms = (sopk_now_ms() - (t))
 #else
 #define SOPK_TIMER(v)         ((void)0)
 #define SOPK_RESET(v)         ((void)0)
-#define SOPK_ELAPSED(v)       (0.0)
 #define SOPK_MEASURE(ms, t)   ((void)0)
 #endif
 
@@ -311,13 +278,13 @@ static void sopk_rt_ctor(void) {
 
     SOPK_LOG("decrypted '%.*s' .text (%llu bytes) at 0x%lx — OK",
              (int)r->soname_len, soname, (unsigned long long)text_size, (long)text);
-    /* Phase breakdown. Only `decrypt` should grow with .text size; open/unwrap are fixed
-     * costs paid once per packed library. `total` is the whole ctor, so it also covers the
-     * phdr scans and the passphrase de-whitening, which are not timed separately. */
+    /* `total` covers the whole ctor, so it also includes the phdr scans and the passphrase
+     * de-whitening, which are not timed separately. */
+    SOPK_MEASURE(ms_total, t_ctor);
     SOPK_LOG("timing '%.*s': open=%.1fms unwrap=%.2fms copy=%.1fms decrypt=%.1fms "
              "place=%.1fms total=%.1fms (%.0f MB/s over %llu bytes)",
              (int)r->soname_len, soname, ms_open, ms_unwrap, ms_copy, ms_decrypt, ms_place,
-             SOPK_ELAPSED(t_ctor),
+             ms_total,
              ms_decrypt > 0.0 ? (double)text_size / 1e6 / (ms_decrypt / 1e3) : 0.0,
              (unsigned long long)text_size);
 }

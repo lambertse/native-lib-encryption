@@ -14,7 +14,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from .cipher import SESSION_KEY_BYTES, WRAPPED_KEY_BYTES  # noqa: F401 — re-exported
+from .cipher import WRAPPED_KEY_BYTES
 
 REGION_MAGIC = 0x52545253    # bytes 'S','R','T','R' little-endian
 REGION_VERSION = 2           # v2 = key wrapping; the helper requires an exact match
