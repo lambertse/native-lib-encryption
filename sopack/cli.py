@@ -52,7 +52,8 @@ def _cmd_pack(args: argparse.Namespace) -> int:
     print(f"sopack {__version__}: packing {args.input} -> {args.output}")
     print(f"  cipher={args.cipher}  abis={','.join(abis)}")
     res = repackage(args.input, args.output, libs, cipher=args.cipher,
-                    abis=abis, keystore=ks, min_sdk=args.min_sdk, log=args.log)
+                    abis=abis, keystore=ks, min_sdk=args.min_sdk, log=args.log,
+                    wb_keygen=args.wb_keygen)
 
     print(f"\nInjected {len(res.injected)} librar{'y' if len(res.injected)==1 else 'ies'}:")
     for ir in res.injected:
@@ -84,7 +85,17 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--lib", action="append",
                    help="a .so to encrypt; repeatable and/or comma-separated "
                         "(e.g. --lib libfoo.so,libbar.so)")
-    pk.add_argument("--cipher", choices=["chacha20", "xor"], default="chacha20")
+    pk.add_argument("--cipher", choices=["chacha20", "xor", "wbaes"], default="chacha20",
+                    help="chacha20/xor: freestanding stub (raw key ships whitened). "
+                         "wbaes: white-box AES-128 key wrapping via an injected helper — the "
+                         "long-term key is sealed and never reconstructed, and the white-box "
+                         "unwraps a session key that ChaCha20-decrypts .text. Requires "
+                         "whitebox-cryptography >= 2.0.0 for both assets/wbc/ and the helper "
+                         "skeleton (2.0.0 removed the bulk API and bumped the blob to v3, so "
+                         "1.x artifacts will not link or load).")
+    pk.add_argument("--wb-keygen", default=None,
+                    help="path to a HOST wb_keygen (for --cipher wbaes); else "
+                         "$SOPACK_WBKEYGEN or one on PATH")
     pk.add_argument("--abi", help=f"comma list; default {','.join(SUPPORTED_ABIS)}")
     pk.add_argument("--min-sdk", type=int, default=None,
                     help="override apksigner minSdkVersion (if manifest detection fails)")

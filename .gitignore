@@ -9,6 +9,10 @@ dist/
 
 # Stub build intermediates (keep the .bin/.json blobs — they are package data)
 sopack/stubs/*.elf
+# The wbaes helper skeleton is USER-built per ABI against your own whitebox-cryptography
+# and NDK (docs/wbaes-verification.md Phase 4), so it is a local artifact, not package data.
+# sopack/stubs.py raises StubMissingError with build guidance when it is absent.
+sopack/stubs/*.so
 
 # Local keystores / scratch
 *.keystore
@@ -17,3 +21,12 @@ sopack/stubs/*.elf
 output/
 .DS_Store
 libvosWrapperEx-arm64.so
+
+# Local binary/APK fixtures and third-party white-box artifacts — large, and not ours to
+# redistribute. Tests that need them skip; tests/fixtures/ below is the committed substitute.
+assets/
+
+# ...except the small purpose-built test fixtures, which MUST be committed so the wbaes
+# tests run on a bare clone (see tests/test_wbaes.py).
+!tests/fixtures/
+!tests/fixtures/**

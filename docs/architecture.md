@@ -469,11 +469,17 @@ ceiling but leave the clean envelope:
 sopack/               the tool (Python)
   cli.py              argument parsing → repackage()
   apk.py              unzip → inject → 16 KB align → apksigner; keystore mgmt
+                      (+ adds the wbaes helper .so — the only add-file path)
   elf_inject.py       encrypt .text, add segment, hijack/add init, patch decinfo, self-verify
-  cipher.py           ChaCha20 / XOR  — mirror of stub/stub_cipher.h
+                      (+ _inject_wbaes: DT_NEEDED surgery + helper emission)
+  cipher.py           ChaCha20 / XOR — mirror of stub/stub_cipher.h; plus AES-128-CTR,
+                      which is the wbaes KEY-WRAP primitive (see §11)
   metadata.py         sopk_decinfo pack/parse — mirror of stub/decinfo.h
-  stubs.py            load prebuilt per-ABI blobs + offsets
+  provision.py        wbaes host provisioning: seal a kek via wb_keygen, wrap a session key
+  rt_meta.py          sopk_rt_region pack/parse — mirror of stub/sopk_rt.h
+  stubs.py            load prebuilt per-ABI blobs + offsets; locate the wbaes skeleton
   stubs/              stub_<abi>.bin + .json (built artifacts, shipped as package data)
+                      sopk_rt_<abi>.so — the wbaes helper skeleton (USER-built, see §11)
 stub/                 the injected runtime stub (C)
   stub.c              sopk_entry: mmap/decrypt/mremap-onto-base/mprotect/flush/chain
   syscalls.h          per-ABI raw syscalls, page-size probe, memcpy, I-cache flush
@@ -482,6 +488,153 @@ stub/                 the injected runtime stub (C)
   decinfo.h           the 128-byte injector↔stub contract
   stub.ld             link at vaddr 0 → flat R+X image
   build_stubs.sh      NDK/LLVM build → flat blobs + offsets; fails on any relocation
-tests/                cipher KAT (RFC 8439), metadata layout, dlopen integration
+  sopk_rt.c           wbaes helper: ctor that unwraps a session key and decrypts .text
+  sopk_rt.h           the 96-byte injector↔helper contract (wbaes)
+tests/                cipher KAT (RFC 8439), metadata + rt_meta layout, wbaes injection,
+                      dlopen integration
 docs/                 this documentation
 ```
+
+---
+
+## 11. `--cipher wbaes` — the white-box key-wrap mode
+
+An alternative to §4's freestanding stub, selected with `--cipher wbaes`. Everything in
+§§1–2 still applies (`execmem` not `execmod`, no W+X, I-cache flush, 16 KB pages); what
+changes is *where the decryptor lives* and *where the key lives*.
+
+### 11a. The problem it solves, and the one it does not
+
+The stub ships its ChaCha20 key inside the `.so` (whitened, §9b). Whitening raises the cost
+of lifting it but the key is still, in principle, recoverable from the shipped bytes. A
+white-box cipher removes that: the AES-128 key is diffused offline into a table network
+inside an obfuscated VM, and **never reconstructed at runtime**. Nothing in the shipped
+artifacts is a key you can copy out.
+
+The white-box runtime is C++ and needs libc, libsodium and the dynamic linker, so it cannot
+live in a freestanding blob. It therefore ships as a normal Android `.so` — a **helper** —
+injected as a `DT_NEEDED` of the target. bionic runs a dependency's constructors before the
+dependent's init, which gives us the same "before the target's own code" guarantee that
+§5c's `DT_INIT` hijack gives, *without any init surgery at all*. As a side effect this mode
+handles `INIT_ARRAY`-only libraries (the `libflutter.so` case) for free.
+
+### 11b. Why the white-box does not decrypt `.text` (the redesign that mattered)
+
+The obvious design — encrypt `.text` with the white-box, decrypt it with the white-box —
+does not work at scale, and the reason is intrinsic rather than a bug. Each 16-byte block is
+thousands of obfuscated VM instructions, and the VM deep-copies a ~400 KB data image per
+block. Measured throughput was ~0.02–0.06 MB/s: a 5.5 MB Flutter `libapp.so` needed
+**minutes** inside an ELF constructor. The first on-device test crashed at "uptime 2s" in
+libflutter, far too early for the decrypt to have finished — the target read still-encrypted
+code.
+
+The slowness *is* the obfuscation, so it cannot be optimised away. Upstream drew the same
+conclusion and in 2.0.0 **deleted** the bulk entry points (`wbc_crypt_ctr`,
+`wbc_encrypt_ecb`), leaving key wrapping as the only shape the SDK offers. sopack follows:
+
+```
+white-box  ──wraps──▶  32-byte session key    (2 blocks, ~1.4 ms, FIXED cost)
+session key ─drives──▶  ChaCha20 over .text    (~360 MB/s)
+```
+
+The white-box charge does not grow with the payload, so only the ChaCha20 term scales.
+Measured on an aarch64 host for a 5.5 MiB `.text`:
+
+| step | cost | scales with `.text`? |
+|---|---|---|
+| `wbc_open` (Argon2id KDF + Unseal) | ~230 ms | no — but once **per library** |
+| `wbc_unwrap_key` (2 white-box blocks) | ~1.4 ms | no |
+| ChaCha20 over `.text` | ~15 ms | yes |
+| **total** | **~245 ms** | |
+
+Note that the KDF, not the crypto, is now the dominant term — and it is the one that
+multiplies by library count, since each target gets its own helper and blob. Collapsing that
+to one shared helper is a known, deliberately deferred optimisation.
+
+### 11c. Why the bulk cipher is sopack's own ChaCha20, not the SDK's AEAD
+
+2.0.0 also ships `wbc_bulk_seal`/`wbc_bulk_open` (XChaCha20-Poly1305) as its data mover. We
+do not use them, for three reasons in priority order:
+
+1. **`.text` encryption must be length-preserving.** The ciphertext occupies the target's own
+   `.text` bytes. An AEAD adds 40 bytes (24-byte nonce + 16-byte tag) with nowhere to live,
+   forcing a split frame; and its in/out-must-not-overlap contract forces a second
+   full-size buffer — a transient +5.5 MB inside a constructor at app startup.
+2. **No new cross-language contract.** `cipher.py` ⇄ `stub_cipher.h` ChaCha20 is already
+   mirrored, KAT-locked and exercised by the aarch64 `dlopen` test. Using the AEAD would mean
+   a bit-exact XChaCha20-Poly1305 on the pack side (new Python crypto, or a PyNaCl dependency).
+3. **It is faster** here anyway: 14.5 ms vs 17.0 ms per 5.5 MiB. The Poly1305 tag buys
+   integrity we have no use for — the threat model is obfuscation, and a tampered `.text`
+   crashes visibly regardless.
+
+### 11d. The host side, and why no new tool was needed
+
+`wbc_wrap_key` requires an opened blob, which would seem to force a host tool that links the
+white-box runtime. It does not, because of one fact: the white-box **is** bit-exact AES-128
+(FIPS-197 anchor `69c4e0d8…`), and the wrap is plain CTR under the sealed key with the IV
+prepended (`src/sdk/wbcrypto.cpp:CtrSessionKey`). The pack host still holds that key at the
+moment it seals it, so it can compute the wrap directly:
+
+```python
+wrapped = wrap_iv + cipher.aes128_ctr(sk, kek, wrap_iv)   # == wbc_wrap_key(ctx, sk, …)
+```
+
+Verified byte-exact against the real 2.0.0 `wbc_unwrap_key` and pinned by a KAT in
+`tests/test_cipher.py`. So provisioning stays "pure Python + the unchanged `wb_keygen` CLI",
+and `assets/wbc/wb_keygen`'s interface did not have to change.
+
+### 11e. Finding the metadata without a patched symbol
+
+The stub reaches its `sopk_decinfo` by a known blob offset (§5d). The helper cannot: it is a
+real `.so` that LIEF re-bases when the packer appends the region segment, so no file offset
+or symbol address baked at build time stays valid. Instead the packer appends the
+`sopk_rt_region` as a single **read-only** `PT_LOAD` and the constructor finds it by walking
+its **own** program headers (`dl_iterate_phdr`, self-identified by testing whether its own
+code address falls inside a module's `PT_LOAD`) and picking the non-writable, non-executable
+segment that begins with the `SRTR` magic and the expected version. The target's load base
+comes from the same iteration, matched by soname basename.
+
+That version gate **fails open** — an unrecognised region means "do nothing", so a mismatch
+between packer and skeleton produces a target running encrypted `.text` and a SIGILL with no
+diagnostic. Because the skeleton is built by hand outside this repo, that mismatch window is
+real, so `sopk_rt.c` embeds an opaque build marker and the packer refuses a skeleton lacking
+it (§CLAUDE.md invariants). Pack-time error beats device-side crash.
+
+### 11f. Adding the `DT_NEEDED` without breaking `dlsym` (a bug worth remembering)
+
+`libapp.so` has no `DT_INIT` and no dependencies at all, so the only surgery wbaes needs on the
+target is one extra `DT_NEEDED`. LIEF's `add_library` cannot be used for it — on tight libraries
+it grows `.dynamic`/`.dynstr` and spills 4 KB-aligned segments that break 16 KB loading (§2d).
+So the packer appends a 16 KB-aligned **copy** of `.dynstr` with the helper soname on the end,
+repoints `DT_STRTAB`/`DT_STRSZ` at the copy, and overwrites the `.dynamic` `DT_NULL` terminator
+with the new `DT_NEEDED` — all in raw file surgery, leaving `.dynamic` and `PT_DYNAMIC` in place.
+
+The subtlety that cost a shipped, crashing APK: **which** copy of `.dynstr`. LIEF's `write()`
+rebuilds the string table with the strings **sorted alphabetically** and rewrites every `st_name`
+in `.dynsym` to match its new layout. The original code snapshotted `.dynstr` *before* the write,
+so after repointing `DT_STRTAB` at that copy every `st_name` indexed the wrong table and landed
+mid-string:
+
+```
+st_name 104  ->  "otData"                       (was _kDartVmSnapshotInstructions)
+st_name  27  ->  "ns"                           (was _kDartIsolateSnapshotInstructions)
+st_name  83  ->  "a"                            (was _kDartVmSnapshotData)
+```
+
+The library still loaded — `DT_NEEDED` resolved, because the packer owned both sides of that one
+offset — but `dlsym(h, "_kDartVmSnapshotData")` returned `NULL`. Flutter stored the nulls and
+dereferenced one in `performNativeAttach`, SIGSEGV'ing ~1 s after launch, in *unmodified*
+`libflutter.so` code with nothing pointing at the packer. A clean null dereference in a library
+you did not touch is the signature of a **load-time lookup failure**, not of executing encrypted
+bytes — that distinction is what located this.
+
+Two lessons are now enforced in code. The string table must be read back **from the written
+file** via `DT_STRTAB` (`_effective_strtab`), never from the pre-write section. And
+`_self_verify_wbaes` compares every dynamic symbol name before and after and refuses to pack on
+any change, resolving them the way bionic does (`_LoaderView`: program headers + `.dynamic`, never
+section headers, since in this mode the `.dynstr` section header and `DT_STRTAB` legitimately
+point at different bytes).
+
+See [`wbaes-verification.md`](./wbaes-verification.md) for the six-phase verification
+procedure, including a host round-trip that exercises every one of these contracts without a
+device.

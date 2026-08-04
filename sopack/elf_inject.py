@@ -23,14 +23,29 @@ from dataclasses import dataclass
 
 import lief
 
-from .cipher import CIPHER_IDS, WHITEN_SPAN, apply_cipher, gen_key_nonce, whiten
+from .cipher import CIPHER_IDS, CIPHER_WBAES, WHITEN_SPAN, apply_cipher, gen_key_nonce, whiten
 from .metadata import (DecInfo, FLAG_CHAIN_INIT, FLAG_LOG, FLAG_NEED_ICACHE,
                        MAGIC, SIZE as DECINFO_SIZE, VERSION)
-from .stubs import Stub, load_stub
+from .provision import provision_text
+from .rt_meta import (HELPER_BUILD_MARKER, REGION_VERSION, WRAPPED_KEY_BYTES, Region)
+from .stubs import Stub, helper_skeleton_path, load_stub
+
+# Bionic-provided libraries an injected helper may depend on WITHOUT bundling anything
+# (present on every Android device). Anything else in the helper's DT_NEEDED means the
+# static link leaked a dependency and would fail to load.
+_BIONIC_ALLOWED = {
+    "libc.so", "libm.so", "libdl.so", "liblog.so", "libz.so", "libandroid.so",
+    "libEGL.so", "libGLESv2.so", "libGLESv3.so", "libvulkan.so", "libjnigraphics.so",
+}
 
 # 16 KB — mandatory max-page-size alignment for the injected LOAD segment so the lib
 # still loads on 16 KB-page devices (Android 15+, Play requirement).
 SEGMENT_ALIGN = 16384
+
+# Spare bytes reserved in the appended string-table segment, so the common case needs a single
+# LIEF write. LIEF's rebuilt .dynstr normally has the same size (it reorders, it does not add),
+# but if it grows past this we re-write once at the exact size rather than truncating.
+_STRTAB_SLACK = 4096
 
 
 class InjectError(RuntimeError):
@@ -45,12 +60,20 @@ def _seg_type_load():
         return lief.ELF.SEGMENT_TYPES.LOAD
 
 
-def _seg_flags_rx():
+def _seg_flags():
     try:
-        F = lief.ELF.Segment.FLAGS
+        return lief.ELF.Segment.FLAGS
     except AttributeError:
-        F = lief.ELF.SEGMENT_FLAGS
+        return lief.ELF.SEGMENT_FLAGS
+
+
+def _seg_flags_rx():
+    F = _seg_flags()
     return F.R | F.X
+
+
+def _seg_flags_r():
+    return _seg_flags().R
 
 
 def _tag(name):
@@ -69,6 +92,9 @@ class InjectResult:
     entry_rva: int
     strategy: str          # how load-time execution was hijacked
     cipher: str
+    # wbaes only: the per-target helper .so that must be ADDED to the APK as a sibling.
+    helper_path: str | None = None
+    helper_soname: str | None = None
 
 
 def _find_text(binary) -> "lief.ELF.Section":
@@ -106,8 +132,485 @@ def _hijack_existing_init(binary, decinfo_rva: int, entry_rva: int):
     return FLAG_CHAIN_INIT, orig - decinfo_rva, "DT_INIT-hijack"
 
 
+def _dynamic_soname(binary) -> str | None:
+    e = binary.get(_tag("SONAME"))
+    name = getattr(e, "name", None) if e is not None else None
+    return name or None
+
+
+def _set_soname(binary, soname: str) -> None:
+    e = binary.get(_tag("SONAME"))
+    if e is not None:
+        e.name = soname
+        return
+    try:
+        binary.add(lief.ELF.DynamicSharedObject(soname))
+    except Exception as exc:  # pragma: no cover - skeleton always has a SONAME
+        raise InjectError(f"helper skeleton has no DT_SONAME and none could be added: {exc}")
+
+
+def _needed_names(binary) -> list[str]:
+    return [e.name for e in binary.dynamic_entries if e.tag == _tag("NEEDED")]
+
+
+class _LoaderView:
+    """A read-only view of a `.so` the way the LOADER sees it: program headers plus
+    `.dynamic`, and never section headers.
+
+    That distinction is the whole point. The wbaes path supersedes `.dynstr` with an appended
+    copy, so the `.dynstr` SECTION header and `DT_STRTAB` can legitimately point at different
+    bytes — and only `DT_STRTAB` is what bionic (and `dlsym`) actually use. Anything asserting
+    a runtime property must read it this way.
+    """
+
+    def __init__(self, path: str):
+        import struct
+        with open(path, "rb") as f:
+            self.buf = buf = f.read()
+        self.is64 = is64 = buf[4] == 2
+        self.W = W = "<Q" if is64 else "<I"
+        e_phoff = struct.unpack_from(W, buf, 0x20 if is64 else 0x1C)[0]
+        e_phentsize = struct.unpack_from("<H", buf, 0x36 if is64 else 0x2A)[0]
+        e_phnum = struct.unpack_from("<H", buf, 0x38 if is64 else 0x2C)[0]
+        p_offset, p_vaddr = (8, 16) if is64 else (4, 8)
+        p_filesz, p_memsz = (32, 40) if is64 else (16, 20)
+        self.loads, dyn = [], None
+        for i in range(e_phnum):
+            p = e_phoff + i * e_phentsize
+            ptype = struct.unpack_from("<I", buf, p)[0]
+            if ptype == _PT_LOAD:
+                self.loads.append((struct.unpack_from(W, buf, p + p_vaddr)[0],
+                                   struct.unpack_from(W, buf, p + p_offset)[0],
+                                   struct.unpack_from(W, buf, p + p_filesz)[0],
+                                   struct.unpack_from(W, buf, p + p_memsz)[0]))
+            elif ptype == _PT_DYNAMIC:
+                dyn = (struct.unpack_from(W, buf, p + p_offset)[0],
+                       struct.unpack_from(W, buf, p + p_filesz)[0])
+        self.tags: dict[int, int] = {}
+        self.needed_offs: list[int] = []
+        if dyn is None:
+            return
+        DYN = 16 if is64 else 8
+        DTAG = "<q" if is64 else "<i"
+        for i in range(dyn[1] // DYN):
+            off = dyn[0] + i * DYN
+            tag = struct.unpack_from(DTAG, buf, off)[0]
+            val = struct.unpack_from(W, buf, off + (8 if is64 else 4))[0]
+            if tag == _DT_NULL:
+                break
+            if tag == _DT_NEEDED:
+                self.needed_offs.append(val)
+            else:
+                self.tags[tag] = val
+
+    def vaddr_to_off(self, va: int) -> int | None:
+        # p_filesz, not p_memsz: a vaddr in the .bss tail has no file bytes to read.
+        for v, o, fsz, _msz in self.loads:
+            if v <= va < v + fsz:
+                return o + (va - v)
+        return None
+
+    def _str_at(self, base: int, off: int) -> str:
+        end = self.buf.index(b"\x00", base + off)
+        return self.buf[base + off:end].decode("utf-8", "replace")
+
+    def strtab_off(self) -> int | None:
+        va = self.tags.get(_DT_STRTAB)
+        return None if va is None else self.vaddr_to_off(va)
+
+    def needed(self) -> list[str]:
+        base = self.strtab_off()
+        if base is None:
+            return []
+        return [self._str_at(base, o) for o in self.needed_offs]
+
+    def dynsym_count(self) -> int | None:
+        """Number of `.dynsym` entries.
+
+        `DT_HASH`'s `nchain` IS the count, so use it when present. Otherwise fall back to the
+        `.dynsym` SECTION header size — which is safe here even though this class otherwise
+        refuses to trust section headers, because sopack never moves or rewrites `.dynsym`. The
+        distinction that matters is: take the COUNT from the section header (untouched), take the
+        STRINGS from `DT_STRTAB` (which this tool does relocate).
+
+        `DT_GNU_HASH` deliberately gets no fallback. It only ever covers *defined, exported*
+        symbols from `symoffset` onwards, so it cannot see undefined imports at all — and when a
+        library exports nothing (exactly our helper skeleton, built `-fvisibility=hidden` with
+        `--exclude-libs`) the bucket array is empty and the usual chain-walk reads whatever
+        follows, silently returning a too-small number. That under-count made this function
+        report 10 symbols for a 20-symbol `.so` and hid three unresolved `wbc_*` imports."""
+        import struct
+        if _DT_HASH in self.tags:
+            o = self.vaddr_to_off(self.tags[_DT_HASH])
+            if o is not None:
+                return struct.unpack_from("<I", self.buf, o + 4)[0]
+        return self._dynsym_count_from_shdr()
+
+    def _dynsym_count_from_shdr(self) -> int | None:
+        import struct
+        buf, is64, W = self.buf, self.is64, self.W
+        e_shoff = struct.unpack_from(W, buf, 0x28 if is64 else 0x20)[0]
+        e_shentsize = struct.unpack_from("<H", buf, 0x3A if is64 else 0x2E)[0]
+        e_shnum = struct.unpack_from("<H", buf, 0x3C if is64 else 0x30)[0]
+        if not e_shoff or not e_shnum:
+            return None
+        sh_size_off = 0x20 if is64 else 0x14
+        for i in range(e_shnum):
+            s = e_shoff + i * e_shentsize
+            if s + e_shentsize > len(buf):
+                return None
+            if struct.unpack_from("<I", buf, s + 4)[0] == _SHT_DYNSYM:
+                size = struct.unpack_from(W, buf, s + sh_size_off)[0]
+                ent = 24 if is64 else 16
+                return size // ent
+        return None
+
+
+def _needed_via_strtab(path: str) -> list[str]:
+    """Resolve DT_NEEDED names the way the LOADER does — via DT_STRTAB read from .dynamic
+    (not the .dynstr section, which we may have superseded with a copy)."""
+    return _LoaderView(path).needed()
+
+
+def _effective_strtab(path: str) -> bytes:
+    """The DT_STRTAB bytes as written — the table `.dynsym`'s st_name offsets actually index.
+
+    Read this AFTER LIEF's write, never from a pre-write `.dynstr` section: LIEF rebuilds the
+    string table with the strings sorted and rewrites every st_name to match, so the pre-write
+    bytes are a different table with the same contents in a different order."""
+    v = _LoaderView(path)
+    base, strsz = v.strtab_off(), v.tags.get(_DT_STRSZ)
+    if base is None or strsz is None:
+        raise InjectError(f"{os.path.basename(path)} has no usable DT_STRTAB/DT_STRSZ")
+    return v.buf[base:base + strsz]
+
+
+def _undefined_dynsyms(path: str) -> list[str]:
+    """Names of UNDEFINED dynamic symbols (`st_shndx == SHN_UNDEF`), i.e. what this `.so`
+    expects the loader to resolve for it. Used to catch a helper skeleton that was linked
+    against the wrong `libwbcrypto.a`."""
+    import struct
+    v = _LoaderView(path)
+    symtab_va, strtab = v.tags.get(_DT_SYMTAB), v.strtab_off()
+    if symtab_va is None or strtab is None:
+        return []
+    symtab = v.vaddr_to_off(symtab_va)
+    n = v.dynsym_count()
+    if symtab is None or n is None:
+        return []
+    ent = 24 if v.is64 else 16
+    out = []
+    for i in range(n):
+        st_name, _info, _other, shndx = struct.unpack_from("<IBBH", v.buf, symtab + i * ent)
+        if st_name and shndx == 0:
+            out.append(v._str_at(strtab, st_name))
+    return out
+
+
+def _dynsym_names(path: str) -> list[str]:
+    """Every `.dynsym` entry's name, resolved exactly as `dlsym` would (DT_SYMTAB indexed
+    against DT_STRTAB, count from the loader's hash table). Section headers are ignored.
+
+    This exists to pin the invariant that an injection must never change the target's exported
+    symbol names — see `_self_verify_wbaes`. Returns [] if the file has no dynamic symbols;
+    raises InjectError if it has them but the count cannot be determined, because silently
+    checking nothing is how the original bug shipped."""
+    import struct
+    v = _LoaderView(path)
+    symtab_va, strtab = v.tags.get(_DT_SYMTAB), v.strtab_off()
+    if symtab_va is None or strtab is None:
+        return []
+    symtab = v.vaddr_to_off(symtab_va)
+    n = v.dynsym_count()
+    if symtab is None or n is None:
+        raise InjectError(
+            f"{os.path.basename(path)} has a DT_SYMTAB but no usable DT_HASH/DT_GNU_HASH, so "
+            "its symbol names cannot be verified")
+    ent = 24 if v.is64 else 16
+    out = []
+    for i in range(n):
+        st_name = struct.unpack_from("<I", v.buf, symtab + i * ent)[0]
+        if st_name:                       # index 0 is the reserved undefined symbol
+            out.append(v._str_at(strtab, st_name))
+    return out
+
+
+def _helper_soname_for(target_soname: str) -> str:
+    """Per-target helper soname. Keep it deterministic and collision-free."""
+    base = target_soname[:-3] if target_soname.endswith(".so") else target_soname
+    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in base)
+    return f"libsopk_rt_{safe}.so"
+
+
+def _emit_helper(abi: str, helper_soname: str, region_bytes: bytes,
+                 out_path: str) -> None:
+    """Clone the ABI helper skeleton: rename its DT_SONAME and append the metadata region
+    as a fresh read-only 16 KB-aligned PT_LOAD (its first bytes are the region, which the
+    helper's constructor finds by magic — see stub/sopk_rt.c)."""
+    skeleton = helper_skeleton_path(abi)
+
+    # Build-marker guard. The skeleton is built by hand outside this repo, so a stale one is
+    # easy to leave behind — and a stale one is SILENT: its ctor requires an exact region
+    # version match, finds none, fails open, and the target runs still-encrypted .text and
+    # SIGILLs with nothing pointing at the cause. Catch it here instead.
+    with open(skeleton, "rb") as f:
+        if HELPER_BUILD_MARKER not in f.read():
+            raise InjectError(
+                f"helper skeleton {skeleton.name} lacks the v{REGION_VERSION} build marker "
+                f"({HELPER_BUILD_MARKER.hex()}) — it was built from an older stub/sopk_rt.c "
+                "and would fail open at load, leaving encrypted .text to crash the app. "
+                "Rebuild it from the current stub/sopk_rt.c against whitebox-cryptography "
+                ">= 2.0.0 (see docs/wbaes-verification.md).")
+
+    binary = lief.parse(str(skeleton))
+    if binary is None:
+        raise InjectError(f"LIEF failed to parse helper skeleton {skeleton}")
+
+    # dependency-closure guard: a correctly static-linked helper needs only bionic libs.
+    stray = [n for n in _needed_names(binary) if n not in _BIONIC_ALLOWED]
+    if stray:
+        raise InjectError(
+            f"helper skeleton {skeleton.name} has non-bionic DT_NEEDED {stray} — the "
+            "white-box was not statically linked in (libwbcrypto/libc++/libsodium must be "
+            "static). Rebuild the skeleton.")
+
+    # A `-shared` link permits unresolved symbols, so a skeleton built against a 1.x
+    # libwbcrypto.a (no wbc_wrap_key/wbc_unwrap_key/wbc_wipe) links CLEANLY and leaves them as
+    # UND imports. bionic then fails to load the helper, which makes dlopen of the TARGET fail,
+    # which surfaces as a crash in whatever was loading the target — nowhere near the cause.
+    # Catch it here; also tell the user the link flag that would have caught it at build time.
+    unresolved = sorted({n for n in _undefined_dynsyms(str(skeleton))
+                         if n.startswith(("wbc_", "sodium_"))})
+    if unresolved:
+        raise InjectError(
+            f"helper skeleton {skeleton.name} imports {unresolved} instead of defining them — "
+            "it was linked against a 1.x libwbcrypto.a (or none). The helper would fail to "
+            "load, taking the target's dlopen down with it. Rebuild assets/wbc/ from "
+            "whitebox-cryptography >= 2.0.0 (scripts/build_android.sh) and link with "
+            "-Wl,--no-undefined so this fails at build time instead.")
+
+    _set_soname(binary, helper_soname)
+
+    seg = lief.ELF.Segment()
+    seg.type = _seg_type_load()
+    seg.flags = _seg_flags_r()          # read-only: not W, not X (region is data)
+    seg.alignment = SEGMENT_ALIGN
+    seg.content = list(region_bytes)
+    binary.add(seg)
+    binary.write(out_path)
+
+
+def _inject_wbaes(in_path: str, out_path: str, abi: str,
+                  wb_keygen: str | None, target_name: str | None) -> InjectResult:
+    """`--cipher wbaes`: encrypt `.text` with ChaCha20 under a session key that is wrapped
+    by a sealed white-box AES-128 key, and inject a per-target DT_NEEDED helper that unwraps
+    and decrypts at load. No stub/decinfo/DT_INIT surgery — the helper's constructor runs
+    before the target's init via dependency ordering. See sopack/provision.py for why the
+    white-box no longer touches the bulk data."""
+    binary = lief.parse(in_path)
+    if binary is None:
+        raise InjectError(f"LIEF failed to parse {in_path}")
+
+    # The soname the on-device helper matches via dl_iterate_phdr basename. Prefer the APK
+    # file name bionic will report; fall back to DT_SONAME, then the input basename.
+    import os as _os
+    target_soname = (target_name or _dynamic_soname(binary)
+                     or _os.path.basename(in_path))
+
+    # 1. encrypt .text under a freshly wrapped session key (host provisioning).
+    text = _find_text(binary)
+    text_size = int(text.size)
+    plain = bytes(text.content)[:text_size]
+    if len(plain) != text_size:
+        raise InjectError(".text content shorter than declared size")
+    prov = provision_text(plain, wb_keygen=wb_keygen)
+    text.content = list(prov.ciphertext)
+
+    # 2. inject the per-target helper as a DT_NEEDED. We do NOT use LIEF add_library: it
+    #    grows .dynamic + .dynstr and on tight libs (e.g. libapp.so) LIEF spills them into
+    #    4 KB-aligned segments that break 16 KB loading (Risk 2). Instead we mirror the stub
+    #    path: append a 16 KB-aligned COPY of .dynstr (+ our soname) with the trusted
+    #    add(seg), then raw-repoint DT_STRTAB/DT_STRSZ and add DT_NEEDED in place — keeping
+    #    .dynamic and PT_DYNAMIC where they are.
+    #
+    #    The string table we copy MUST be the one LIEF emits, not the one we read here.
+    #    `write()` rebuilds .dynstr with the strings sorted and rewrites every st_name in
+    #    .dynsym to match its new layout. Copying the PRE-write bytes and then repointing
+    #    DT_STRTAB at them leaves every offset pointing mid-string, so dlsym() returns NULL
+    #    for every symbol — an APK that loads and then crashes (this shipped once: Flutter
+    #    null-dereferenced its Dart snapshot pointers in performNativeAttach). So we reserve
+    #    a placeholder segment, let LIEF write, then read the EFFECTIVE table back out of the
+    #    file via DT_STRTAB and fill the placeholder with that.
+    helper_soname = _helper_soname_for(target_soname)
+    dynstr = binary.get_section(".dynstr")
+    if dynstr is None:
+        raise InjectError("target has no .dynstr section")
+    soname_bytes = helper_soname.encode("ascii") + b"\x00"
+    # LIEF's rebuild only reorders and may de-duplicate, so its table is normally the same
+    # size; the slack absorbs a table that grew. An overflow is handled below, never ignored.
+    reserve = len(bytes(dynstr.content)) + len(soname_bytes) + _STRTAB_SLACK
+
+    for attempt in range(2):
+        b = binary if attempt == 0 else lief.parse(in_path)
+        if b is None:
+            raise InjectError(f"LIEF failed to re-parse {in_path}")
+        seg = lief.ELF.Segment()
+        seg.type = _seg_type_load()
+        seg.flags = _seg_flags_r()      # read-only data (the string table copy)
+        seg.alignment = SEGMENT_ALIGN
+        seg.content = [0] * reserve
+        added = b.add(seg)
+        # add(seg) updates in-memory vaddrs consistently (proven by the stub path): read now.
+        text_rva = int(_find_text(b).virtual_address)
+        strtab_rva = int(added.virtual_address)
+        b.write(out_path)
+        strtab_foff = int(added.file_offset)   # reliable after write (same as the stub path)
+
+        # The table .dynsym's offsets actually refer to, straight out of the written file.
+        eff = _effective_strtab(out_path)
+        new_strtab = eff + soname_bytes
+        if len(new_strtab) <= reserve:
+            break
+        if attempt:
+            raise InjectError(
+                f"appended string table still does not fit ({len(new_strtab)} > {reserve})")
+        reserve = len(new_strtab)         # retry once at the exact size
+
+    name_off = len(eff)
+
+    # 3. raw ELF surgery on the written file: write the effective table into the placeholder,
+    #    repoint DT_STRTAB/DT_STRSZ (and the .dynstr section header, so tools agree with the
+    #    loader), and overwrite the .dynamic DT_NULL terminator with our DT_NEEDED.
+    with open(out_path, "r+b") as f:
+        f.seek(strtab_foff)
+        f.write(new_strtab)
+    _add_needed_inplace(out_path, name_off, strtab_rva, strtab_foff, len(new_strtab))
+
+    # 4. build + emit the helper carrying this target's metadata region.
+    region = Region(
+        text_rva=text_rva, text_size=text_size,
+        wrapped=prov.wrapped, nonce16=prov.nonce16,
+        soname=target_soname.encode("utf-8"), wpass=prov.wpass, blob=prov.blob,
+    ).pack()
+    helper_path = out_path + ".helper.so"
+    _emit_helper(abi, helper_soname, region, helper_path)
+
+    # 5. self-verify both artifacts.
+    _self_verify_wbaes(out_path, helper_path, prov.ciphertext, text_rva, text_size,
+                       target_soname, helper_soname, abi, in_path)
+
+    return InjectResult(abi=abi, text_rva=text_rva, text_size=text_size,
+                        seg_rva=0, entry_rva=0, strategy="DT_NEEDED-wbaes",
+                        cipher="wbaes", helper_path=helper_path,
+                        helper_soname=helper_soname)
+
+
+def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size,
+                       target_soname, helper_soname, abi, in_path):
+    """Assert every invariant the on-device helper depends on, for both artifacts."""
+    tgt = lief.parse(target_path)
+    if tgt is None:
+        raise InjectError("re-parse of wbaes target failed")
+    # (a) .text vaddr unchanged vs what we baked into the region, and content is ciphertext.
+    # Read the .text bytes straight from the file at the section offset (LIEF's .content on
+    # a multi-MB section is slow and, on some builds, unreliable).
+    t = _find_text(tgt)
+    if int(t.virtual_address) != text_rva:
+        raise InjectError(f".text vaddr shifted after write: 0x{int(t.virtual_address):x}")
+    with open(target_path, "rb") as f:
+        f.seek(int(t.file_offset))
+        if f.read(text_size) != ciphertext:
+            raise InjectError("target .text is not the provisioned ciphertext")
+    # (b) DT_NEEDED points at the helper — resolved via DT_STRTAB, as the loader does.
+    if helper_soname not in _needed_via_strtab(target_path):
+        raise InjectError(f"DT_NEEDED {helper_soname!r} missing from target")
+    # (b2) EVERY existing exported symbol name still resolves to the same string. This mode
+    # supersedes .dynstr with an appended copy, so a mismatch here means dlsym() returns the
+    # wrong name (or NULL) for symbols the app looks up — an APK that loads and then crashes
+    # far from the cause. It shipped exactly once: LIEF re-sorts .dynstr during write() and
+    # rewrites st_name to match, so a copy taken before the write desynchronised every offset
+    # and Flutter null-dereferenced its Dart snapshot pointers. Cheap check, unmissable bug.
+    before, after = _dynsym_names(in_path), _dynsym_names(target_path)
+    if before != after:
+        bad = next(((x, y) for x, y in zip(before, after) if x != y), None)
+        detail = f"e.g. {bad[0]!r} -> {bad[1]!r}" if bad else \
+                 f"count {len(before)} -> {len(after)}"
+        raise InjectError(
+            f"injection changed the target's dynamic symbol names ({detail}) — DT_STRTAB and "
+            "the .dynsym offsets are out of sync, so dlsym() would fail on device")
+    # (c) 16 KB congruence for arm64 (the only 16 KB-page device class) + no text relocs.
+    _assert_16k_and_no_textrel(tgt, abi)
+
+    hlp = lief.parse(helper_path)
+    if hlp is None:
+        raise InjectError("re-parse of wbaes helper failed")
+    if _dynamic_soname(hlp) != helper_soname:
+        raise InjectError("helper DT_SONAME not renamed")
+    stray = [n for n in _needed_names(hlp) if n not in _BIONIC_ALLOWED]
+    if stray:
+        raise InjectError(f"emitted helper has non-bionic DT_NEEDED {stray}")
+    _assert_16k_and_no_textrel(hlp, abi)
+    # (d) the region round-trips and describes THIS target.
+    region = _extract_region(helper_path)
+    r = Region.unpack(region)
+    if (r.text_rva, r.text_size) != (text_rva, text_size):
+        raise InjectError("helper region text_rva/size mismatch")
+    if r.soname.decode("utf-8", "replace") != target_soname:
+        raise InjectError("helper region soname mismatch")
+    if len(r.blob) < WHITEN_SPAN or len(r.wpass) == 0:
+        raise InjectError("helper region blob/pass missing")
+    # The helper reads these as fixed-size fields, so a wrong length here is a wrong-length
+    # unwrap on device (i.e. a silent garbage session key), not a parse error.
+    if len(r.wrapped) != WRAPPED_KEY_BYTES:
+        raise InjectError(
+            f"helper region wrapped key is {len(r.wrapped)} bytes, expected {WRAPPED_KEY_BYTES}")
+    if len(r.nonce16) != 16 or r.nonce16 == b"\x00" * 16:
+        raise InjectError("helper region ChaCha20 nonce missing or all-zero")
+
+
+def _assert_16k_and_no_textrel(binary, abi):
+    load_t = _seg_type_load()
+    if abi == "arm64-v8a":
+        for s in binary.segments:
+            if s.type != load_t:
+                continue
+            if int(s.alignment) % SEGMENT_ALIGN != 0:
+                raise InjectError(
+                    f"LOAD seg align {int(s.alignment)} not multiple of {SEGMENT_ALIGN}")
+            if (int(s.virtual_address) - int(s.file_offset)) % SEGMENT_ALIGN != 0:
+                raise InjectError("LOAD seg vaddr/offset not 16 KB-congruent")
+    if binary.get(_tag("TEXTREL")) is not None:
+        raise InjectError("output has DT_TEXTREL (text relocations) — must be absent")
+
+
+def _extract_region(helper_path: str) -> bytes:
+    """Read the appended region back out of an emitted helper by locating the read-only
+    PT_LOAD whose file bytes start with the region magic (mirrors the ctor's magic-scan)."""
+    from .rt_meta import HDR_SIZE, REGION_MAGIC
+    magic = REGION_MAGIC.to_bytes(4, "little")
+    b = lief.parse(helper_path)
+    F = _seg_flags()
+    with open(helper_path, "rb") as f:
+        data = f.read()
+    for s in b.segments:
+        if s.type != _seg_type_load():
+            continue
+        fl = int(s.flags)
+        if (fl & int(F.W)) or (fl & int(F.X)):
+            continue
+        off = int(s.file_offset)
+        if data[off:off + 4] == magic:
+            size = int(s.physical_size) or (len(data) - off)
+            return data[off:off + size]
+    raise InjectError("could not find the region segment in the emitted helper")
+
+
 def inject_so(in_path: str, out_path: str, abi: str,
-              cipher: str = "chacha20", log: bool = False) -> InjectResult:
+              cipher: str = "chacha20", log: bool = False,
+              wb_keygen: str | None = None,
+              target_name: str | None = None) -> InjectResult:
+    if CIPHER_IDS[cipher] == CIPHER_WBAES:
+        return _inject_wbaes(in_path, out_path, abi, wb_keygen, target_name)
     stub: Stub = load_stub(abi)
     cipher_id = CIPHER_IDS[cipher]
     # Whitening span: the WHITEN_SPAN stub bytes immediately before g_decinfo — real
@@ -212,6 +715,124 @@ def inject_so(in_path: str, out_path: str, abi: str,
 
 
 _DT_NULL, _DT_INIT, _SHT_DYNAMIC, _PT_DYNAMIC, _PT_LOAD = 0, 12, 6, 2, 1
+_DT_NEEDED, _DT_STRTAB, _DT_STRSZ = 1, 5, 10
+_DT_HASH, _DT_SYMTAB, _DT_GNU_HASH, _SHT_DYNSYM = 4, 6, 0x6FFFFEF5, 11
+
+
+def _add_needed_inplace(path: str, name_off: int, new_strtab_vaddr: int,
+                        new_strtab_foff: int, new_strsz: int) -> None:
+    """Add a DT_NEEDED whose name lives at `name_off` in a NEW string table (already
+    appended as its own segment), WITHOUT growing/moving .dynamic. We (1) repoint
+    DT_STRTAB/DT_STRSZ to the new table (a verbatim copy of the old .dynstr + our soname,
+    so every existing string offset still resolves), (2) repoint the .dynstr SECTION header
+    to the same copy so section-based tools (readelf -d, LIEF) agree with the loader, and
+    (3) overwrite the .dynamic DT_NULL terminator in place with DT_NEEDED, using the
+    following zero word as the new terminator — the same in-place trick as
+    _add_dtinit_inplace (and the same loud refusal when there is no usable terminator slot).
+    Class-aware raw ELF little-endian surgery."""
+    import struct
+    with open(path, "r+b") as f:
+        buf = bytearray(f.read())
+        is64 = buf[4] == 2
+        W = "<Q" if is64 else "<I"
+        E_PHOFF, E_SHOFF = (0x20, 0x28) if is64 else (0x1C, 0x20)
+        E_PHENTSIZE, E_PHNUM = (0x36, 0x38) if is64 else (0x2A, 0x2C)
+        E_SHENTSIZE, E_SHNUM = (0x3A, 0x3C) if is64 else (0x2E, 0x30)
+        P_OFFSET = 8 if is64 else 4
+        P_FILESZ = 32 if is64 else 16
+        P_MEMSZ = 40 if is64 else 20
+        SH_ADDR = 16 if is64 else 12
+        SH_OFFSET = 24 if is64 else 16
+        SH_SIZE = 32 if is64 else 20
+        _SHT_STRTAB = 3
+        DYN = 16 if is64 else 8
+        DTAG = "<q" if is64 else "<i"
+        DPACK = "<qQ" if is64 else "<iI"
+
+        e_phoff = struct.unpack_from(W, buf, E_PHOFF)[0]
+        e_phentsize = struct.unpack_from("<H", buf, E_PHENTSIZE)[0]
+        e_phnum = struct.unpack_from("<H", buf, E_PHNUM)[0]
+        e_shoff = struct.unpack_from(W, buf, E_SHOFF)[0]
+        e_shentsize = struct.unpack_from("<H", buf, E_SHENTSIZE)[0]
+        e_shnum = struct.unpack_from("<H", buf, E_SHNUM)[0]
+
+        ph_dyn = None
+        loads = []
+        for i in range(e_phnum):
+            p = e_phoff + i * e_phentsize
+            ptype = struct.unpack_from("<I", buf, p)[0]
+            if ptype == _PT_DYNAMIC:
+                ph_dyn = p
+            elif ptype == _PT_LOAD:
+                loads.append((struct.unpack_from(W, buf, p + P_OFFSET)[0],
+                              struct.unpack_from(W, buf, p + P_FILESZ)[0],
+                              struct.unpack_from(W, buf, p + P_MEMSZ)[0]))
+        if ph_dyn is None:
+            raise InjectError("no PT_DYNAMIC program header found")
+        dyn_off = struct.unpack_from(W, buf, ph_dyn + P_OFFSET)[0]
+        dyn_filesz = struct.unpack_from(W, buf, ph_dyn + P_FILESZ)[0]
+
+        # repoint DT_STRTAB / DT_STRSZ and locate the DT_NULL terminator in one pass.
+        term = None
+        old_strtab_vaddr = None
+        for i in range(dyn_filesz // DYN):
+            off = dyn_off + i * DYN
+            tag = struct.unpack_from(DTAG, buf, off)[0]
+            if tag == _DT_STRTAB:
+                old_strtab_vaddr = struct.unpack_from(W, buf, off + (8 if is64 else 4))[0]
+                struct.pack_into(W, buf, off + (8 if is64 else 4), new_strtab_vaddr)
+            elif tag == _DT_STRSZ:
+                struct.pack_into(W, buf, off + (8 if is64 else 4), new_strsz)
+            elif tag == _DT_NULL and term is None:
+                term = i
+        if term is None:
+            raise InjectError(".dynamic has no DT_NULL terminator")
+
+        # repoint the .dynstr SECTION header (the SHT_STRTAB whose addr was the old strtab)
+        # to the appended copy, so section-based tools resolve the same strings as bionic.
+        if old_strtab_vaddr is not None:
+            for i in range(e_shnum):
+                s = e_shoff + i * e_shentsize
+                if (struct.unpack_from("<I", buf, s + 4)[0] == _SHT_STRTAB
+                        and struct.unpack_from(W, buf, s + SH_ADDR)[0] == old_strtab_vaddr):
+                    struct.pack_into(W, buf, s + SH_ADDR, new_strtab_vaddr)
+                    struct.pack_into(W, buf, s + SH_OFFSET, new_strtab_foff)
+                    struct.pack_into(W, buf, s + SH_SIZE, new_strsz)
+                    break
+
+        # the slot after the terminator must read DT_NULL at runtime (in-place terminator).
+        new_term_off = dyn_off + (term + 1) * DYN
+        if new_term_off + DYN > len(buf):
+            raise InjectError("no room after .dynamic for a new terminator")
+        container = next(((o, fsz, msz) for (o, fsz, msz) in loads
+                          if o <= dyn_off < o + fsz), None)
+        if container is None:
+            raise InjectError(".dynamic is not inside a PT_LOAD segment")
+        c_off, c_filesz, c_memsz = container
+        seg_term = new_term_off - c_off
+        if seg_term + DYN <= c_filesz:
+            if struct.unpack_from(DTAG, buf, new_term_off)[0] != _DT_NULL:
+                raise InjectError(
+                    "slot after .dynamic terminator is file-backed with a non-DT_NULL tag; "
+                    "cannot add DT_NEEDED in place (target's .dynamic is full)")
+        elif seg_term + DYN > ((c_memsz + 0xFFF) & ~0xFFF):
+            raise InjectError("no mapped zero slot after .dynamic for a new terminator")
+
+        struct.pack_into(DPACK, buf, dyn_off + term * DYN, _DT_NEEDED, name_off)
+
+        new_filesz = (term + 2) * DYN
+        if new_filesz > dyn_filesz:
+            struct.pack_into(W, buf, ph_dyn + P_FILESZ, new_filesz)
+            struct.pack_into(W, buf, ph_dyn + P_MEMSZ, new_filesz)
+        for i in range(e_shnum):
+            s = e_shoff + i * e_shentsize
+            if struct.unpack_from("<I", buf, s + 4)[0] == _SHT_DYNAMIC:
+                if new_filesz > struct.unpack_from(W, buf, s + SH_SIZE)[0]:
+                    struct.pack_into(W, buf, s + SH_SIZE, new_filesz)
+                break
+
+        f.seek(0)
+        f.write(buf)
 
 
 def _add_dtinit_inplace(path: str, entry_rva: int) -> None:

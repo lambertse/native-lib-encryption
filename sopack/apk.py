@@ -127,16 +127,26 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
               keystore: KeystoreInfo | None = None,
               min_sdk: int | None = None,
               log: bool = False,
+              wb_keygen: str | None = None,
               logger=print) -> RepackResult:
     wanted = set(wanted_libs)
     abis_set = set(abis)
     result = RepackResult(output=out_apk)
+
+    # wbaes preflight: resolve a RUNNABLE host wb_keygen now, so a wrong tool fails before we
+    # start injecting (not mid-pack). Also surfaces the Android-vs-host mistake up front.
+    if cipher == "wbaes":
+        from .provision import find_wb_keygen
+        wb_keygen = find_wb_keygen(wb_keygen)   # raises with guidance if unusable
+        logger(f"  using host wb_keygen: {wb_keygen}")
 
     with tempfile.TemporaryDirectory(prefix="sopack-") as tmp:
         unsigned = os.path.join(tmp, "unsigned.apk")
         aligned = os.path.join(tmp, "aligned.apk")
 
         matched_any = False
+        seen_names: set[str] = set()          # every entry written (collision guard)
+        extra_helpers: list[tuple[str, bytes]] = []   # wbaes: (lib/<abi>/name, bytes)
         with zipfile.ZipFile(in_apk, "r") as zin, \
                 zipfile.ZipFile(unsigned, "w") as zout:
             for item in zin.infolist():
@@ -153,21 +163,43 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                     dst = os.path.join(tmp, "out.so")
                     with open(src, "wb") as f:
                         f.write(data)
-                    ir = inject_so(src, dst, abi, cipher=cipher, log=log)
+                    ir = inject_so(src, dst, abi, cipher=cipher, log=log,
+                                   wb_keygen=wb_keygen, target_name=m.group(2))
                     with open(dst, "rb") as f:
                         data = f.read()
                     result.injected.append(ir)
                     matched_any = True
+                    # wbaes: stage the per-target helper .so to add into lib/<abi>/.
+                    if ir.helper_path and ir.helper_soname:
+                        hname = f"lib/{abi}/{ir.helper_soname}"
+                        with open(ir.helper_path, "rb") as hf:
+                            extra_helpers.append((hname, hf.read()))
                     # STORED so the .so stays uncompressed & page-alignable.
                     zi = zipfile.ZipInfo(name, date_time=item.date_time)
                     zi.compress_type = zipfile.ZIP_STORED
                     zi.external_attr = item.external_attr
                     zout.writestr(zi, data)
+                    seen_names.add(name)
                 else:
                     if m:
                         result.skipped.append(name)
                     # Preserve original entry (compression and all).
                     zout.writestr(item, data)
+                    seen_names.add(name)
+
+            # Add the wbaes helper libraries as NEW STORED entries (the packer's only
+            # add-file path). Skip a name already present (shouldn't collide — helper
+            # sonames are per-target and prefixed libsopk_rt_).
+            for hname, hdata in extra_helpers:
+                if hname in seen_names:
+                    logger(f"  warning: helper {hname} already present; not overwriting")
+                    continue
+                logger(f"  adding helper {hname} …")
+                zi = zipfile.ZipInfo(hname)
+                zi.compress_type = zipfile.ZIP_STORED
+                zi.external_attr = (0o644 << 16)
+                zout.writestr(zi, hdata)
+                seen_names.add(hname)
 
         if not matched_any:
             raise RuntimeError(

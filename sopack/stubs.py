@@ -45,3 +45,20 @@ def load_stub(abi: str) -> Stub:
     return Stub(abi=abi, blob=blob,
                 entry_off=int(meta["entry_off"]),
                 decinfo_off=int(meta["decinfo_off"]))
+
+
+# ---- wbaes helper skeleton (--cipher wbaes) ---------------------------------------
+def helper_skeleton_path(abi: str) -> Path:
+    """Path to the user-built white-box helper skeleton for `abi`.
+
+    A normal Android .so (NDK + O-MVLL) built from stub/sopk_rt.c, statically linking the
+    white-box VM. The packer clones it per target, renames its DT_SONAME, and appends the
+    metadata region. See stub/sopk_rt.h."""
+    if abi not in SUPPORTED_ABIS:
+        raise ValueError(f"unsupported ABI {abi!r}; supported: {SUPPORTED_ABIS}")
+    p = _STUB_DIR / f"sopk_rt_{abi}.so"
+    if not p.exists():
+        raise StubMissingError(
+            f"wbaes helper skeleton for {abi} not found ({p.name} in {_STUB_DIR}). Build "
+            "it from stub/sopk_rt.c with the NDK + O-MVLL and drop it there.")
+    return p
