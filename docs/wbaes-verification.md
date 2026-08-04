@@ -10,7 +10,21 @@ format to v3. Older artifacts are not usable: a v2 blob is *rejected* by `Unseal
 `scripts/gen_blob.sh` fails with `'abort' is not a member of 'std'`, your checkout predates
 the `#include <cstdlib>` fix in `src/vm/assembler.cpp` — update it.
 
-Set these once:
+**Phases 1-4 are automated** by `scripts/build_wbaes.sh`, which runs them in order and turns
+every PASS signal below into a hard gate:
+
+```bash
+./scripts/build_wbaes.sh                      # prompts for WBC/NDK if unset
+./scripts/build_wbaes.sh --host-only          # Phases 1-3 only; no NDK needed
+./scripts/build_wbaes.sh --release            # skeleton without logcat tracing
+```
+
+It stops before Phase 5 (that needs your APK and lib names) and prints the pack command to run
+next. The phases below are the manual equivalent, and the reference for what each check means
+when the script fails one. (`scripts/build_chacha20.sh` is the equivalent for the stub ciphers,
+which need only the stub blobs.)
+
+Set these once if you prefer to run the phases by hand:
 
 ```bash
 export SOPACK=/path/to/sopack             # this repo
@@ -84,79 +98,14 @@ Python packer wrote; the passphrase whitening mirror is byte-exact (otherwise `w
 rejects the passphrase); the wrap computed in Python is what the real `wbc_unwrap_key`
 inverts; and the ChaCha20 mirror is byte-exact (otherwise the plaintext compare fails).
 
-Build the probe once:
+The probe lives at [`scripts/rt_roundtrip.c`](../scripts/rt_roundtrip.c) (it is what
+`build_wbaes.sh` compiles, so there is one copy, not two). Build it:
 
 ```bash
-cat > /tmp/rt_roundtrip.c <<'EOF'
-/* Host round-trip of the FULL --cipher wbaes contract. Parses the packer's region with the
- * real C struct, de-whitens the passphrase, opens the sealed blob with the real wbcrypto
- * 2.0.0, unwraps the session key, and ChaCha20-decrypts with the same code the helper uses. */
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include "wbcrypto.h"
-#include "sopk_rt.h"
-#include "stub_cipher.h"
-
-static double ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
-static unsigned char *slurp(const char *p, size_t *n) {
-    FILE *f = fopen(p, "rb"); if (!f) { perror(p); exit(1); }
-    fseek(f, 0, SEEK_END); long l = ftell(f); fseek(f, 0, SEEK_SET);
-    unsigned char *b = malloc(l); if (fread(b, 1, l, f) != (size_t)l) exit(1);
-    fclose(f); *n = l; return b;
-}
-
-int main(int argc, char **argv) {
-    if (argc != 4) { fprintf(stderr, "usage: %s region.bin cipher.bin plain.bin\n", argv[0]); return 2; }
-    size_t rn, cn, pn;
-    unsigned char *rb = slurp(argv[1], &rn), *ct = slurp(argv[2], &cn), *pt = slurp(argv[3], &pn);
-
-    const sopk_rt_region *r = (const sopk_rt_region *)rb;
-    printf("region: %zu bytes, hdr=%u\n", rn, SOPK_RT_REGION_HDR_SIZE);
-    if (r->magic != SOPK_RT_REGION_MAGIC) { printf("FAIL: bad magic 0x%08x\n", r->magic); return 1; }
-    if (r->version != SOPK_RT_REGION_VERSION) { printf("FAIL: version %u != %u\n", r->version, SOPK_RT_REGION_VERSION); return 1; }
-    const uint8_t *tail = rb + SOPK_RT_REGION_HDR_SIZE;
-    const char *soname = (const char *)tail;
-    const uint8_t *wpass = tail + r->soname_len;
-    const uint8_t *blob  = wpass + r->pass_len;
-    printf("  magic/version OK  target='%.*s'  text_size=%llu  blob=%u  pass_len=%u\n",
-           (int)r->soname_len, soname, (unsigned long long)r->text_size, r->blob_len, r->pass_len);
-    if (r->text_size != cn || cn != pn) { printf("FAIL: size mismatch\n"); return 1; }
-
-    /* de-whiten the passphrase exactly as the ctor does */
-    uint8_t wkey[32]; sopk_whiten_key(blob, SOPK_WHITEN_SPAN, wkey);
-    char pass[256]; memcpy(pass, wpass, r->pass_len);
-    sopk_chacha20_apply((uint8_t *)pass, r->pass_len, wkey, SOPK_WHITEN_NONCE);
-    pass[r->pass_len] = '\0';
-
-    wbc_ctx *ctx = NULL; double t0 = ms();
-    wbc_status s = wbc_open(blob, r->blob_len, pass, &ctx);
-    double t_open = ms() - t0;
-    if (s != WBC_OK) { printf("FAIL: wbc_open -> %s (wrong passphrase => whitening drift)\n", wbc_strerror(s)); return 1; }
-    printf("  wbc_open OK (%.1f ms)\n", t_open);
-
-    uint8_t sk[WBC_SESSION_KEY_BYTES];
-    t0 = ms(); s = wbc_unwrap_key(ctx, r->wrapped, sk); double t_unwrap = ms() - t0;
-    wbc_close(ctx);
-    if (s != WBC_OK) { printf("FAIL: wbc_unwrap_key -> %s\n", wbc_strerror(s)); return 1; }
-    printf("  wbc_unwrap_key OK (%.2f ms)\n", t_unwrap);
-
-    t0 = ms(); sopk_chacha20_apply(ct, cn, sk, r->nonce16); double t_bulk = ms() - t0;
-    wbc_wipe(sk, sizeof sk);
-    printf("  ChaCha20 decrypt: %.1f ms (%.0f MB/s)\n", t_bulk, cn/1e6/(t_bulk/1e3));
-
-    int ok = memcmp(ct, pt, pn) == 0;
-    printf("\nROUND-TRIP: %s   (total %.1f ms for %zu bytes)\n",
-           ok ? "PASS" : "FAIL", t_open + t_unwrap + t_bulk, pn);
-    return ok ? 0 : 1;
-}
-EOF
-
 cd "$WBC"
-SODIUM_INC="third_party/libsodium/libsodium-1.0.20/src/libsodium/include"
+SODIUM_INC="$(echo third_party/libsodium/libsodium-*/src/libsodium/include)"
 SRCS=$(find src -name '*.cpp' -not -path 'src/tools/*' -not -path 'src/rt/*' | sort)
-cc -O2 -Iinclude -I"$SOPACK/stub" -c /tmp/rt_roundtrip.c -o /tmp/rt_roundtrip.o
+cc -O2 -Iinclude -I"$SOPACK/stub" -c "$SOPACK/scripts/rt_roundtrip.c" -o /tmp/rt_roundtrip.o
 c++ -std=c++17 -O2 -w -Isrc -Iinclude -I"$SODIUM_INC" \
     /tmp/rt_roundtrip.o $SRCS build-host/libsodium.a -o /tmp/rt_roundtrip
 ```
@@ -333,16 +282,31 @@ sopack refuses such a skeleton at pack time instead.
 
 ```bash
 cd "$SOPACK"
-python3 -m sopack.cli pack in.apk --lib libfoo.so --cipher wbaes \
-    --abi arm64-v8a --wb-keygen "$SOPACK_WBKEYGEN" -o out.apk --verify
+mkdir -p output                 # sopack does not create it, and apksigner will fail without it
+
+APK=path/to/your.apk
+OUT=output/vsa-encrypted.apk
+TGT=libso1.so                   # the lib you check below
+
+python3 -m sopack.cli pack "$APK" \
+  --lib "libso1.so,libso2.so" \
+  --cipher wbaes \
+  --abi arm64-v8a \
+  --wb-keygen "$SOPACK_WBKEYGEN" \
+  -o "$OUT" \
+  --verify
 ```
 
-Verify the output APK (replace `libfoo.so` with your target):
+**Quote the `--lib` list.** It is comma-separated but must be ONE argv word: unquoted
+`--lib libso1.so, libso2.so` shell-splits, and argparse rejects the second name with
+`error: unrecognized arguments: libso2.so`.
+
+Verify the output APK:
 
 ```bash
-python3 - <<'PY'
+OUT="$OUT" TGT="$TGT" python3 - <<'PY'
 import zipfile, subprocess, tempfile, os, math, collections
-Z = zipfile.ZipFile("out.apk"); TGT = "libfoo.so"
+Z = zipfile.ZipFile(os.environ["OUT"]); TGT = os.environ["TGT"]
 libs = [n for n in Z.namelist() if n.startswith("lib/arm64-v8a/")]
 helper = f"lib/arm64-v8a/libsopk_rt_{TGT[:-3]}.so"
 print("1) helper added         :", helper in libs)
@@ -379,12 +343,12 @@ pack otherwise, but check it here too — it is the failure that produced a load
 APK, and it is invisible to every other check in this list:
 
 ```bash
-python3 - <<'PY'
-import zipfile, sys
+APK="$APK" OUT="$OUT" TGT="$TGT" python3 - <<'PY'
+import zipfile, os, sys
 sys.path.insert(0, ".")
 from sopack.elf_inject import _dynsym_names
-TGT = "libfoo.so"
-for tag, apk in (("orig", "in.apk"), ("packed", "out.apk")):
+TGT = os.environ["TGT"]
+for tag, apk in (("orig", os.environ["APK"]), ("packed", os.environ["OUT"])):
     z = zipfile.ZipFile(apk)
     open(f"/tmp/{tag}_{TGT}", "wb").write(z.read(f"lib/arm64-v8a/{TGT}"))
 a, b = _dynsym_names(f"/tmp/orig_{TGT}"), _dynsym_names(f"/tmp/packed_{TGT}")

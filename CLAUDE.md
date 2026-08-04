@@ -20,12 +20,23 @@ it explains the constraints that force nearly every design decision.
 ## Commands
 
 ```bash
-# Build the per-ABI stub blobs (needed once, and after ANY change to stub/*.c/*.h).
-# Uses the NDK if ANDROID_NDK_HOME/ANDROID_NDK_ROOT is set, else clang+lld+llvm-* on PATH.
-# The script hard-fails if the blob has any relocation, undefined symbol, or (arm64) adrp.
-bash stub/build_stubs.sh [API_LEVEL]        # default API 24 -> sopack/stubs/*.bin + *.json
-
 pip install -e .                            # install the CLI (pulls in LIEF)
+
+# One entry point per cipher mode — each gets that mode to a packable state and prints the
+# pack command to run next. Prefer these over the raw steps: they turn every PASS signal in
+# docs/wbaes-verification.md into a hard gate, which matters because this mode's failure
+# modes are mostly SILENT (see the invariants below).
+./scripts/build_chacha20.sh [--api N]       # stub ciphers: build the per-ABI blobs + test
+./scripts/build_wbaes.sh                    # wbaes: Phases 1-4 of docs/wbaes-verification.md
+./scripts/build_wbaes.sh --host-only        #   Phases 1-3 only; no NDK/cmake/ninja needed
+./scripts/build_wbaes.sh --release          #   skeleton without -DSOPK_RT_LOG tracing
+# Takes WBC/NDK from the environment, else --wbc/--ndk, else prompts. SOPACK is always the
+# repo the script lives in. --force redoes cached phases; --help lists everything.
+
+# The raw stub build the chacha20 script wraps (needed after ANY change to stub/*.c/*.h).
+# Uses the NDK if ANDROID_NDK_HOME/ANDROID_NDK_ROOT is set, else clang+lld+llvm-* on PATH.
+# Hard-fails if the blob has any relocation, undefined symbol, or (arm64) adrp.
+bash stub/build_stubs.sh [API_LEVEL]        # default API 24 -> sopack/stubs/*.bin + *.json
 
 # Pack an APK
 sopack pack in.apk --lib libfoo.so,libbar.so -o out.apk \

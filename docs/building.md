@@ -36,6 +36,19 @@ Notes:
 Compiles the per-ABI decryption stub into `sopack/stubs/stub_<abi>.bin` (+ `.json`
 offsets). Run it once, and again only when you change anything under `stub/`.
 
+Easiest is the per-cipher wrapper, which also runs the tests and prints the pack command:
+
+```bash
+./scripts/build_chacha20.sh              # plain LLVM on PATH, or an NDK from the environment
+./scripts/build_chacha20.sh --ndk /path/to/Android/sdk/ndk/<version> --api 24
+```
+
+For `--cipher wbaes` the equivalent is `./scripts/build_wbaes.sh`, which additionally builds
+the white-box artifacts and the per-ABI helper — see
+[wbaes-verification.md](./wbaes-verification.md).
+
+Or drive the stub build directly:
+
 ```bash
 # with the NDK:
 ANDROID_NDK_HOME=/path/to/Android/sdk/ndk/<version> bash stub/build_stubs.sh 24
@@ -43,6 +56,9 @@ ANDROID_NDK_HOME=/path/to/Android/sdk/ndk/<version> bash stub/build_stubs.sh 24
 bash stub/build_stubs.sh 24
 # -> sopack/stubs/stub_{arm64-v8a,armeabi-v7a,x86_64}.bin
 ```
+
+Either way this **rewrites tracked files** (`sopack/stubs/stub_*.bin`/`.json` are committed
+package data), so expect a dirty tree afterwards.
 
 `24` is the Android API level (any modern level is fine). The script **fails hard** if
 any blob ends up with a dynamic relocation, an undefined external symbol, or (on
