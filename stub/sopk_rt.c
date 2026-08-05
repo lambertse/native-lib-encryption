@@ -20,10 +20,16 @@
  *   wbc_unwrap_key (2 white-box blocks, ~1 ms) -> wbc_close ->
  *   copy .text page window into anon RW -> ChaCha20-decrypt with the session key ->
  *   wipe the session key -> mremap onto the original .text VA (execmem, not execmod) ->
- *   mprotect R-X -> flush I-cache. On ANY error it FAILS OPEN (returns), leaving the
- *   target to load normally on still-encrypted code (which then faults visibly) — never
- *   worse than a hard abort, and correct when the helper is present but a step is
- *   unsupported.
+ *   mprotect R-X -> flush I-cache. On ANY error it FAILS CLOSED: sopk_fail() records a
+ *   numbered reason in sopk_fail_code and abort()s.
+ *
+ * Why fail closed here, when the freestanding stub deliberately fails open (see
+ * docs/architecture.md §4c/§9b): the stub can chain the original DT_INIT and genuinely
+ * degrade to an unpacked-but-working library. This helper has no such fallback — its only
+ * job is decryption, so a failure leaves the target executing still-encrypted .text, which
+ * SIGILLs somewhere inside the target with nothing pointing at the cause. Aborting does not
+ * add a crash; it moves the same crash to the real cause with a controlled signature, and
+ * sopk_fail_code stays readable in the tombstone even in a stripped, non-logging build.
  *
  * Why the white-box does not decrypt `.text` itself: it runs at well under 1 MB/s (every
  * block is thousands of obfuscated VM instructions), so a multi-MB `.text` took minutes.
@@ -35,6 +41,7 @@
 #include <sys/auxv.h>      /* getauxval(AT_PAGESZ)            */
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>        /* abort                           */
 #include <string.h>
 
 #include "wbcrypto.h"      /* wbc_open / wbc_unwrap_key / wbc_wipe / ... (>= 2.0.0) */
@@ -105,13 +112,42 @@ static double sopk_now_ms(void) {
 #define SOPK_MEASURE(ms, t)   ((void)0)
 #endif
 
+/* Fail closed. `volatile` keeps the store from being optimised away, so the reason survives
+ * into a release build where there is no logging: the code is readable in the tombstone's
+ * memory dump. `noreturn` lets the compiler drop the dead code after every call site, so
+ * failing closed costs no bytes over failing open. Codes are stable — do not renumber. */
+enum {
+    SOPK_FAIL_NO_REGION     = 1,
+    SOPK_FAIL_BAD_FIELDS    = 2,
+    SOPK_FAIL_NO_TARGET     = 3,
+    SOPK_FAIL_WBC_OPEN      = 4,
+    SOPK_FAIL_WBC_UNWRAP    = 5,
+    SOPK_FAIL_SCRATCH_MMAP  = 6,
+    SOPK_FAIL_FIXED_REMAP   = 7,
+    SOPK_FAIL_MPROTECT      = 8,
+    SOPK_FAIL_REGION_TAIL   = 9,
+};
+
+static volatile unsigned int sopk_fail_code;
+
+__attribute__((noreturn)) static void sopk_fail(unsigned int code) {
+    sopk_fail_code = code;
+    abort();
+}
+
+#ifdef SOPK_RT_LOG
+#define SOPK_FAIL(code, ...) do { SOPK_LOG(__VA_ARGS__); sopk_fail(code); } while (0)
+#else
+#define SOPK_FAIL(code, ...) sopk_fail(code)
+#endif
+
 #define SOPK_MAX_PASS 256u   /* whitened passphrases are short; bound the stack copy */
 
 static uintptr_t align_down(uintptr_t v, uintptr_t a) { return v & ~(a - 1); }
 static uintptr_t align_up(uintptr_t v, uintptr_t a)   { return (v + a - 1) & ~(a - 1); }
 
 /* ---- locate our own appended region ------------------------------------------------ */
-struct self_scan { uintptr_t selfaddr; const uint8_t *region; };
+struct self_scan { uintptr_t selfaddr; const uint8_t *region; size_t size; };
 
 static int self_cb(struct dl_phdr_info *info, size_t sz, void *data) {
     (void)sz;
@@ -138,10 +174,11 @@ static int self_cb(struct dl_phdr_info *info, size_t sz, void *data) {
         const sopk_rt_region *r = (const sopk_rt_region *)p;
         if (r->magic == SOPK_RT_REGION_MAGIC && r->version == SOPK_RT_REGION_VERSION) {
             s->region = p;
+            s->size   = (size_t)ph->p_memsz;   /* bounds the variable-length tail */
             return 1;                                       /* stop iteration */
         }
     }
-    return 1;   /* found self but no region -> stop (fail open) */
+    return 1;   /* found self but no region -> stop; the ctor then fails closed */
 }
 
 /* ---- locate the target by soname basename ------------------------------------------ */
@@ -174,9 +211,9 @@ static void sopk_rt_ctor(void) {
     /* Keep the build marker reachable regardless of toolchain GC behaviour. */
     __asm__ __volatile__("" :: "r"(sopk_rt_build_marker));
 
-    struct self_scan ss = { (uintptr_t)&sopk_rt_ctor, NULL };
+    struct self_scan ss = { (uintptr_t)&sopk_rt_ctor, NULL, 0 };
     dl_iterate_phdr(self_cb, &ss);
-    if (!ss.region) { SOPK_LOG("no metadata region found in self (fail open)"); return; }
+    if (!ss.region) SOPK_FAIL(SOPK_FAIL_NO_REGION, "no metadata region found in self");
 
     const sopk_rt_region *r = (const sopk_rt_region *)ss.region;
     const uint8_t *tail = ss.region + SOPK_RT_REGION_HDR_SIZE;
@@ -188,7 +225,14 @@ static void sopk_rt_ctor(void) {
     uint32_t blob_len  = r->blob_len;
     uint16_t pass_len  = r->pass_len;
     if (text_size == 0 || blob_len < SOPK_WHITEN_SPAN || pass_len == 0
-        || pass_len >= SOPK_MAX_PASS) { SOPK_LOG("bad region fields (fail open)"); return; }
+        || pass_len >= SOPK_MAX_PASS) SOPK_FAIL(SOPK_FAIL_BAD_FIELDS, "bad region fields");
+
+    /* self_cb only proved the 96-byte HEADER fits. The tail is variable-length and its three
+     * lengths come from the region itself, so bound them against the segment before reading
+     * through soname/wpass/blob — otherwise a truncated or hand-edited region walks off the
+     * end of the mapping. Computed in the segment's own units to avoid pointer overflow. */
+    if ((uint64_t)SOPK_RT_REGION_HDR_SIZE + r->soname_len + pass_len + blob_len
+        > (uint64_t)ss.size) SOPK_FAIL(SOPK_FAIL_REGION_TAIL, "region tail exceeds segment");
     SOPK_LOG("region: target='%.*s' text_rva=0x%llx size=%llu blob=%u",
              (int)r->soname_len, soname, (unsigned long long)text_rva,
              (unsigned long long)text_size, blob_len);
@@ -196,8 +240,8 @@ static void sopk_rt_ctor(void) {
     /* find the target's load base */
     struct tgt_scan ts = { soname, r->soname_len, 0, 0 };
     dl_iterate_phdr(tgt_cb, &ts);
-    if (!ts.found) { SOPK_LOG("target '%.*s' not loaded (fail open)",
-                              (int)r->soname_len, soname); return; }
+    if (!ts.found) SOPK_FAIL(SOPK_FAIL_NO_TARGET, "target '%.*s' not loaded",
+                             (int)r->soname_len, soname);
 
     /* de-whiten the passphrase (key derived from the blob's own first bytes) */
     uint8_t wkey[32];
@@ -212,7 +256,7 @@ static void sopk_rt_ctor(void) {
     wbc_ctx *ctx = NULL;
     wbc_status st = wbc_open(blob, blob_len, pass, &ctx);
     memset(pass, 0, sizeof(pass));                          /* wipe ASAP */
-    if (st != WBC_OK || !ctx) { SOPK_LOG("wbc_open failed (%d) (fail open)", (int)st); return; }
+    if (st != WBC_OK || !ctx) SOPK_FAIL(SOPK_FAIL_WBC_OPEN, "wbc_open failed (%d)", (int)st);
     SOPK_MEASURE(ms_open, t_phase);
 
     /* The ONLY white-box work: unwrap the session key (2 blocks, ~1 ms, independent of
@@ -223,9 +267,8 @@ static void sopk_rt_ctor(void) {
     st = wbc_unwrap_key(ctx, r->wrapped, sk);
     wbc_close(ctx);
     if (st != WBC_OK) {
-        SOPK_LOG("wbc_unwrap_key failed (%d) (fail open)", (int)st);
-        wbc_wipe(sk, sizeof(sk));
-        return;
+        wbc_wipe(sk, sizeof(sk));               /* wipe before aborting, not after */
+        SOPK_FAIL(SOPK_FAIL_WBC_UNWRAP, "wbc_unwrap_key failed (%d)", (int)st);
     }
     SOPK_MEASURE(ms_unwrap, t_phase);
 
@@ -241,9 +284,8 @@ static void sopk_rt_ctor(void) {
     void *scratch = mmap(NULL, win_len, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (scratch == MAP_FAILED) {
-        SOPK_LOG("scratch mmap failed");
         wbc_wipe(sk, sizeof(sk));
-        return;
+        SOPK_FAIL(SOPK_FAIL_SCRATCH_MMAP, "scratch mmap failed");
     }
     memcpy(scratch, (const void *)win_lo, win_len);
     SOPK_MEASURE(ms_copy, t_phase);
@@ -262,17 +304,27 @@ static void sopk_rt_ctor(void) {
     void *placed = mremap(scratch, win_len, win_len,
                           MREMAP_MAYMOVE | MREMAP_FIXED, (void *)win_lo);
     if (placed == MAP_FAILED) {
-        /* fallback: replace the file mapping with a fresh fixed anon map + copy in */
-        munmap((void *)win_lo, win_len);
+        /* Fallback: replace the file mapping with a fresh fixed anon map + copy in.
+         * MAP_FIXED already replaces whatever is at win_lo atomically, so do NOT munmap
+         * first: an munmap+failed-mmap pair would leave the target with no .text mapping at
+         * all, turning a recoverable failure into a segfault on the first call into the
+         * library. (mremap with MREMAP_FIXED above unmaps its destination implicitly too,
+         * so neither path needs the window pre-unmapped.) */
         void *p = mmap((void *)win_lo, win_len, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (p == MAP_FAILED) { SOPK_LOG("fixed anon remap failed"); munmap(scratch, win_len); return; }
+        if (p == MAP_FAILED) {
+            munmap(scratch, win_len);
+            SOPK_FAIL(SOPK_FAIL_FIXED_REMAP, "fixed anon remap failed");
+        }
         memcpy((void *)win_lo, scratch, win_len);
         munmap(scratch, win_len);
-        SOPK_LOG("used munmap+MAP_FIXED fallback");
+        SOPK_LOG("used MAP_FIXED fallback");
     }
 
-    mprotect((void *)win_lo, win_len, PROT_READ | PROT_EXEC);
+    /* Must be checked: a failed mprotect leaves the decrypted window RW-and-not-X, so the
+     * first call into .text faults — and the old code went on to log "OK" regardless. */
+    if (mprotect((void *)win_lo, win_len, PROT_READ | PROT_EXEC) != 0)
+        SOPK_FAIL(SOPK_FAIL_MPROTECT, "mprotect R-X failed");
     __builtin___clear_cache((char *)text, (char *)(text + text_size));
     SOPK_MEASURE(ms_place, t_phase);
 

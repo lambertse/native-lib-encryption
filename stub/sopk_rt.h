@@ -76,18 +76,27 @@ _Static_assert(sizeof(struct sopk_rt_region) == 96, "sopk_rt_region header must 
 
 /*
  * Build marker. The skeleton is built by hand, outside this repo, so a stale one is easy
- * to leave in sopack/stubs/. A stale skeleton would find no region (the version gate above
- * fails), FAIL OPEN, and let the target run still-encrypted `.text` — a SIGILL with nothing
- * pointing at the cause. sopk_rt.c therefore embeds these bytes in a retained variable and
- * the packer (elf_inject.py:_emit_helper) refuses a skeleton that lacks them, turning a
- * device-side crash into a pack-time error. Bump them on ANY change to this layout or to
- * the crypto flow, and mirror the change in sopack/rt_meta.py:HELPER_BUILD_MARKER.
+ * to leave in sopack/stubs/. A stale skeleton finds no region (the version gate above fails)
+ * and now aborts — but the abort carries no explanation, and the fix is a rebuild, not a
+ * debugging session. sopk_rt.c therefore embeds these bytes in a retained variable and the
+ * packer (elf_inject.py:_emit_helper) refuses a skeleton that lacks them, turning a
+ * device-side crash into a pack-time error naming the remedy. Bump them on ANY change to
+ * this layout or to the crypto flow, and mirror the change in
+ * sopack/rt_meta.py:HELPER_BUILD_MARKER.
+ *
+ * The marker must live in an SHF_ALLOC section: the packer strips every non-ALLOC section
+ * from the emitted helper, and its own guard is a byte-scan for these bytes. `.rodata`
+ * (where a `static const` lands) is fine; do not move it to a debug or note section.
  *
  * Deliberately opaque bytes rather than an ASCII string: the appended region's 'SRTR' magic
  * is already a fingerprint, and there is no reason to add a second one that spells out the
  * tool's name. See docs/static-analysis-hardening.md on string hygiene.
+ *
+ * Bumped for the fail-closed ctor (abort instead of return), the region-tail bounds check,
+ * and the checked mprotect. The previous value 1dc74b92a630e852 is published in a
+ * reverse-engineering report, which is a second reason not to reuse it.
  */
-#define SOPK_RT_BUILD_MARKER_BYTES { 0x1d, 0xc7, 0x4b, 0x92, 0xa6, 0x30, 0xe8, 0x52 }
+#define SOPK_RT_BUILD_MARKER_BYTES { 0x61, 0xeb, 0x36, 0x17, 0x71, 0xab, 0x71, 0xe2 }
 #define SOPK_RT_BUILD_MARKER_LEN  8u
 
 /*

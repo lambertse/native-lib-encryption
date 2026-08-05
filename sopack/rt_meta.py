@@ -20,11 +20,12 @@ REGION_MAGIC = 0x52545253    # bytes 'S','R','T','R' little-endian
 REGION_VERSION = 2           # v2 = key wrapping; the helper requires an exact match
 
 # Opaque bytes the helper skeleton must contain, mirroring SOPK_RT_BUILD_MARKER_BYTES in
-# stub/sopk_rt.h. The skeleton is built by hand outside this repo, and a stale one fails
-# open SILENTLY on device (the ctor's version gate finds no region, so the target runs
-# encrypted .text and crashes). elf_inject.py:_emit_helper refuses a skeleton without
-# these, turning that into a pack-time error. Bump both sides together.
-HELPER_BUILD_MARKER = bytes((0x1d, 0xc7, 0x4b, 0x92, 0xa6, 0x30, 0xe8, 0x52))
+# stub/sopk_rt.h. The skeleton is built by hand outside this repo, and a stale one is
+# undiagnosable on device: the ctor's version gate finds no region and aborts with no
+# indication that the cause is a stale build. elf_inject.py:_emit_helper refuses a skeleton
+# without these, turning that into a pack-time error that names the rebuild. Bump both sides
+# together. Bumped for the fail-closed ctor; see stub/sopk_rt.h for the full note.
+HELPER_BUILD_MARKER = bytes((0x61, 0xeb, 0x36, 0x17, 0x71, 0xab, 0x71, 0xe2))
 
 # header: magic,version | text_rva,text_size | wrapped | nonce16 | soname_len,pass_len,blob_len
 _FMT = "<IIQQ48s16sHHI"

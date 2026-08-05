@@ -53,7 +53,7 @@ def _cmd_pack(args: argparse.Namespace) -> int:
     print(f"  cipher={args.cipher}  abis={','.join(abis)}")
     res = repackage(args.input, args.output, libs, cipher=args.cipher,
                     abis=abis, keystore=ks, min_sdk=args.min_sdk, log=args.log,
-                    wb_keygen=args.wb_keygen)
+                    wb_keygen=args.wb_keygen, allow_helper_log=args.allow_helper_log)
 
     print(f"\nInjected {len(res.injected)} librar{'y' if len(res.injected)==1 else 'ies'}:")
     for ir in res.injected:
@@ -101,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="override apksigner minSdkVersion (if manifest detection fails)")
     pk.add_argument("--log", action="store_true",
                     help="stub emits a logcat line (tag 'sopack') on successful decrypt")
+    pk.add_argument("--allow-helper-log", action="store_true",
+                    help="(--cipher wbaes) permit a helper skeleton built with -DSOPK_RT_LOG. "
+                         "Such a helper logs the target name, .text address and size to logcat, "
+                         "so packing one is refused by default. Use it for on-device Phase 6 "
+                         "verification only — the resulting APK is NOT shippable.")
     pk.add_argument("--keystore", help="keystore path (auto-generated if missing)")
     pk.add_argument("--ks-alias", default="sopack")
     pk.add_argument("--ks-pass", default="sopack")

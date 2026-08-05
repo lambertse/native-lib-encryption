@@ -1,6 +1,6 @@
 """`--cipher wbaes` injection tests.
 
-Two tiers, deliberately:
+Three tiers, deliberately:
 
 * Everything driven by `tests/fixtures/mini_arm64.so` runs with **no setup at all** — it is a
   committed 50 KB aarch64 `.so` built for this purpose (see `mini_arm64.c` for the three
@@ -9,14 +9,22 @@ Two tiers, deliberately:
 * The two full-injection tests additionally need a **host** `wb_keygen`, because `--cipher
   wbaes` seals a real white-box blob and there is no way to fake that meaningfully. They skip
   without one.
+* The strip tests need a compiler that emits **ELF** — not merely a compiler. macOS `cc`
+  produces Mach-O, so there `_elf_cc` falls back to the NDK's clang if `ANDROID_NDK_HOME` is
+  set, and they skip if it is not.
 
 The on-device decrypt is validated separately: the host round-trip probe in
 `docs/wbaes-verification.md` Phase 3, then Phase 6 on a device.
 """
+import functools
+import glob
 import os
 import pathlib
 import shutil
+import struct
 import subprocess
+import sys
+import tempfile
 
 import lief
 import pytest
@@ -247,3 +255,330 @@ def test_wbaes_injection_surgery(monkeypatch, tmp_path):
         f1.seek(int(sec.file_offset)); enc = f1.read(int(sec.size))
     assert enc != orig
     assert len(set(enc)) > 200                  # ciphertext uses ~all byte values
+
+
+# ---- the strip, and the release-posture gates ------------------------------------------
+#
+# All of this exists because a static-analysis report on a shipped APK reconstructed the whole
+# design in about an hour, and named the unstripped, tracing helper as the reason. The build
+# script could already produce a correct release helper; nothing refused an incorrect one.
+
+_HOST_CC = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+
+_HOST_SRC = """
+static const char hidden_symbol_name[] = "RODATA-MUST-SURVIVE";
+int host_answer(void) { return 4242; }
+const char *host_marker(void) { return hidden_symbol_name; }
+"""
+
+_BUILD_FLAGS = ("-g", "-O1", "-fPIC", "-shared")     # -g: there must be something to strip
+
+
+def _ndk_clang():
+    """The NDK's clang, if the environment points at an NDK. It cross-compiles ELF from any
+    host, which is the whole reason it is here — see `_elf_cc`. The prebuilt directory is
+    globbed rather than derived from `uname`, because on Apple Silicon the only toolchain an
+    NDK ships is `darwin-x86_64`, run under Rosetta."""
+    root = (os.environ.get("ANDROID_NDK_HOME") or os.environ.get("ANDROID_NDK_ROOT")
+            or os.environ.get("NDK"))
+    if not root:
+        return None
+    found = sorted(glob.glob(
+        os.path.join(root, "toolchains", "llvm", "prebuilt", "*", "bin", "clang")))
+    return found[0] if found else None
+
+
+@functools.lru_cache(maxsize=None)
+def _elf_cc():
+    """An argv prefix for a compiler that emits **ELF**, or None. Cached: it compiles to find out.
+
+    Having a compiler is not enough for ELF surgery. On macOS `cc -shared` emits a Mach-O dylib
+    (the `.so` name is cosmetic): LIEF parses it as a `MachO.Binary`, it has no `.symtab`
+    *section* because its symbols live in `LC_SYMTAB`/`__LINKEDIT`, `-g` leaves the DWARF in the
+    `.o` files instead of the linked image, and `_strip_nonalloc` refuses it on the `\\x7fELF`
+    check. All three assumptions these tests make are wrong there at once.
+
+    Prefer the host's own compiler when it emits ELF — that fixture is also *loadable*, which
+    `_elf_so(native=True)` needs — and otherwise cross-compile for arm64 Android, which is the
+    target the shipped helper is built for anyway. Probes the output rather than the platform,
+    so any host that does emit ELF is used as-is."""
+    candidates = [[_HOST_CC], [_ndk_clang(), "--target=aarch64-linux-android24"]]
+    with tempfile.TemporaryDirectory() as td:
+        src = pathlib.Path(td) / "probe.c"
+        src.write_text(_HOST_SRC)
+        out = pathlib.Path(td) / "probe.so"
+        for argv in candidates:
+            if argv[0] is None:
+                continue
+            r = subprocess.run([*argv, *_BUILD_FLAGS, "-o", str(out), str(src)],
+                               capture_output=True)
+            if r.returncode == 0 and out.exists() and out.read_bytes()[:4] == b"\x7fELF":
+                return tuple(argv)
+    return None
+
+
+def _elf_so(tmp_path, name="hostlib.so", *, native=False):
+    """An ELF `.so` built WITH debug info, so there is something to strip.
+
+    `native=True` additionally demands one this host can `dlopen`: a cross-compiled
+    aarch64-android library satisfies every other test here, but nothing local can load it."""
+    argv = _elf_cc()
+    if argv is None or (native and argv[0] != _HOST_CC):
+        pytest.skip(
+            "no compiler emitting ELF: host cc is absent or emits Mach-O, and no NDK to "
+            "cross-compile with (set ANDROID_NDK_HOME)" if argv is None else
+            f"only a cross-compiler is available ({argv[0]}) and this test must dlopen its "
+            "output")
+    src = tmp_path / "hostlib.c"
+    src.write_text(_HOST_SRC)
+    out = tmp_path / name
+    subprocess.run([*argv, *_BUILD_FLAGS, "-o", str(out), str(src)], check=True)
+    return out
+
+
+def test_strip_removes_debug_and_symbols_but_keeps_the_loader_view(tmp_path):
+    """The strip must delete exactly the sections the loader never maps, and nothing else.
+    `.dynsym`/`.dynstr`/`.shstrtab` and a non-zero `e_shnum` all have to survive: bionic on
+    Android 14+ rejects a library with no section headers, which is why the rejected §Method 3
+    (zeroing `e_shoff`) is a different operation from this one."""
+    lib = _elf_so(tmp_path)
+    before_bytes = lib.read_bytes()
+    alloc = lief.ELF.Section.FLAGS.ALLOC
+    before = lief.parse(str(lib))
+    assert before.get_section(".symtab") is not None, "fixture should start unstripped"
+    assert any(s.name.startswith(".debug_") for s in before.sections)
+
+    removed = dict(elf_inject._strip_nonalloc(str(lib)))
+    assert ".symtab" in removed and ".strtab" in removed
+    assert any(n.startswith(".debug_") for n in removed)
+
+    after = lief.parse(str(lib))
+    leftover = [s.name for s in after.sections if s.name and not s.has(alloc)]
+    assert leftover == [".shstrtab"], f"unexpected non-ALLOC sections left: {leftover}"
+    assert after.header.numberof_sections > 0
+    for keep in (".dynsym", ".dynstr", ".shstrtab"):
+        assert after.get_section(keep) is not None, f"{keep} must survive"
+
+    raw = lib.read_bytes()
+    assert b"hidden_symbol_name" not in raw, "static symbol name should be gone"
+    assert b"RODATA-MUST-SURVIVE" in raw, ".rodata must be untouched"
+    assert b".debug_info" not in raw, "dropped section NAMES should go too"
+
+    # The surviving links must still name the right sections. On this fixture the check is weak
+    # by construction — a real toolchain puts every strippable section at the END of the table,
+    # so the index remap is an identity and a bug in it would not show up here. The remap itself
+    # is exercised by test_strip_handles_elf32_and_remaps_section_indices, which deliberately
+    # drops a section that comes FIRST.
+    names = [x.name for x in after.sections]
+    for sec, expect in ((".dynsym", ".dynstr"), (".gnu.version", ".dynsym")):
+        s = after.get_section(sec)
+        if s is not None:
+            assert names[s.link] == expect, \
+                f"{sec}.sh_link points at {names[s.link]!r}, expected {expect!r}"
+
+    # And the file must actually have shrunk, not merely lost its section headers.
+    assert lib.stat().st_size < len(before_bytes), "strip did not compact the file"
+
+
+def test_a_stripped_library_still_loads(tmp_path):
+    """The one check that matters and that no amount of ELF parsing can substitute for: a real
+    loader accepts the result and its exports still resolve. Host `dlopen` is not bionic — the
+    §Method 3 post-mortem records glibc accepting files bionic refused — so this proves the
+    surgery is sane, not that it is Android-safe. Phase 6 on a device is still required."""
+    lib = _elf_so(tmp_path, native=True)
+    elf_inject._strip_nonalloc(str(lib))
+    # Fresh process: dlopen'ing before the strip would leave the file mapped while it is
+    # truncated, and the SIGSEGV that follows is the test's fault, not the packer's.
+    probe = (
+        "import ctypes,sys;"
+        f"l=ctypes.CDLL({str(lib)!r});"
+        "l.host_marker.restype=ctypes.c_char_p;"
+        "assert l.host_answer()==4242, 'wrong answer';"
+        "assert l.host_marker()==b'RODATA-MUST-SURVIVE', 'wrong rodata';"
+        "print('ok')"
+    )
+    r = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert r.returncode == 0 and "ok" in r.stdout, \
+        f"stripped library failed to load: rc={r.returncode} {r.stderr[-400:]}"
+
+
+def test_strip_is_idempotent(tmp_path):
+    """Packing an already-stripped skeleton must be a no-op, not a second round of surgery on
+    a file whose layout the first pass already rewrote."""
+    lib = _elf_so(tmp_path)
+    assert elf_inject._strip_nonalloc(str(lib))          # first pass removes things
+    size = lib.stat().st_size
+    assert elf_inject._strip_nonalloc(str(lib)) == []    # second finds nothing
+    assert lib.stat().st_size == size
+
+
+def test_strip_refuses_a_library_with_no_section_table(tmp_path):
+    """Guard the guard: if the input already has no section headers, say so rather than
+    producing something even less loadable."""
+    lib = tmp_path / "noshdr.so"
+    shutil.copyfile(FIXTURE, lib)
+    buf = bytearray(lib.read_bytes())
+    struct.pack_into("<Q", buf, 0x28, 0)                  # e_shoff = 0
+    struct.pack_into("<H", buf, 0x3C, 0)                  # e_shnum = 0
+    lib.write_bytes(buf)
+    with pytest.raises(InjectError, match="no section header table"):
+        elf_inject._strip_nonalloc(str(lib))
+
+
+def test_emit_helper_refuses_a_tracing_skeleton(monkeypatch, tmp_path):
+    """A `-DSOPK_RT_LOG` helper logs the target soname, `.text` RVA and size, and a final "OK"
+    to logcat — which is the exact address and length to dump, plus confirmation the dump is
+    valid. A real APK shipped that way, so refuse it by default."""
+    monkeypatch.setattr(elf_inject, "helper_skeleton_path",
+                        lambda abi: _marked_skeleton(tmp_path))
+    monkeypatch.setattr(elf_inject, "_undefined_dynsyms",
+                        lambda path: ["memcpy", "__android_log_print"])
+    with pytest.raises(InjectError, match="SOPK_RT_LOG"):
+        elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", b"SRTR" + bytes(92),
+                                str(tmp_path / "helper.so"))
+
+
+def test_allow_helper_log_permits_a_tracing_skeleton_but_warns_loudly(monkeypatch, tmp_path,
+                                                                     capsys):
+    """The escape hatch must not become the new "remember to use --release": it has to shout on
+    every pack, because an unmarked opt-in is precisely the convention that already failed."""
+    monkeypatch.setattr(elf_inject, "helper_skeleton_path",
+                        lambda abi: _marked_skeleton(tmp_path))
+    monkeypatch.setattr(elf_inject, "_undefined_dynsyms",
+                        lambda path: ["__android_log_print"])
+    out = tmp_path / "helper.so"
+    elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", b"SRTR" + bytes(92), str(out),
+                            allow_helper_log=True)
+    assert out.exists()
+    err = capsys.readouterr().err
+    assert "TRACING build" in err and "DO NOT SHIP" in err
+
+
+def test_emit_helper_refuses_a_skeleton_that_reexports_the_white_box(monkeypatch, tmp_path):
+    """`WBC_API` visibility is baked into libwbcrypto.a's objects, so `-fvisibility=hidden`
+    cannot hide it — only `--exclude-libs,ALL` can. Phase 4 checks this, but Phase 4 is a
+    script the user can skip, and the skeleton is built by hand."""
+    monkeypatch.setattr(elf_inject, "helper_skeleton_path",
+                        lambda abi: _marked_skeleton(tmp_path))
+    monkeypatch.setattr(elf_inject, "_exported_dynsyms",
+                        lambda path: ["wbc_open", "wbc_unwrap_key"])
+    with pytest.raises(InjectError, match="re-exports white-box symbols"):
+        elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", b"SRTR" + bytes(92),
+                                str(tmp_path / "helper.so"))
+
+
+def test_emitted_helper_is_stripped_and_keeps_its_dynamic_symbols(monkeypatch, tmp_path):
+    """End-to-end through `_emit_helper`: the emitted helper carries no non-ALLOC sections, and
+    its dynamic symbol names are byte-identical to the skeleton's. The second half matters
+    because `_undefined_dynsyms` — the guard that catches a 1.x archive — reads exactly that
+    table, so a desync would silently empty the guard rather than break anything visibly."""
+    skel = _marked_skeleton(tmp_path)
+    monkeypatch.setattr(elf_inject, "helper_skeleton_path", lambda abi: skel)
+    out = tmp_path / "helper.so"
+    elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", b"SRTR" + bytes(92), str(out))
+
+    alloc = lief.ELF.Section.FLAGS.ALLOC
+    hlp = lief.parse(str(out))
+    assert [s.name for s in hlp.sections if s.name and not s.has(alloc)] == [".shstrtab"]
+    assert hlp.header.numberof_sections > 0
+    assert _dynsym_names(str(out)) == _dynsym_names(str(skel))
+
+
+def test_host_path_detector_finds_a_leaked_build_path():
+    """The report found `/Users/<name>/src/.../libsodium-1.0.20/...` in a shipped helper. Those
+    strings come from `__FILE__`/DWARF; the ones in mapped sections need the archive rebuilt
+    with `-ffile-prefix-map`, so the packer can only warn — but it has to spot them first."""
+    assert elf_inject._host_paths_in(
+        b"\x00/Users/someone/src/whitebox-cryptography/src/sdk/wbcrypto.cpp\x00")
+    assert elf_inject._host_paths_in(b"junk /home/dev/project/third_party/libsodium/x.c junk")
+    assert elf_inject._host_paths_in(b"no paths here, just bytes") == []
+
+
+def _synthetic_elf32(path, sections):
+    """A minimal, deliberately NOT loadable ELF32 with a section table.
+
+    The armeabi-v7a helper would be ELF32, and `_strip_nonalloc` carries a second set of
+    struct offsets for that class. No 32-bit host toolchain is assumed to exist, so exercise
+    those offsets directly rather than leaving the branch untested — a wrong offset here would
+    silently corrupt a v7a helper. `sections` is [(name, sh_flags, payload, sh_link)], where
+    `sh_link` is an index into `sections` (1-based, matching the on-disk table's leading null
+    entry) or 0 for none.
+    """
+    EH, SH, PH = 52, 40, 32
+    names = (b"\x00" + b"".join(n.encode() + b"\x00" for n, _, _, _ in sections)
+             + b".shstrtab\x00")
+
+    def name_off(n):
+        return names.index(n.encode() + b"\x00")
+
+    body, offs = bytearray(), []
+    base = EH + PH
+    for _, _, payload, _ in sections:
+        offs.append(base + len(body))
+        body += payload
+    names_off = base + len(body)
+    shoff = names_off + len(names)
+
+    out = bytearray(b"\x7fELF\x01\x01\x01" + bytes(9))
+    out += struct.pack("<HHIIIIIHHHHHH", 3, 40, 1, 0, EH, shoff, 0,
+                       EH, PH, 1, SH, len(sections) + 2, len(sections) + 1)
+    assert len(out) == EH
+    out += struct.pack("<IIIIIIII", 1, 0, 0, 0, names_off, names_off, 0x5, 0x1000)  # PT_LOAD
+    out += body
+    out += names
+    out += bytes(SH)                                            # SHN_UNDEF
+    for (n, fl, payload, link), off in zip(sections, offs):
+        out += struct.pack("<IIIIIIIIII", name_off(n), 1, fl, 0, off, len(payload),
+                           link, 0, 1, 0)
+    out += struct.pack("<IIIIIIIIII", name_off(".shstrtab"), 3, 0, 0, names_off, len(names),
+                       0, 0, 1, 0)
+    pathlib.Path(path).write_bytes(bytes(out))
+
+
+def test_strip_handles_elf32_and_remaps_section_indices(tmp_path):
+    """Two things at once, both otherwise untested.
+
+    ELF32: the field offsets differ from ELF64 throughout (file, section and program headers),
+    and armeabi-v7a would use them.
+
+    Index remapping: `sh_link`/`sh_info` hold section INDICES, so every one shifts when earlier
+    entries are removed. On a normal toolchain layout the strippable sections all sit at the END
+    of the table, which makes the remap an identity and hides a bug in it — so this fixture puts
+    a dropped section FIRST, before a kept `.dynsym` whose `sh_link` must follow `.dynstr` down
+    by one. A stale `sh_link` would leave `.dynsym` pointing at whatever now occupies the old
+    index, which no other check here would notice.
+    """
+    p = tmp_path / "tiny32.so"
+    #                name           flags  payload             sh_link (1-based on-disk index)
+    _synthetic_elf32(p, [(".comment",     0x0, b"SECRET-COMMENT",  0),   # dropped, FIRST
+                         (".dynsym",      0x2, b"\x22" * 32,       3),   # -> .dynstr at index 3
+                         (".dynstr",      0x2, b"\x00KEEP-ME-32\x00", 0),
+                         (".debug_info",  0x0, b"SECRET-DWARF",    0)])  # dropped
+    removed = dict(elf_inject._strip_nonalloc(str(p)))
+    assert set(removed) == {".comment", ".debug_info"}, removed
+
+    raw = p.read_bytes()
+    assert b"SECRET-COMMENT" not in raw and b"SECRET-DWARF" not in raw
+    assert b"KEEP-ME-32" in raw, "ALLOC content must survive"
+    assert b".debug_info" not in raw, "dropped section names must go too"
+
+    # The rewritten header must stay self-consistent, or nothing can parse the result.
+    shoff, = struct.unpack_from("<I", raw, 0x20)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", raw, 0x2E)
+    assert shnum == 4, "null + .dynsym + .dynstr + .shstrtab"
+    assert shoff + shnum * shentsize == len(raw), "section table must end the file"
+
+    def sh(i):
+        return struct.unpack_from("<IIIIIIIIII", raw, shoff + i * shentsize)
+
+    strtab_off = sh(shstrndx)[4]
+
+    def name(i):
+        start = strtab_off + sh(i)[0]
+        return raw[start:raw.index(b"\x00", start)].decode()
+
+    assert [name(i) for i in range(1, shnum)] == [".dynsym", ".dynstr", ".shstrtab"]
+    assert shstrndx == 3, "e_shstrndx must follow .shstrtab to its new index"
+    # The remap: .dynsym's sh_link was 3, and .dynstr is now index 2.
+    assert sh(1)[6] == 2, f".dynsym.sh_link is {sh(1)[6]}, expected 2 (.dynstr)"
+    assert name(sh(1)[6]) == ".dynstr"

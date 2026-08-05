@@ -20,7 +20,10 @@ Requires LIEF >= 0.15. LIEF's enum names shifted across versions; _E() shims tha
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import struct
+import sys
 from dataclasses import dataclass
 
 import lief
@@ -44,6 +47,13 @@ _BIONIC_ALLOWED = {
 # 16 KB — mandatory max-page-size alignment for the injected LOAD segment so the lib
 # still loads on 16 KB-page devices (Android 15+, Play requirement).
 SEGMENT_ALIGN = 16384
+
+
+def _warn(msg: str) -> None:
+    """Warnings that must survive being ignored: stderr, not the `logger` the APK layer
+    threads around, because these fire deep in the injection and describe a shippable
+    artifact that is not shippable."""
+    print(f"WARNING: {msg}", file=sys.stderr)
 
 # Spare bytes reserved in the appended string-table segment, so the common case needs a single
 # LIEF write. LIEF's rebuilt .dynstr normally has the same size (it reorders, it does not add),
@@ -277,14 +287,16 @@ def _effective_strtab(path: str) -> bytes:
     return v.buf[base:base + strsz]
 
 
-def _walk_dynsyms(path: str, undefined_only: bool = False) -> list[str]:
+def _walk_dynsyms(path: str, undefined_only: bool = False,
+                  defined_only: bool = False) -> list[str]:
     """Dynamic symbol names, resolved exactly as `dlsym` would: `DT_SYMTAB` indexed against
     `DT_STRTAB`, count from `_LoaderView.dynsym_count`, section headers ignored.
 
     `undefined_only` keeps just the `SHN_UNDEF` entries — what this `.so` needs the loader to
-    resolve for it. Returns [] for a `.so` with no dynamic symbols at all, but RAISES if it has
-    a `DT_SYMTAB` whose length cannot be established: both callers are guards, and a guard that
-    silently inspects nothing is how the bug in §11f shipped."""
+    resolve for it; `defined_only` keeps the complement, what it offers others. Returns [] for a
+    `.so` with no dynamic symbols at all, but RAISES if it has a `DT_SYMTAB` whose length cannot
+    be established: every caller is a guard, and a guard that silently inspects nothing is how
+    the bug in §11f shipped."""
     v = _LoaderView(path)
     symtab_va, strtab = v.tags.get(_DT_SYMTAB), v.strtab_off()
     if symtab_va is None or strtab is None:
@@ -298,8 +310,11 @@ def _walk_dynsyms(path: str, undefined_only: bool = False) -> list[str]:
     out = []
     for i in range(n):
         st_name, _info, _other, shndx = struct.unpack_from("<IBBH", v.buf, symtab + i * ent)
-        if st_name and (shndx == 0 or not undefined_only):   # index 0 is the reserved symbol
-            out.append(v.str_at(strtab, st_name))
+        if not st_name:                                      # index 0 is the reserved symbol
+            continue
+        if (undefined_only and shndx != 0) or (defined_only and shndx == 0):
+            continue
+        out.append(v.str_at(strtab, st_name))
     return out
 
 
@@ -315,6 +330,181 @@ def _undefined_dynsyms(path: str) -> list[str]:
     return _walk_dynsyms(path, undefined_only=True)
 
 
+def _exported_dynsyms(path: str) -> list[str]:
+    """Symbols this `.so` defines for others to resolve. The helper is supposed to export
+    nothing; anything here that names the white-box hands an analyst the SDK's API surface."""
+    return _walk_dynsyms(path, defined_only=True)
+
+
+# Sections the loader never maps, so the helper has no business shipping them. This is NOT the
+# section-header stripping that docs/static-analysis-hardening.md §Method 3 researched and
+# rejected: that zeroed e_shoff/e_shnum, and bionic on Android 14+ refuses to load a library
+# with no section headers. Here the table itself stays valid — only its non-ALLOC entries go,
+# and `.shstrtab` has to stay because e_shstrndx must point at a real string table.
+_KEEP_NONALLOC = frozenset({".shstrtab"})
+
+# Host build paths leak a developer username and pin dependency versions for CVE matching.
+_HOST_PATH_RE = re.compile(rb"/(?:Users|home|private/var)/[A-Za-z0-9._/+-]{4,160}")
+
+
+_SHF_ALLOC = 0x2
+_SHT_NOBITS = 8
+
+
+def _strip_nonalloc(path: str) -> list[tuple[str, int]]:
+    """Strip `path` in place: zero and drop every non-`SHF_ALLOC` section, then pull `.shstrtab`
+    and the section header table down past the last mapped byte and truncate. Returns
+    `(name, size)` for each section removed, largest first.
+
+    On the arm64 skeleton the removed set is exactly `.symtab`, `.strtab`, `.comment` and the six
+    `.debug_*` sections — 2.7 MB of a 3.2 MB file, and the only place the `sopk_rt_ctor`/`wbc_*`/
+    VM-handler symbol names and the host build paths appear. A static-analysis report on a
+    shipped APK named the unstripped helper as the single largest shortcut it had.
+
+    Raw surgery rather than LIEF, for two reasons found by measurement:
+      * LIEF re-creates `.symtab`/`.strtab` from its own symbol model on `write()`, so removing
+        those two sections through LIEF does not remove them from the output.
+      * LIEF keeps the sections it retains at their original file offsets, so deleting 2.7 MB out
+        of the middle of the file leaves a 2.7 MB hole of padding instead of a smaller file. The
+        content is gone, but a STORED APK entry still carries every zero.
+    Nothing mapped moves here: only non-ALLOC content is touched, plus `.shstrtab` and the
+    section header table, neither of which is covered by a `PT_LOAD`. That also means this is
+    NOT the section-header stripping bionic rejects (see `_KEEP_NONALLOC`) — the table stays,
+    it just gets shorter and moves down."""
+    with open(path, "rb") as f:
+        buf = bytearray(f.read())
+    if buf[:4] != b"\x7fELF":
+        raise InjectError(f"{os.path.basename(path)} is not an ELF file")
+    is64, little = buf[4] == 2, buf[5] == 1
+    if not little:
+        raise InjectError("big-endian ELF is not supported (no Android ABI uses it)")
+
+    # Header, section-header and program-header field offsets for the two ELF classes.
+    if is64:
+        (e_shoff,) = struct.unpack_from("<Q", buf, 0x28)
+        e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", buf, 0x3A)
+        (e_phoff,) = struct.unpack_from("<Q", buf, 0x20)
+        e_phentsize, e_phnum = struct.unpack_from("<HH", buf, 0x36)
+        SH_OFF, SH_SIZE, SZ = 0x18, 0x20, "<Q"
+        PH_OFF, PH_FILESZ = 0x08, 0x20
+    else:
+        (e_shoff,) = struct.unpack_from("<I", buf, 0x20)
+        e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", buf, 0x2E)
+        (e_phoff,) = struct.unpack_from("<I", buf, 0x1C)
+        e_phentsize, e_phnum = struct.unpack_from("<HH", buf, 0x2A)
+        SH_OFF, SH_SIZE, SZ = 0x10, 0x14, "<I"
+        PH_OFF, PH_FILESZ = 0x04, 0x10
+    if e_shoff == 0 or e_shnum == 0:
+        raise InjectError(
+            f"{os.path.basename(path)} has no section header table — bionic (Android 14+) "
+            "refuses to load such a library, so it cannot have come from this tool")
+
+    def shdr(i: int) -> int:
+        return e_shoff + i * e_shentsize
+
+    def fld(i: int, off: int, fmt: str = "<I") -> int:
+        return struct.unpack_from(fmt, buf, shdr(i) + off)[0]
+
+    # Read the existing section table.
+    strtab_off = fld(e_shstrndx, SH_OFF, SZ)
+
+    def name_of(i: int) -> str:
+        start = strtab_off + fld(i, 0x00)
+        end = buf.index(b"\x00", start)
+        return buf[start:end].decode("utf-8", "replace")
+
+    names = [name_of(i) for i in range(e_shnum)]
+    flags = [fld(i, 0x08, SZ) for i in range(e_shnum)]
+    types = [fld(i, 0x04) for i in range(e_shnum)]
+    offs = [fld(i, SH_OFF, SZ) for i in range(e_shnum)]
+    sizes = [fld(i, SH_SIZE, SZ) for i in range(e_shnum)]
+
+    # Index 0 is the reserved null entry and must survive. Keep anything the loader maps, plus
+    # the section-name table itself (e_shstrndx has to point at a real one).
+    def keep(i: int) -> bool:
+        return i == 0 or bool(flags[i] & _SHF_ALLOC) or i == e_shstrndx
+
+    kept = [i for i in range(e_shnum) if keep(i)]
+    dropped = [i for i in range(e_shnum) if not keep(i)]
+    if not dropped:
+        return []
+
+    # Highest byte the loader or a kept section still needs. `.shstrtab` is excluded because it
+    # is what we are about to move; NOBITS occupies no file space.
+    keep_end = 0
+    for i in range(e_phnum):
+        p = e_phoff + i * e_phentsize
+        p_off = struct.unpack_from(SZ, buf, p + PH_OFF)[0]
+        p_filesz = struct.unpack_from(SZ, buf, p + PH_FILESZ)[0]
+        keep_end = max(keep_end, p_off + p_filesz)
+    for i in kept:
+        if i == e_shstrndx or types[i] == _SHT_NOBITS:
+            continue
+        keep_end = max(keep_end, offs[i] + sizes[i])
+
+    # Erase dropped content wherever it lies — a dropped section below keep_end cannot be
+    # truncated away, so zero it rather than leave readable DWARF in the shipped file.
+    for i in dropped:
+        if types[i] == _SHT_NOBITS:
+            continue
+        lo, hi = offs[i], min(offs[i] + sizes[i], len(buf))
+        if lo < hi:
+            buf[lo:hi] = b"\x00" * (hi - lo)
+
+    # Rebuild .shstrtab with only the surviving names, so ".debug_info"/".symtab" do not linger
+    # as strings advertising what was removed.
+    new_names = bytearray(b"\x00")
+    name_at: dict[str, int] = {"": 0}
+    for i in kept:
+        if names[i] and names[i] not in name_at:
+            name_at[names[i]] = len(new_names)
+            new_names += names[i].encode() + b"\x00"
+
+    old_to_new = {old: new for new, old in enumerate(kept)}
+    shstrtab_off = (keep_end + 15) & ~15
+    new_shoff = (shstrtab_off + len(new_names) + 15) & ~15
+
+    table = bytearray()
+    for i in kept:
+        ent = bytearray(buf[shdr(i):shdr(i) + e_shentsize])
+        struct.pack_into("<I", ent, 0x00, name_at.get(names[i], 0))
+        if i == e_shstrndx:
+            struct.pack_into(SZ, ent, SH_OFF, shstrtab_off)
+            struct.pack_into(SZ, ent, SH_SIZE, len(new_names))
+        # sh_link/sh_info are section indices (e.g. .dynsym -> .dynstr, .rela.* -> .dynsym) and
+        # every index shifts when entries are removed. A stale sh_link is how a "stripped" lib
+        # ends up with tooling reading the wrong table.
+        link_off, info_off = (0x28, 0x2C) if is64 else (0x18, 0x1C)
+        for off in (link_off, info_off):
+            (val,) = struct.unpack_from("<I", ent, off)
+            if val:
+                struct.pack_into("<I", ent, off, old_to_new.get(val, 0))
+        table += ent
+
+    out = buf[:keep_end]
+    out += b"\x00" * (shstrtab_off - len(out))
+    out += new_names
+    out += b"\x00" * (new_shoff - len(out))
+    out += table
+
+    struct.pack_into(SZ, out, 0x28 if is64 else 0x20, new_shoff)
+    struct.pack_into("<HH", out, 0x3C if is64 else 0x30,
+                     len(kept), old_to_new[e_shstrndx])
+
+    with open(path, "wb") as f:
+        f.write(out)
+    return sorted(((names[i], sizes[i]) for i in dropped), key=lambda t: -t[1])
+
+
+def _host_paths_in(data: bytes) -> list[str]:
+    """Host build paths left in `data`, including this host's own $HOME."""
+    hits = {m.group().decode("utf-8", "replace") for m in _HOST_PATH_RE.finditer(data)}
+    home = os.path.expanduser("~").encode()
+    if len(home) > 4 and home in data:
+        hits.add(home.decode("utf-8", "replace"))
+    return sorted(hits)
+
+
 def _helper_soname_for(target_soname: str) -> str:
     """Per-target helper soname. Keep it deterministic and collision-free."""
     base = target_soname[:-3] if target_soname.endswith(".so") else target_soname
@@ -323,24 +513,30 @@ def _helper_soname_for(target_soname: str) -> str:
 
 
 def _emit_helper(abi: str, helper_soname: str, region_bytes: bytes,
-                 out_path: str) -> None:
-    """Clone the ABI helper skeleton: rename its DT_SONAME and append the metadata region
-    as a fresh read-only 16 KB-aligned PT_LOAD (its first bytes are the region, which the
-    helper's constructor finds by magic — see stub/sopk_rt.c)."""
+                 out_path: str, allow_helper_log: bool = False) -> None:
+    """Clone the ABI helper skeleton: strip it, rename its DT_SONAME and append the metadata
+    region as a fresh read-only 16 KB-aligned PT_LOAD (its first bytes are the region, which the
+    helper's constructor finds by magic — see stub/sopk_rt.c).
+
+    Every guard here exists because the skeleton is hand-built OUTSIDE this repo, so the host is
+    the only place a bad one can be caught. `scripts/build_wbaes.sh --release` and Phase 4's
+    checks already describe a correct build; they did not prevent a tracing, unstripped helper
+    reaching a shipped APK, because nothing refused one."""
     skeleton = helper_skeleton_path(abi)
 
     # Build-marker guard. The skeleton is built by hand outside this repo, so a stale one is
     # easy to leave behind — and a stale one is SILENT: its ctor requires an exact region
-    # version match, finds none, fails open, and the target runs still-encrypted .text and
-    # SIGILLs with nothing pointing at the cause. Catch it here instead.
+    # version match and finds none. Catch it here instead. Safe across the strip below: the
+    # marker lives in .rodata (SHF_ALLOC), so it is still present in the emitted helper.
     with open(skeleton, "rb") as f:
         if HELPER_BUILD_MARKER not in f.read():
             raise InjectError(
                 f"helper skeleton {os.path.basename(str(skeleton))} lacks the v{REGION_VERSION} build marker "
-                f"({HELPER_BUILD_MARKER.hex()}) — it was built from an older stub/sopk_rt.c "
-                "and would fail open at load, leaving encrypted .text to crash the app. "
+                f"({HELPER_BUILD_MARKER.hex()}) — it was built from an older stub/sopk_rt.c, "
+                "so its region layout or crypto flow no longer matches this packer. "
                 "Rebuild it from the current stub/sopk_rt.c against whitebox-cryptography "
-                ">= 2.0.0 (see docs/wbaes-verification.md).")
+                ">= 2.0.0 (see docs/wbaes-verification.md Phase 4, or run "
+                "./scripts/build_wbaes.sh --release).")
 
     binary = lief.parse(str(skeleton))
     if binary is None:
@@ -369,6 +565,79 @@ def _emit_helper(abi: str, helper_soname: str, region_bytes: bytes,
             "whitebox-cryptography >= 2.0.0 (scripts/build_android.sh) and link with "
             "-Wl,--no-undefined so this fails at build time instead.")
 
+    name = os.path.basename(str(skeleton))
+
+    # Tracing guard. A -DSOPK_RT_LOG helper announces the target soname, .text RVA and size,
+    # and a final "OK" to logcat under tag sopk_rt — which hands anyone with adb the exact
+    # address and length to dump, plus confirmation the dump is valid. Refuse by default.
+    logging_built = ("liblog.so" in _needed_names(binary)
+                     or "__android_log_print" in _undefined_dynsyms(str(skeleton)))
+    if logging_built and not allow_helper_log:
+        raise InjectError(
+            f"helper skeleton {name} was built with -DSOPK_RT_LOG (imports "
+            "__android_log_print / needs liblog.so). A shipped helper then logs the target "
+            "soname, .text RVA and size, and a final \"OK\" to logcat under tag sopk_rt — an "
+            "attacker with adb gets the exact address and length to dump.\n"
+            "  To fix:  ./scripts/build_wbaes.sh --release\n"
+            "  To keep: pass --allow-helper-log (for on-device Phase 6 verification only; "
+            "the result is NOT shippable)")
+    if logging_built:
+        # Every pack, not once per run: the whole reason this flag needs a loud footprint is
+        # that "remember to drop -DSOPK_RT_LOG" is exactly the convention that already failed.
+        _warn(f"{helper_soname} is a TRACING build (--allow-helper-log): it logs the target "
+              "name, .text address and size to logcat. DO NOT SHIP THIS APK.")
+
+    # The helper is supposed to export nothing (-Wl,--exclude-libs,ALL + -fvisibility=hidden).
+    # Re-exported white-box symbols publish the SDK's whole API surface, and Phase 4 checks for
+    # them only in a script the user can skip, so check here too. Narrow to the white-box names:
+    # a blanket "exports nothing" rule would reject the test fixtures, which double as targets.
+    exported = _exported_dynsyms(str(skeleton))
+    leaked = sorted({n for n in exported
+                     if n.startswith(("wbc_", "sodium_")) or "wbaes" in n or n.startswith("_ZN2vm")})
+    if leaked:
+        raise InjectError(
+            f"helper skeleton {name} re-exports white-box symbols {leaked[:8]}"
+            f"{' …' if len(leaked) > 8 else ''} — WBC_API visibility is baked into "
+            "libwbcrypto.a's objects, so -fvisibility=hidden cannot hide them. Relink with "
+            "-Wl,--exclude-libs,ALL (or a `{ local: *; };` version script).")
+    elif exported:
+        _warn(f"{helper_soname} exports {len(exported)} symbol(s) (expected none): "
+              f"{exported[:5]}. Relink with -Wl,--exclude-libs,ALL.")
+
+    # Snapshot before any write. LIEF rebuilds .dynstr with the strings SORTED on write(),
+    # rewriting every st_name to match; on the target that desync shipped once and cost a
+    # Flutter app its Dart snapshot pointers (§11f). Here the risk is not dlsym — the helper
+    # exports nothing — but its UNDEFINED imports, which is exactly what the "must DEFINE
+    # every wbc_*, never import one" guard above reads. If a write perturbs the
+    # .dynsym/.dynstr correspondence, that guard silently stops meaning anything.
+    dynsyms_before = _dynsym_names(str(skeleton))
+    del binary          # everything below works on the output copy, not the skeleton
+
+    # Strip FIRST, on a copy, and only then let LIEF append the region. The order matters twice:
+    #   * LIEF re-creates `.symtab`/`.strtab` from its own symbol model on write(), so stripping
+    #     after a LIEF write does not remove them. Stripping first leaves LIEF nothing to
+    #     regenerate from.
+    #   * `_strip_nonalloc` truncates at the last byte any PT_LOAD still needs. LIEF picks the
+    #     appended region segment's file offset itself, and if it landed above the debug
+    #     sections that truncation point would jump past them — content still erased, but the
+    #     file would stay multi-megabyte. Stripping before the segment exists removes the
+    #     dependency on where LIEF chooses to put it.
+    shutil.copyfile(str(skeleton), out_path)
+    removed = _strip_nonalloc(out_path)
+    if removed:
+        total = sum(sz for _, sz in removed)
+        shown = ", ".join(n for n, _ in removed[:6])
+        _warn(f"helper skeleton {name} shipped {len(removed)} non-ALLOC sections "
+              f"({shown}{' …' if len(removed) > 6 else ''}; {total:,} bytes) — stripped them. "
+              "Build with ./scripts/build_wbaes.sh --release, which passes -g0 and "
+              "llvm-strip --strip-all, so the packer does not have to.")
+
+    binary = lief.parse(out_path)
+    if binary is None:
+        raise InjectError(
+            f"LIEF cannot parse {name} after stripping it — the section surgery produced a "
+            "malformed ELF, which is a bug in _strip_nonalloc, not in the skeleton")
+
     _set_soname(binary, helper_soname)
 
     seg = lief.ELF.Segment()
@@ -379,9 +648,31 @@ def _emit_helper(abi: str, helper_soname: str, region_bytes: bytes,
     binary.add(seg)
     binary.write(out_path)
 
+    dynsyms_after = _dynsym_names(out_path)
+    if dynsyms_before != dynsyms_after:
+        bad = next(((x, y) for x, y in zip(dynsyms_before, dynsyms_after) if x != y), None)
+        detail = f"e.g. {bad[0]!r} -> {bad[1]!r}" if bad else \
+                 f"count {len(dynsyms_before)} -> {len(dynsyms_after)}"
+        raise InjectError(
+            f"emitting helper {helper_soname} changed its dynamic symbol names ({detail}) — "
+            "DT_STRTAB and the .dynsym offsets are out of sync, so the undefined-symbol guard "
+            "no longer inspects what it claims to and bionic may fail to load the helper")
+
+    # Residual host paths. After the strip there should be none; anything left is in a mapped
+    # section, which no amount of post-processing here can fix — it needs the archive rebuilt
+    # with -ffile-prefix-map. Warn rather than refuse, since that is another repo.
+    with open(out_path, "rb") as f:
+        residual = _host_paths_in(f.read())
+    if residual:
+        _warn(f"{helper_soname} still contains host build paths in mapped sections: "
+              f"{residual[:3]}. These leak a developer username and pin dependency versions. "
+              "Rebuild libwbcrypto.a with -ffile-prefix-map=<src>=. in the "
+              "whitebox-cryptography repo.")
+
 
 def _inject_wbaes(in_path: str, out_path: str, abi: str,
-                  wb_keygen: str | None, target_name: str | None) -> InjectResult:
+                  wb_keygen: str | None, target_name: str | None,
+                  allow_helper_log: bool = False) -> InjectResult:
     """`--cipher wbaes`: encrypt `.text` with ChaCha20 under a session key that is wrapped
     by a sealed white-box AES-128 key, and inject a per-target DT_NEEDED helper that unwraps
     and decrypts at load. No stub/decinfo/DT_INIT surgery — the helper's constructor runs
@@ -467,7 +758,8 @@ def _inject_wbaes(in_path: str, out_path: str, abi: str,
         soname=target_soname.encode("utf-8"), wpass=prov.wpass, blob=prov.blob,
     ).pack()
     helper_path = out_path + ".helper.so"
-    _emit_helper(abi, helper_soname, region, helper_path)
+    _emit_helper(abi, helper_soname, region, helper_path,
+                 allow_helper_log=allow_helper_log)
 
     # 5. self-verify both artifacts.
     _self_verify_wbaes(out_path, helper_path, prov.ciphertext, text_rva, text_size,
@@ -521,6 +813,44 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
     if stray:
         raise InjectError(f"emitted helper has non-bionic DT_NEEDED {stray}")
     _assert_16k_and_no_textrel(hlp, abi)
+    # The strip actually happened. A silently-skipped strip ships 2.7 MB of DWARF and the full
+    # symbol table, which is the single largest analysis shortcut in the whole design.
+    leftover = sorted(s.name for s in hlp.sections
+                      if s.name and s.name not in _KEEP_NONALLOC
+                      and not s.has(lief.ELF.Section.FLAGS.ALLOC))
+    if leftover:
+        raise InjectError(
+            f"emitted helper still has non-ALLOC sections {leftover} — the strip did not take "
+            "effect, so the helper would ship its symbol table and debug info")
+    # Absence of the sections is not the same as absence of their bytes. Stripping erases and
+    # truncates, so once only `.shstrtab` is left the file should be little more than its mapped
+    # segments plus the section table; anything much larger means a multi-MB hole of padding
+    # survived, which a STORED APK entry still carries in full. Checked rather than observed,
+    # because the "~470 KB not 3.2 MB" claim in the docs otherwise rests on a layout accident.
+    mapped_end = max((int(s.file_offset) + int(s.physical_size)) for s in hlp.segments)
+    shstr = hlp.get_section(".shstrtab")
+    tail = int(shstr.size) + hlp.header.numberof_sections * hlp.header.section_header_size
+    budget = mapped_end + tail + SEGMENT_ALIGN     # one page of alignment slack
+    actual = os.path.getsize(helper_path)
+    if actual > budget:
+        raise InjectError(
+            f"emitted helper is {actual:,} bytes but its mapped content plus section table needs "
+            f"only {budget:,} — {actual - budget:,} bytes of stripped-out padding were left "
+            "behind, so the APK carries them. _strip_nonalloc did not compact the file")
+    # ...and it did NOT turn into the section-header stripping that bionic (Android 14+)
+    # refuses to load: e_shnum must stay non-zero and e_shstrndx must point at a real
+    # .shstrtab. See docs/static-analysis-hardening.md §Method 3.
+    if hlp.header.numberof_sections == 0 or hlp.get_section(".shstrtab") is None:
+        raise InjectError(
+            "emitted helper lost its section header table (e_shnum=0 or no .shstrtab) — "
+            "bionic on Android 14+ rejects that outright ('has no section headers')")
+    for need in (".dynsym", ".dynstr"):
+        if hlp.get_section(need) is None:
+            raise InjectError(f"emitted helper lost {need}, so it cannot be linked against")
+    # Deliberately NOT asserted here: that the build marker survived into the emitted helper.
+    # Nothing reads it there — the stale-skeleton guard always reads sopack/stubs/, never a
+    # previously emitted helper — so the assertion would only be able to fail spuriously (a
+    # test fixture carrying the marker as trailing bytes rather than in .rodata).
     # (d) the region round-trips and describes THIS target.
     region = _extract_region(helper_path)
     r = Region.unpack(region)
@@ -604,9 +934,11 @@ def _extract_region(helper_path: str) -> bytes:
 def inject_so(in_path: str, out_path: str, abi: str,
               cipher: str = "chacha20", log: bool = False,
               wb_keygen: str | None = None,
-              target_name: str | None = None) -> InjectResult:
+              target_name: str | None = None,
+              allow_helper_log: bool = False) -> InjectResult:
     if CIPHER_IDS[cipher] == CIPHER_WBAES:
-        return _inject_wbaes(in_path, out_path, abi, wb_keygen, target_name)
+        return _inject_wbaes(in_path, out_path, abi, wb_keygen, target_name,
+                             allow_helper_log=allow_helper_log)
     stub: Stub = load_stub(abi)
     cipher_id = CIPHER_IDS[cipher]
     # Whitening span: the WHITEN_SPAN stub bytes immediately before g_decinfo — real

@@ -21,7 +21,10 @@
 #   --abi ABI       default arm64-v8a
 #   --api N         default 24
 #   --release       build the skeleton WITHOUT -DSOPK_RT_LOG (no logcat tracing, no liblog).
-#                   The default is a tracing build, because the first device run needs it.
+#                   This is the DEFAULT — a tracing helper logs the target name, .text address
+#                   and size to logcat, and `sopack pack` refuses to pack one.
+#   --trace         opt into the tracing build for on-device Phase 6 verification. The result
+#                   needs `sopack pack --allow-helper-log` and is NOT shippable.
 #   --omvll         configure the Android build WITH the O-MVLL obfuscation plugin. Default is
 #                   --no-omvll: fewer moving parts while proving the pipeline works.
 #   --skip-tests    skip Phase 2 (the unit tests)
@@ -40,7 +43,7 @@ SOPACK="$(cd "$HERE/.." && pwd)"
 
 ABI="arm64-v8a"
 API=24
-RELEASE=0
+RELEASE=1
 OMVLL=0
 SKIP_TESTS=0
 HOST_ONLY=0
@@ -53,7 +56,8 @@ while [ "$#" -gt 0 ]; do
         --ndk)        NDK="$2"; shift 2 ;;
         --abi)        ABI="$2"; shift 2 ;;
         --api)        API="$2"; shift 2 ;;
-        --release)    RELEASE=1; shift ;;
+        --release)    RELEASE=1; shift ;;          # now the default; kept for explicitness
+        --trace)      RELEASE=0; shift ;;
         --omvll)      OMVLL=1; shift ;;
         --skip-tests) SKIP_TESTS=1; shift ;;
         --host-only)  HOST_ONLY=1; shift ;;
@@ -146,8 +150,8 @@ else
     info "NDK     $NDK  ($HOSTTAG)"
 fi
 info "target  $ABI / android-$API"
-if [ "$RELEASE" -eq 1 ]; then info "skeleton RELEASE (no tracing)"
-else                          info "skeleton TRACING (-DSOPK_RT_LOG -llog)"; fi
+if [ "$RELEASE" -eq 1 ]; then info "skeleton RELEASE (no tracing, stripped)"
+else warn "skeleton TRACING (-DSOPK_RT_LOG -llog) — needs 'pack --allow-helper-log'; NOT shippable"; fi
 
 # ---- Phase 1 — host wb_keygen, and prove the white-box is standard AES-128 --------------
 step 1 "$TOTAL" "Phase 1 — host wb_keygen + FIPS-197 anchor"
@@ -275,9 +279,17 @@ TRACE_FLAGS=""
 # clang++ (not clang: the archive is C++), libc++ STATIC (a libc++_shared.so dependency would be
 # another .so to ship and the packer rejects it), -x c because sopk_rt.c is C, and
 # --no-undefined so a 1.x archive fails HERE instead of on device. See the doc for each.
+#
+# -g0 and -ffile-prefix-map are load-bearing for static-analysis resistance, not tidiness: a
+# default build carries ~2.7 MB of DWARF naming every function (sopk_rt_ctor, the wbc_* API, the
+# VM handlers) plus the absolute host source paths, which leak a developer username and pin the
+# vendored libsodium version. The packer strips what it can at pack time, but doing it here is
+# what keeps the artifact honest. Note -ffile-prefix-map only rewrites paths for THIS file;
+# strings baked into libwbcrypto.a need the same flag in the whitebox-cryptography build.
 link_skeleton() {   # link_skeleton <extra flags…>
     # shellcheck disable=SC2086
-    "$CXX" --target="${ABI_TRIPLE}${API}" -fPIC -shared -O2 \
+    "$CXX" --target="${ABI_TRIPLE}${API}" -fPIC -shared -O2 -g0 \
+        -ffile-prefix-map="$WBC=." -ffile-prefix-map="$SOPACK=." \
         -fvisibility=hidden -Wl,--exclude-libs,ALL -Wl,--no-undefined \
         "$@" \
         -I"$WBC/include" -I"$SOPACK/stub" \
@@ -306,6 +318,19 @@ if ! link_skeleton -static-libstdc++; then
     fi
 fi
 ok "skeleton built: $SKEL"
+
+# -g0 stops OUR debug info; the static archive still contributes its own symbols, so strip.
+# --strip-all removes .symtab/.strtab/.comment and any remaining .debug_*, and keeps .dynsym /
+# .dynstr / the section header table — which is what bionic needs. This is NOT the section-header
+# stripping that docs/static-analysis-hardening.md §Method 3 rejected (that zeroed e_shoff).
+STRIP="$(dirname "$CXX")/llvm-strip"
+if [ -x "$STRIP" ]; then
+    before=$(wc -c <"$SKEL")
+    "$STRIP" --strip-all "$SKEL" || die "llvm-strip failed on $SKEL"
+    ok "stripped: $before -> $(wc -c <"$SKEL") bytes"
+else
+    warn "llvm-strip not found at $STRIP; the packer will strip at pack time instead"
+fi
 
 # ---- Phase 4 PASS checks ---------------------------------------------------------------
 info "checking the skeleton …"
@@ -383,6 +408,14 @@ if [ "$RELEASE" -eq 0 ]; then
 
   This skeleton is a TRACING build, so the helper logs a per-phase timing line at load:
       adb logcat | grep -E 'sopk_rt|linker|dlopen|DEBUG'
-  Re-run with --release before shipping.
+  It also needs 'pack --allow-helper-log', because those same lines hand an attacker the
+  .text address and length to dump. Re-run WITHOUT --trace before shipping.
+EOF
+else
+    cat <<EOF
+
+  This skeleton is a RELEASE build: no logcat output, so a failure at load is a SIGABRT
+  with no message (by design — see the fail-closed note in stub/sopk_rt.c). If the app
+  crashes on device, rebuild with --trace and pack with --allow-helper-log to find out why.
 EOF
 fi
