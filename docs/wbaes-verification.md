@@ -14,9 +14,9 @@ the `#include <cstdlib>` fix in `src/vm/assembler.cpp` — update it.
 every PASS signal below into a hard gate:
 
 ```bash
-./scripts/build_wbaes.sh                      # prompts for WBC/NDK if unset
+./scripts/build_wbaes.sh                      # prompts for WBC/NDK if unset; RELEASE skeleton
 ./scripts/build_wbaes.sh --host-only          # Phases 1-3 only; no NDK needed
-./scripts/build_wbaes.sh --release            # skeleton without logcat tracing
+./scripts/build_wbaes.sh --trace              # Phase-6 tracing skeleton (NOT shippable)
 ```
 
 It stops before Phase 5 (that needs your APK and lib names) and prints the pack command to run
@@ -174,19 +174,33 @@ Then the helper (add YOUR O-MVLL plugin flags to this clang++ line):
 CXX="$NDK/toolchains/llvm/prebuilt/$(uname | tr A-Z a-z)-x86_64/bin/clang++"
 # (on Apple Silicon the prebuilt dir is still darwin-x86_64)
 
-"$CXX" --target=aarch64-linux-android24 -fPIC -shared -O2 \
+"$CXX" --target=aarch64-linux-android24 -fPIC -shared -O2 -g0 \
+    -ffile-prefix-map="$WBC=." -ffile-prefix-map="$SOPACK=." \
     -fvisibility=hidden -Wl,--exclude-libs,ALL -Wl,--no-undefined \
     -static-libstdc++ \
     -I"$WBC/include" -I"$SOPACK/stub" \
     -x c "$SOPACK/stub/sopk_rt.c" -x none \
     "$SOPACK/assets/wbc/libwbcrypto.a" \
-    -DSOPK_RT_LOG -llog \
     -o "$SOPACK/sopack/stubs/sopk_rt_arm64-v8a.so"
+
+# -g0 stops OUR debug info; the static archive still contributes its own symbols.
+"$(dirname "$CXX")/llvm-strip" --strip-all "$SOPACK/sopack/stubs/sopk_rt_arm64-v8a.so"
 ```
 
-(`-DSOPK_RT_LOG -llog` is the Phase-6 tracing build; drop both for release. The `-D` may sit
-anywhere on the line — the driver collects defines globally — but `-llog` must come after the
-source, as above.)
+This is the RELEASE line, and it is the default for a reason. Built without `-g0` and the strip,
+the helper carries ~2.7 MB of DWARF (85% of the file) naming `sopk_rt_ctor`, the whole `wbc_*`
+API and the VM handler set, plus a 4,000-entry `.symtab` and the absolute host source paths. A
+static-analysis report on a shipped APK named exactly that as the single largest shortcut it had.
+
+`--strip-all` keeps `.dynsym`/`.dynstr` and the section header table, which is what bionic needs.
+It is **not** the section-header stripping that `static-analysis-hardening.md` §Method 3 rejected;
+that zeroed `e_shoff`, and Android 14+ refuses to load the result.
+
+For the **Phase 6** tracing build, add `-DSOPK_RT_LOG -llog` (the `-D` may sit anywhere on the
+line — the driver collects defines globally — but `-llog` must come after the source). Such a
+helper must then be packed with `sopack pack --allow-helper-log`, because it logs the target
+soname and the `.text` address and size to logcat; the packer refuses it otherwise, and the
+result is not shippable.
 
 If `-static-libstdc++` is not accepted, drop it and append the two archives explicitly after
 `libwbcrypto.a` instead:
@@ -244,7 +258,8 @@ Six things about that link line, all load-bearing:
   the loader reaches through `DT_INIT_ARRAY`, not the symbol table.
 - No `-llog` unless you also pass `-DSOPK_RT_LOG` (Phase 6).
 
-**PASS — three checks:**
+**PASS — four checks.** `sopack pack` now re-runs all of these (and refuses on failure), so
+this is the early-warning copy, not the only line of defence:
 
 ```bash
 S="$SOPACK/sopack/stubs/sopk_rt_arm64-v8a.so"
@@ -269,10 +284,17 @@ python3 -c "
 from sopack.rt_meta import HELPER_BUILD_MARKER as m
 print('build marker present:', m in open('$S','rb').read())"
 # expect True
+
+# 4. stripped: no symbol table, no DWARF, no host build paths — and still a section table
+$NM -SW "$S" | grep -cE '\.symtab|\.debug_'      # expect 0
+$NM -hW "$S" | grep -E 'section headers|Size of section'
+strings "$S" | grep -cE '^/(Users|home)/'         # expect 0
+# A release helper is ~470 KB. If it is ~3.2 MB you built without -g0/--strip-all; the packer
+# will strip it and warn, but fix the build rather than relying on that.
 ```
 
 Check 3 is what stops a **stale** skeleton shipping. The on-device ctor requires an exact
-region-version match and otherwise fails open silently, so a skeleton built from an older
+region-version match and otherwise aborts with no explanation, so a skeleton built from an older
 `sopk_rt.c` would produce an APK that crashes with encrypted `.text` and no diagnostic.
 sopack refuses such a skeleton at pack time instead.
 
@@ -331,14 +353,31 @@ for ln in o.splitlines():
 data = open(tp,"rb").read()[off:off+size]
 c = collections.Counter(data); H = -sum(v/len(data)*math.log2(v/len(data)) for v in c.values())
 print(f"5) .text entropy        : {H:.2f} bits/byte (encrypted ≈ 8.0)")
+# 6) the helper must not stand out from the libraries it ships beside
+stamps = {n: Z.getinfo(n).date_time for n in libs}
+print("6) helper timestamp OK  :", stamps[helper][0] != 1980,
+      "| distinct stamps:", len(set(stamps.values())))
+# 7) the helper carries no symbol table, no DWARF and no host build paths
+sec = subprocess.run(f"readelf -SW {hp}", shell=True, capture_output=True, text=True).stdout
+bad = [n for n in (".symtab", ".strtab", ".debug_") if n in sec]
+paths = [l for l in subprocess.run(f"strings {hp}", shell=True, capture_output=True,
+                                   text=True).stdout.splitlines()
+         if l.startswith(("/Users/", "/home/"))]
+print("7) helper stripped      :", not bad, "| leftover:", bad)
+print("7) no host paths        :", not paths, "| e.g.:", paths[:1])
+print("7) section table intact :", ".shstrtab" in sec, "| size:", len(Z.read(helper)))
 PY
 ```
 
-**PASS:** all of (1)–(4) `True`; (5) entropy ≈ 8.0 (encrypted). `--verify` prints a signer
+**PASS:** all of (1)–(4) `True`; (5) entropy ≈ 8.0 (encrypted); (6) the helper's ZIP
+timestamp matches the Gradle-built libraries around it rather than 1980-01-01 — an outlier
+there was the *first* thing a static-analysis report noticed about a shipped APK, before any
+disassembly; (7) no `.symtab`/`.debug_*`/host paths, `.shstrtab` still present, and the helper
+is ~470 KB rather than ~3.2 MB. `--verify` prints a signer
 cert. No AES key appears anywhere: the long-term key is diffused into the white-box blob
 (inside the helper), and the session key ships only in its wrapped form.
 
-**(6) The target's exported symbol names must be unchanged.** `inject_so` already refuses to
+**(8) The target's exported symbol names must be unchanged.** `inject_so` already refuses to
 pack otherwise, but check it here too — it is the failure that produced a loading-then-crashing
 APK, and it is invisible to every other check in this list:
 
@@ -367,7 +406,8 @@ tables, so `readelf --dyn-syms` alone can mislead in either direction.
 ## Phase 6 — On-device (the last mile; needs a device/emulator, arm64)
 
 **Strongly recommended for the FIRST device test: build the skeleton with tracing** so each
-helper's decrypt is visible in logcat (otherwise a silent fail-open is hard to diagnose). Add
+helper's decrypt is visible in logcat (a release helper does not log, so an abort names no
+cause). Add
 `-DSOPK_RT_LOG -llog` to the Phase-4 clang line, rebuild `sopk_rt_arm64-v8a.so`, re-pack, then:
 
 ```bash
@@ -377,7 +417,7 @@ adb logcat -s sopk_rt DEBUG          # sopk_rt = our trace; DEBUG = native crash
 ```
 
 With tracing you should see one line PER packed library, e.g.:
-`decrypted 'libapp.so' .text (5513872 bytes) at 0x… — OK`. Any `(fail open)` line names the
+`decrypted 'libapp.so' .text (5513872 bytes) at 0x… — OK`. A `SIGABRT` names the
 exact step that failed (region / target-not-loaded / `wbc_open` / `wbc_unwrap_key`).
 
 **PASS:**

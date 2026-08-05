@@ -29,7 +29,9 @@ pip install -e .                            # install the CLI (pulls in LIEF)
 ./scripts/build_chacha20.sh [--api N]       # stub ciphers: build the per-ABI blobs + test
 ./scripts/build_wbaes.sh                    # wbaes: Phases 1-4 of docs/wbaes-verification.md
 ./scripts/build_wbaes.sh --host-only        #   Phases 1-3 only; no NDK/cmake/ninja needed
-./scripts/build_wbaes.sh --release          #   skeleton without -DSOPK_RT_LOG tracing
+./scripts/build_wbaes.sh --trace            #   opt into -DSOPK_RT_LOG tracing (NOT shippable:
+                                            #   needs `pack --allow-helper-log`). Release,
+                                            #   stripped, is the DEFAULT.
 # Takes WBC/NDK from the environment, else --wbc/--ndk, else prompts. SOPACK is always the
 # repo the script lives in. --force redoes cached phases; --help lists everything.
 
@@ -41,6 +43,7 @@ bash stub/build_stubs.sh [API_LEVEL]        # default API 24 -> sopack/stubs/*.b
 # Pack an APK
 sopack pack in.apk --lib libfoo.so,libbar.so -o out.apk \
     [--abi arm64-v8a,...] [--cipher chacha20|xor|wbaes] [--min-sdk N] [--log] \
+    [--allow-helper-log] \
     [--wb-keygen PATH] [--keystore PATH --ks-alias A --ks-pass P --key-pass P] [--verify]
 sopack pack in.apk --libs libs.txt -o out.apk        # or a file, one .so per line
 # --cipher wbaes = white-box AES-128 KEY-WRAP mode (see "wbaes mode" below): the long-term key
@@ -57,7 +60,8 @@ python -m pytest tests/                     # all
 python -m pytest tests/test_cipher.py       # ChaCha20/XOR + the wbaes key-wrap KAT + whitening
 python -m pytest tests/test_metadata.py     # decinfo layout vs decinfo.h
 python -m pytest tests/test_rt_meta.py      # sopk_rt_region layout vs stub/sopk_rt.h (wbaes)
-python -m pytest tests/test_wbaes.py        # real wbaes injection (skips w/o a host wb_keygen)
+python -m pytest tests/test_wbaes.py        # wbaes guards, the strip, and real injection
+                                           #   (2 tests skip w/o a host wb_keygen)
 python -m pytest tests/test_integration.py -k init_array   # a single test by name
 ```
 
@@ -130,12 +134,26 @@ count** rather than size, is in `docs/architecture.md` §11b. Pieces:
   `dl_iterate_phdr`s the target by soname basename, de-whitens the pass, `wbc_open`s,
   `wbc_unwrap_key`s, closes the ctx (freeing the ~400 KB VM image), then ChaCha20-decrypts and
   `wbc_wipe`s the session key. `SOPK_MAX_PASS` bounds the pass.
-- **Stale-skeleton guard.** The skeleton is built by hand outside this repo, and a stale one is
-  SILENT: the ctor requires an exact region-version match, finds none, fails open, and the
-  target runs still-encrypted `.text` → SIGILL with nothing pointing at the cause. So
-  `sopk_rt.c` embeds `SOPK_RT_BUILD_MARKER_BYTES` in a retained variable and
-  `_emit_helper` **refuses** a skeleton lacking it. Bump the marker on any region/flow change,
-  in both `stub/sopk_rt.h` and `rt_meta.HELPER_BUILD_MARKER` (a test pins that they agree).
+- **The helper ctor FAILS CLOSED** (unlike the stub). Every failure path calls `sopk_fail(code)`
+  → records the reason in `volatile sopk_fail_code` → `abort()`. Do not "restore" fail-open here:
+  the helper has no fallback (decryption is its only job), so returning leaves the target running
+  encrypted `.text` and SIGILLing inside the target with nothing pointing at the cause. The stub's
+  fail-open (§4c/§9b) is different — it can chain the original init and genuinely degrade.
+- **Stale-skeleton guard.** The skeleton is built by hand outside this repo, and on device a stale
+  one is undiagnosable: the ctor requires an exact region-version match, finds none, and aborts
+  with no explanation. So `sopk_rt.c` embeds `SOPK_RT_BUILD_MARKER_BYTES` in a retained variable
+  and `_emit_helper` **refuses** a skeleton lacking it. Bump the marker on any region/flow change,
+  in both `stub/sopk_rt.h` and `rt_meta.HELPER_BUILD_MARKER` (a test pins that they agree). Keep
+  it in an `SHF_ALLOC` section (`.rodata`) — the packer strips everything else, and its own guard
+  is a byte-scan.
+- **The emitted helper is STRIPPED at pack time, and a tracing helper is REFUSED.** `_emit_helper`
+  removes every non-`SHF_ALLOC` section (`_strip_nonalloc`, raw surgery — LIEF regenerates
+  `.symtab` on write and leaves a multi-MB hole; see docs/static-analysis-hardening.md §Method 5)
+  and refuses a skeleton that imports `__android_log_print`/needs `liblog.so` unless
+  `--allow-helper-log` is passed, which warns on every pack. A default build ships 2.7 MB of DWARF
+  naming every function plus the host build paths; that is what let a static-analysis report
+  reconstruct the whole design in an hour. **This is not the rejected §Method 3** — the section
+  header table and `.shstrtab` survive, which is what bionic requires.
 - **Injection** (`elf_inject.py:_inject_wbaes`): encrypt `.text`, then add the `DT_NEEDED` via
   **raw ELF surgery, NOT LIEF `add_library`** — `add_library` grows `.dynamic`/`.dynstr` and
   spills 4 KB-aligned segments on tight libs (e.g. `libapp.so`), breaking 16 KB loading.
@@ -144,6 +162,11 @@ count** rather than size, is in `docs/architecture.md` §11b. Pieces:
   `DT_NEEDED` (`_add_needed_inplace`; refuses loudly if `.dynamic` has no terminator slack).
   Then emit the per-target helper (`libsopk_rt_<target>.so`) carrying the region. No stub /
   decinfo / DT_INIT surgery — so this mode also handles `INIT_ARRAY`-only libs for free.
+
+Only `arm64-v8a` is protected in practice, by deliberate scope choice. The other ABIs ship
+cleartext `.text`, so an analyst after the *algorithm* reads the x86_64 build and never touches the
+encryption. State the value accordingly: this raises device-level attack cost on arm64; it does not
+keep algorithms secret.
 
 Security ceiling is unchanged (obfuscation, not a key vault): the white-box is Chow-style AES
 (academically broken by BGE-class attacks — protects against *static* analysis, not dynamic;

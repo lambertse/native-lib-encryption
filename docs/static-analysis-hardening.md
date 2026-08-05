@@ -17,6 +17,7 @@ SELinux `avc` denial, and neither `SOPK` nor `sopack` appears in the shipped lib
 | 2 | [No magic at rest](#method-2--no-magic-at-rest-patch-by-known-offset-not-by-scanning) — patch by known offset, verify the signpost is gone | ✅ shipped | Nothing to `grep` for; a pack-time guard proves it |
 | 3 | [Section-header stripping](#method-3--section-header-stripping--researched-rejected-removed) | ❌ removed | Incompatible with Android 14+ bionic; also low value once (1) holds |
 | 4 | [String hygiene](#method-4--string-hygiene-drop-the-packers-name) — obfuscate the `sopack` tag | ✅ shipped | Packer name absent from a `strings` dump |
+| 5 | [Strip the wbaes helper](#method-5--strip-the-wbaes-helper-symbols-dwarf-host-paths) — symbols, DWARF, host paths | ✅ shipped (host-verified) | Removes the single largest shortcut: named functions and the SDK's whole API |
 
 The contract version was bumped `SOPK_VERSION` 1 → 2 (`stub/decinfo.h` ⇄ `sopack/metadata.py`);
 the 128-byte layout is unchanged — only its at-rest *representation* is whitened.
@@ -195,6 +196,12 @@ and little to gain by doing so. The related "keep the table but blank the sectio
 variant was also rejected: it still requires threading bionic's `.note.*`/MTE section lookups
 without bricking, for the same near-zero benefit. Whitening is the load-safe hardening.
 
+**Do not read this section as a rejection of stripping in general.** What failed was removing the
+section *header table* (`e_shoff`/`e_shnum`). Removing individual non-`SHF_ALLOC` **sections** —
+`.symtab`, `.strtab`, `.comment`, `.debug_*` — is a different operation: the table survives with a
+valid `e_shstrndx` and `.shstrtab`, which is exactly what bionic checks. That is Method 5, and it
+is shipped.
+
 ---
 
 ## Method 4 — String hygiene (drop the packer's name)
@@ -224,6 +231,58 @@ same helper to obfuscate them is straightforward if wanted.
 
 ---
 
+## Method 5 — Strip the wbaes helper (symbols, DWARF, host paths)
+
+Applies to `--cipher wbaes` only: the injected helper `libsopk_rt_<target>.so` is a normal,
+dynamically-linked `.so`, so unlike the freestanding stub blob it *has* a symbol table to leak.
+
+A static-analysis report on a shipped APK reconstructed the entire design — key hierarchy, load
+flow, region layout — in about an hour, and said plainly what made that possible: the helper
+shipped unstripped. It carried a 4,145-entry `.symtab` naming `sopk_rt_ctor`, `sopk_chacha20_apply`,
+`self_cb`, `tgt_cb`, `SOPK_WHITEN_NONCE`, `sopk_rt_build_marker`, the entire `wbc_*` API and all 21
+VM handlers, plus `STT_FILE` entries naming the translation units (`sopk_rt.c`, `wbcrypto.cpp`,
+`vm.cpp`, `softaes.c`, `trusted_storage.cpp`) — and ~2.3 MB of DWARF, in which the absolute host
+build paths disclosed a developer username and pinned the vendored libsodium version for CVE
+matching. Naming is most of reversing; this handed it over.
+
+**What ships now.** Every non-`SHF_ALLOC` section is removed, keeping only `.shstrtab`:
+
+| Removed | Why it mattered |
+| --- | --- |
+| `.symtab`, `.strtab` | every internal function and variable name |
+| `.debug_*` (six sections) | source-level structure, and the host build paths |
+| `.comment` | exact compiler build string |
+
+On the reference arm64 helper that is 2,785,024 of 3,250,832 bytes — 3.2 MB → ~470 KB, and about
+11 MB across a four-library APK. The dropped section *names* go too, so `.debug_info` does not
+linger in `.shstrtab` advertising what was taken out.
+
+**Two layers, because the skeleton is hand-built outside the repo.** `scripts/build_wbaes.sh`
+passes `-g0 -ffile-prefix-map=… ` and runs `llvm-strip --strip-all` (Phase 4); and
+`elf_inject.py:_emit_helper` strips whatever still arrives, warning that it had to.
+`_self_verify_wbaes` then asserts the result. The build flag alone was not enough — a correct
+`--release` path already existed when the unstripped helper shipped. Nothing refused one.
+
+**Why raw ELF surgery rather than LIEF here.** Two measured reasons: LIEF re-creates
+`.symtab`/`.strtab` from its own symbol model on `write()`, so removing them through LIEF does not
+remove them from the output; and LIEF keeps retained sections at their original file offsets, so
+deleting 2.7 MB from the middle of the file leaves a 2.7 MB hole of zero padding rather than a
+smaller file — which a STORED APK entry still carries in full. `_strip_nonalloc` therefore zeroes
+the dropped ranges, rebuilds `.shstrtab` from the surviving names, remaps every `sh_link`/`sh_info`
+index, and moves `.shstrtab` plus the section header table down past the last mapped byte before
+truncating. Nothing the loader maps is moved, so the 16 KB segment congruence LIEF established is
+undisturbed.
+
+**This is not Method 3.** The section header table survives with a valid `e_shstrndx` and a real
+`.shstrtab`; only its non-ALLOC entries are gone. See the note at the end of Method 3.
+
+**Not hidden by this.** The 8 build-marker bytes stay (they live in `.rodata`, and being a stable
+recognisable constant is the marker's whole job as the stale-skeleton guard), and so do the `SRTR`
+magic and the section-less RO `PT_LOAD` that carries it. Those remain reliable detection
+signatures, per "What is deliberately NOT hidden" below.
+
+---
+
 ## How the hardening is verified
 
 | Concern | Locked by |
@@ -233,6 +292,9 @@ same helper to obfuscate them is straightforward if wanted.
 | Magic signpost gone; record round-trips | `_self_verify` (magic-needle absent, de-whiten == packed) + `b"SOPK" not in output` in integration tests |
 | Span is real code the injector never rewrites | `_self_verify` span-immutability check + low-entropy guard in `inject_so` |
 | End-to-end on real hardware | Confirmed on-device (Android 16, arm64): stub logs `native .text decrypted OK`, no SELinux `avc` denial, app runs |
+| Stripping keeps the helper loadable | `tests/test_wbaes.py::test_a_stripped_library_still_loads` — strips a host `.so` and `dlopen`s it in a fresh process. Host glibc is **not** bionic (see Method 3), so this proves the surgery is sane, not that it is Android-safe; Phase 6 on device is still required |
+| Nothing strippable survives a pack | `test_strip_removes_debug_and_symbols_but_keeps_the_loader_view`, `test_emitted_helper_is_stripped_and_keeps_its_dynamic_symbols`, and `_self_verify_wbaes` |
+| A tracing or symbol-leaking helper cannot be packed | `test_emit_helper_refuses_a_tracing_skeleton`, `test_emit_helper_refuses_a_skeleton_that_reexports_the_white_box` |
 
 Run: `python -m pytest tests/`. After **any** change to `stub/*.c`/`*.h`, rebuild the blobs
 first: `bash stub/build_stubs.sh` (hard-fails on any relocation / undefined symbol / arm64
@@ -246,3 +308,11 @@ first: `bash stub/build_stubs.sh` (hard-fails on any relocation / undefined symb
 - **Where `.text` is.** Section-header stripping was removed (Method 3), and the location is
   derivable from program headers regardless. Harmless once the key is unrecoverable.
 - Runtime plaintext (dynamic analysis) — see the threat model above.
+- **The wbaes helper's `SRTR` magic in a section-less read-only `PT_LOAD`**, and the
+  `libsopk_rt_<target>.so` name in the target's `DT_NEEDED`. Both are one-line detection
+  signatures, and neither can be removed while the helper still has to find its own region and be
+  loaded by name. Renaming buys an analyst-minute, not security.
+- **That only `arm64-v8a` is protected.** `armeabi-v7a`/`x86`/`x86_64` ship cleartext `.text`, so
+  an analyst who wants the *algorithm* reads another ABI's build and never touches the encryption.
+  This is a deliberate scope decision: the protection raises device-level attack cost on arm64, it
+  does not keep algorithms secret.

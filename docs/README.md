@@ -6,6 +6,10 @@
   that shape the design, the three components (runtime stub, ELF injector, APK
   repackager), the reasoning and the hard-won insights behind each decision, and how it
   was built and validated.
+- **[wbc-integration.md](./wbc-integration.md)** — the boundary with the
+  **whitebox-cryptography** SDK for `--cipher wbaes`: which artifacts and API calls sopack
+  consumes and which it refuses, what crosses the host/device line, the version contract, and
+  what breaks when the SDK moves. Read it before upgrading that dependency.
 - **[wbaes-verification.md](./wbaes-verification.md)** — the six-phase procedure for
   `--cipher wbaes` (white-box AES-128 key wrapping): building the host `wb_keygen` and the
   per-ABI helper skeleton, a host round-trip through the real white-box, and what to check

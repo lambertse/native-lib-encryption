@@ -499,6 +499,10 @@ docs/                 this documentation
 
 ## 11. `--cipher wbaes` — the white-box key-wrap mode
 
+*For the boundary with the whitebox-cryptography SDK itself — the API surface consumed vs refused,
+the artifact flow, the version contract and the upgrade checklist — see
+[`wbc-integration.md`](./wbc-integration.md). This section is the reasoning behind it.*
+
 An alternative to §4's freestanding stub, selected with `--cipher wbaes`. Everything in
 §§1–2 still applies (`execmem` not `execmod`, no W+X, I-cache flush, 16 KB pages); what
 changes is *where the decryptor lives* and *where the key lives*.
@@ -594,11 +598,21 @@ code address falls inside a module's `PT_LOAD`) and picking the non-writable, no
 segment that begins with the `SRTR` magic and the expected version. The target's load base
 comes from the same iteration, matched by soname basename.
 
-That version gate **fails open** — an unrecognised region means "do nothing", so a mismatch
-between packer and skeleton produces a target running encrypted `.text` and a SIGILL with no
-diagnostic. Because the skeleton is built by hand outside this repo, that mismatch window is
-real, so `sopk_rt.c` embeds an opaque build marker and the packer refuses a skeleton lacking
-it (§CLAUDE.md invariants). Pack-time error beats device-side crash.
+That version gate, and every other failure path in the ctor, **fails closed**: `sopk_fail()`
+records a numbered reason in the `volatile` `sopk_fail_code` and calls `abort()`.
+
+Failing open would be pointless here, and this is the one place the stub's policy (§4c, §9b)
+does not transfer. The stub can chain the original `DT_INIT` and degrade to a working, unpacked
+library. The helper has no such fallback — decryption is its only job — so a fail-open return
+leaves the target executing still-encrypted `.text`, which SIGILLs somewhere inside the target
+with nothing pointing at the cause. Aborting does not add a crash; it relocates the same crash
+to the actual cause, and the reason code stays readable in the tombstone even in a stripped,
+non-logging build. `noreturn` lets the compiler drop the dead code after each call site, so the
+policy costs no bytes.
+
+An abort still says nothing about *why*, and the most likely why is a stale hand-built skeleton.
+So `sopk_rt.c` embeds an opaque build marker and the packer refuses a skeleton lacking it
+(§CLAUDE.md invariants): a pack-time error naming the rebuild beats a device-side SIGABRT.
 
 ### 11f. Adding the `DT_NEEDED` without breaking `dlsym` (a bug worth remembering)
 
@@ -638,3 +652,191 @@ point at different bytes).
 See [`wbaes-verification.md`](./wbaes-verification.md) for the six-phase verification
 procedure, including a host round-trip that exercises every one of these contracts without a
 device.
+
+---
+
+## 12. Key lifecycle — pack time and runtime, in both modes
+
+Where the key comes from, how it is embedded, and how it is recovered at load. Everything below
+is drawn from the code; §§4–5 and §11 argue *why* each step exists.
+
+**There are two key paths, not three.** `--cipher xor` and `--cipher chacha20` share one path
+completely — same `sopk_decinfo`, same whitening, same stub, same delivery; only the bulk
+primitive differs. Call that **stub mode**. `--cipher wbaes` is the other. Both use the same
+16-byte nonce block convention (12-byte ChaCha20 nonce ‖ 4-byte little-endian counter), so the
+nonce is never a point of difference.
+
+### 12a. Stub mode — pack time (how the key is embedded)
+
+```
+HOST — sopack pack --cipher chacha20|xor
+─────────────────────────────────────────────────────────────────────────────────
+  cipher.gen_key_nonce()
+    ├── key32   = urandom(32)
+    └── nonce16 = urandom(12) ‖ 00 00 00 00
+           │
+           ├──▶ apply_cipher(.text, key32, nonce16) ──▶ ciphertext, IN PLACE
+           │                                            (stream cipher: same length)
+           └──▶ sopk_decinfo, 128 B   (metadata.py ⇄ stub/decinfo.h)
+                  magic 'SOPK' │ version │ cipher_id │ flags
+                  delta_text │ text_size │ delta_init   ← signed, vs &g_decinfo
+                  key32 │ nonce16 │ reserved[40]
+                           │
+           stub blob (with the record at decinfo_off) appended as one R+X PT_LOAD
+                           │
+           WHITEN AT REST — the record is masked in the shipped file:
+             span = blob[decinfo_off-1024 : decinfo_off]      ← the stub's OWN
+             wkey = cipher.whiten_key(span)                      code/rodata
+             shipped128 = ChaCha20(record, wkey, WHITEN_NONCE)
+                           │
+           DT_INIT ──▶ stub entry     (hijack the existing one, or add in place)
+```
+
+The whitening key is **derived from the stub's own bytes**, so nothing key-shaped is stored to
+carry it. Consequences the code enforces: the literal `SOPK` magic never appears in a packed
+output (`_self_verify`), the injector patches at the known offset `seg_file_off + decinfo_off`
+rather than scanning for magic, and it refuses to pack if `decinfo_off < WHITEN_SPAN` or the span
+has fewer than 16 distinct bytes (a low-entropy span would mean a near-fixed whitening key).
+`_self_verify` steps 5a/5b then re-read the output file and check the span is byte-identical to
+what was whitened with, and that the shipped 128 bytes de-whiten back to the record.
+
+**This is obfuscation, not secrecy.** The de-whitening key is computable from the shipped file
+alone — an analyst who reverses the stub once recovers every key. Whitening raises that one-time
+cost; it does not remove the ceiling (§9e).
+
+### 12b. Stub mode — runtime (how the key is retrieved)
+
+```
+DEVICE — bionic runs DT_INIT before DT_INIT_ARRAY
+─────────────────────────────────────────────────────────────────────────────────
+  DT_INIT ──▶ sopk_entry
+    │
+    │  &g_decinfo reached PC-relatively (adr; -mcmodel=tiny) — no load bias needed
+    │
+    ├─ copy the shipped 128 bytes byte-by-byte into a STACK local raw[128]
+    │     (the segment is R+X: de-whitening in place is not possible)
+    ├─ wkey = sopk_whiten_key(&g_decinfo - 1024, 1024)   ← recomputed from own code
+    └─ sopk_chacha20_apply(raw, 128, wkey, SOPK_WHITEN_NONCE)   ← self-inverse
+           │
+           ├─ parse raw[] into locals: key32, nonce16, cipher_id, flags,     [A:entry]
+           │     delta_text, text_size, delta_init   ← plaintext key material
+           │                                           lives HERE, one stack frame
+           ├─ GATE: raw.magic == 'SOPK' && text_size != 0 ?
+           │     no ──▶ [A:not-patched] ──▶ chain original init — FAIL OPEN
+           │            (a tampered stub checksums differently → garbage → here)
+           │
+           └─ text = &g_decinfo + delta_text                                  [B]
+                     │
+                     └──▶ shared .text placement tail, §12e      [C][D][E][F]
+                                │
+                          chain original init via delta_init            [H:… OK]
+```
+
+### 12c. `wbaes` mode — pack time (how the key is embedded)
+
+```
+HOST — sopack pack --cipher wbaes            (provision.py:provision_text)
+─────────────────────────────────────────────────────────────────────────────────
+  gen_wbaes_params() ──▶ kek16, sk32, wrap_iv16, nonce16
+  passphrase = token_hex(16)        seed = randbits(64)
+           │
+  kek16 ──▶ host wb_keygen --key <hex> --pass <p> --seed <n> --out blob
+           │        │
+           │        └──▶ sealed blob   (kek diffused into the table network;
+           │                            NOT recoverable from the blob)
+           │
+  sk32 ──(AES-128-CTR under kek16)──▶ wrapped = wrap_iv ‖ aes128_ctr(sk, kek, iv)
+           │                          48 B — byte-identical to wbc_wrap_key (§11d)
+           │
+  sk32 ──▶ apply_cipher(.text, sk32, nonce16) ──▶ ciphertext, IN PLACE
+           │
+  wpass = whiten_pass(passphrase, blob)     ← keyed off blob[:1024], the blob's own bytes
+           │
+  ✗ kek16 and sk32 are DISCARDED — never written to any output
+           │
+  sopk_rt_region v2 (96-B header + soname ‖ wpass ‖ blob)  ← rt_meta.py ⇄ sopk_rt.h
+           │
+  helper skeleton clone ── region appended as RO 16 KB-aligned PT_LOAD
+           │              ── DT_SONAME := libsopk_rt_<target>.so
+           │
+  target: + DT_NEEDED libsopk_rt_<target>.so   (raw surgery; no DT_INIT touched)
+  APK:    + lib/<abi>/libsopk_rt_<target>.so   (STORED, 16 KB)
+```
+
+What ships is the sealed blob, the wrapped session key, the nonce and the whitened passphrase.
+**No shipped byte is a key that can be copied out and used** — the long-term key exists only as a
+table network, and the session key only as ciphertext under it.
+
+### 12d. `wbaes` mode — runtime (how the key is retrieved)
+
+```
+DEVICE — bionic runs a dependency's constructors BEFORE the dependent's init
+─────────────────────────────────────────────────────────────────────────────────
+  dlopen(target) ──▶ load libsopk_rt_<target>.so ──▶ sopk_rt_ctor
+    │
+    ├─ magic-scan own program headers for 'SRTR' + EXACT version  (§11e)
+    │     no match ──▶ return — FAIL OPEN, SILENTLY
+    │     (that silence is why _emit_helper demands the build marker at pack time)
+    ├─ dl_iterate_phdr ──▶ target load base, matched by soname basename
+    │
+    ├─ wkey = sopk_whiten_key(region.blob, 1024) ─▶ ChaCha20(wpass) ──▶ pass
+    │     (self-inverse; the same whiten_key/WHITEN_NONCE pair as stub mode uses)
+    ├─ wbc_open(blob, pass) ──▶ ctx        Argon2id: ~230 ms, +64 MiB transient
+    ├─ wbc_unwrap_key(ctx, wrapped) ──▶ sk32              2 white-box blocks, ~1.4 ms
+    └─ wbc_close(ctx)                                     frees the ~400 KB VM image
+           │
+           │  sk32 is now an ORDINARY key in ORDINARY memory ── the one window a
+           │  process dump can exploit without attacking the white-box (§11a)
+           │
+           ├─ text = target_base + region.text_rva
+           ├─ mmap anon RW ‖ copy window ‖ ChaCha20(text…, sk32, nonce16)   ─┐
+           ├─ wbc_wipe(sk32, 32)   ← window closed as soon as the decrypt is  │ §12e
+           │                         done, BEFORE the pages are placed        │
+           └─ mremap onto the original VA ‖ mprotect R-X ‖ icache flush     ─┘
+```
+
+The long-term key `kek` is **never reconstructed on device**, at any point. That is the entire
+security difference between the two modes.
+
+### 12e. The shared `.text` placement tail (identical in both modes)
+
+Both decryptors end the same way, and the shape is forced by §2a — executing bytes the process
+modified in a *file-backed* mapping is `execmod` (denied to apps); executing from *anonymous*
+memory is `execmem` (allowed). Hence: never decrypt in place. The bracketed letters are stub
+mode's logcat stages — the ones [`troubleshooting.md`](./troubleshooting.md) has you read.
+
+```
+  pg = AT_PAGESZ                     ← read at runtime; 4 KB or 16 KB, never hardcoded
+  win = [align_down(text,pg), align_up(text+len,pg))
+  ├─ [C] mmap(anon, RW, win_len)                    ← scratch, no file behind it
+  ├─      memcpy(scratch, win_lo, win_len)          ← the encrypted page window
+  ├─ [D] decrypt exactly [text, text+text_size) inside the scratch
+  ├─ [E] mremap(scratch, MREMAP_MAYMOVE|MREMAP_FIXED → win_lo)
+  │        fails on some devices ──▶ [E2] munmap + mmap(MAP_FIXED) + copy
+  ├─ [F] mprotect(win, R-X)                         ← never W+X simultaneously
+  └─      icache flush (arm/arm64)                  ← §2c
+```
+
+Landing back on the **original** VA is what keeps every PC-relative reference, GOT entry and
+unwind table valid, so nothing else in the library needs rewriting.
+
+### 12f. The two paths side by side
+
+| | stub mode (`chacha20` / `xor`) | `wbaes` mode |
+|---|---|---|
+| bulk cipher over `.text` | ChaCha20 or XOR | ChaCha20 (always) |
+| key used for `.text` | `key32`, generated per library | `sk32`, the unwrapped session key |
+| what ships | the key itself, **whitened** | sealed blob + wrapped key + whitened passphrase |
+| where the metadata lives | `sopk_decinfo`, 128 B, inside the R+X stub segment | `sopk_rt_region` v2, 96 B + tail, in the helper's RO segment |
+| found at runtime by | known offset from `&g_decinfo` (PC-relative) | magic-scan of the helper's own phdrs |
+| decryptor | freestanding stub, raw syscalls, no libc | normal `.so`, libc + C++ + libsodium |
+| delivery | `DT_INIT` hijack or in-place add | `DT_NEEDED` on the target |
+| works on `INIT_ARRAY`-only libs | yes, via the added `DT_INIT` | yes, for free |
+| gate on bad metadata | `magic` / `text_size` check → chain original (fail open, logs `A:not-patched`) | exact region version → `abort()` (**fails closed**, reason in `sopk_fail_code`) |
+| symbols / debug info shipped | n/a (flat blob, no symbol table) | none: the packer strips every non-ALLOC section |
+| plaintext key in memory | the de-whitened stack copy, for one frame; **not** explicitly zeroed on exit | `sk32`, only between the unwrap and the explicit `wbc_wipe` |
+| startup cost | ~15 ms per 5.5 MiB | ~245 ms per library (Argon2id dominates) |
+| **long-term key recoverable from the shipped files?** | **yes** — reverse the stub once | **no** — never reconstructed on device |
+
+For the SDK-boundary view of the `wbaes` column — which WBC calls and artifacts each step uses —
+see [`wbc-integration.md`](./wbc-integration.md).
