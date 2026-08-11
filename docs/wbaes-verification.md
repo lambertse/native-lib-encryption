@@ -28,7 +28,7 @@ Set these once if you prefer to run the phases by hand:
 
 ```bash
 export SOPACK=/path/to/sopack             # this repo
-export WBC=/path/to/whitebox-cryptography # the SDK repo (master, >= 2.0.0)
+export WBC=/path/to/whitebox-cryptography # the SDK repo (master, >= 3.0.0)
 export NDK=/path/to/android-ndk           # your NDK (for Phase 4)
 ```
 
@@ -36,7 +36,7 @@ export NDK=/path/to/android-ndk           # your NDK (for Phase 4)
 
 ## Phase 1 — Prove the white-box IS standard AES-128 (host `wb_keygen`)
 
-The delivered `assets/wbc/wb_keygen` is an **Android** binary and will not run on the pack
+Any `wb_keygen` delivered out of band is an **Android** binary and will not run on the pack
 host. Build the host-native, un-obfuscated provisioning tool from source (this is exactly
 what the SDK's `scripts/gen_blob.sh` is for) and let it self-check the FIPS-197 vector:
 
@@ -72,7 +72,7 @@ behaviour the mode depends on — runs off the committed `tests/fixtures/mini_ar
 setup at all. What this covers:
 
 - `test_cipher.py` — AES core vs FIPS-197; **`aes128_ctr` vs a vector captured from the real
-  2.0.0 `wbc_unwrap_key`** (the key-wrap contract); openssl fast paths == pure Python for
+  2.0.0 `wbc_unwrap_key`, still exact at 3.0.0** (the key-wrap contract); openssl fast paths == pure Python for
   both AES-CTR and ChaCha20, **and that a wrong-IV-convention `openssl` is rejected rather
   than silently trusted** (macOS ships LibreSSL, Linux OpenSSL 3.x — a same-length wrong
   result would ship a corrupt `.text` that only crashes on device); passphrase whitening
@@ -135,20 +135,27 @@ PY
 **PASS:** `ROUND-TRIP: PASS`. Reference run on an aarch64 Linux host:
 
 ```
-region: 455233 bytes, hdr=96
-  magic/version OK  target='libapp.so'  text_size=5513872  blob=455096  pass_len=32
-  wbc_open OK (226.3 ms)
-  wbc_unwrap_key OK (1.43 ms)
-  ChaCha20 decrypt: 15.4 ms (359 MB/s)
+region: 455061 bytes, hdr=96
+  magic/version OK  target='libapp.so'  text_size=5513872  blob=454924  pass_len=32
+  blob kdf tier = 0 (0 = light/HKDF)
+  wbc_open OK (1.1 ms)
+  wbc_unwrap_key OK (0.83 ms)
+  ChaCha20 decrypt: 11.8 ms (467 MB/s)
 
-ROUND-TRIP: PASS   (total 243.1 ms for 5513872 bytes)
+ROUND-TRIP: PASS   (total 13.7 ms for 5513872 bytes)
 ```
 
-Note where the time goes: `wbc_open`'s Argon2id KDF is ~93% of it, and the white-box itself
-is 1.4 ms because it only ever touches the 32-byte session key. Neither term grows with
-`.text`; only the 15 ms ChaCha20 line does. Both the long-term key and the session key were
-generated, used and discarded inside `provision_text` — only the sealed blob, the wrapped
-key, the nonce and the whitened passphrase exist afterwards.
+Note where the time goes: **no term dominates any more**, and the only one that grows with
+`.text` is the 11.8 ms ChaCha20 line. `wbc_blob_kdf_tier` asserting tier 0 is what makes that
+true — it proves the blob was sealed at the `light` tier. Before wbcrypto 3.0.0 this run showed
+`wbc_open OK (226.3 ms)` for a 243 ms total, because the seal's KDF was a fixed Argon2id
+64 MiB / 2; sealing at `light` (HKDF-SHA256) replaces that with 1.1 ms and removes the transient
+64 MiB. A `wbc_open` line in the hundreds of ms here means the tier assertion should have caught
+it first — report that, it is a bug.
+
+The white-box itself is 0.83 ms because it only ever touches the 32-byte session key. Both the
+long-term key and the session key were generated, used and discarded inside `provision_text` —
+only the sealed blob, the wrapped key, the nonce and the whitened passphrase exist afterwards.
 
 If `wbc_open` fails here, the passphrase whitening mirror has drifted
 (`sopack/cipher.py` ⇄ `stub/stub_cipher.h`). If it opens but the compare fails, the
@@ -156,11 +163,25 @@ ChaCha20 mirror or the wrap has drifted.
 
 ---
 
-## Phase 4 — Build the per-ABI helper skeleton (NDK + O-MVLL)
+## Phase 4 — Build the per-ABI skeletons (NDK + O-MVLL)
 
-You build this; sopack only does ELF surgery on it. First the Android runtime library —
-2.0.0 ships a wrapper for the cross-build, and `libwbcrypto.a` now **bundles libsodium**, so
-the separate Android `libsodium.a` the old recipe built by hand is no longer needed:
+**Since region v3 there are TWO artifacts per ABI**, and they must be built in this order,
+because 4b links against 4a's output:
+
+| # | source | output | role |
+|---|---|---|---|
+| 4a | `stub/sopk_wb.c` | `sopk_wb_<abi>.so` → `libsopk_wb.so` | ONE shared white-box provider per ABI. Links `libwbcrypto.a`, owns every `wbc_*` call and the sealed blob, exports exactly `sopk_wb_k`. |
+| 4b | `stub/sopk_rt.c` | `sopk_rt_<abi>.so` | The THIN per-target helper. Links **no** white-box; the packer clones it once per protected library. |
+
+Why the split, in one line: the trigger must stay 1:1 with the target (bionic runs a shared
+object's constructors **once**, so one helper shared by N targets would only decrypt the libraries
+already mapped when the first loads), but the ~465 KB of white-box code and the ~455 KB blob do
+not need duplicating N times. See `stub/sopk_wb.h`.
+
+`./scripts/build_wbaes.sh` does both in one step. The manual recipe follows.
+
+First the Android runtime library — `libwbcrypto.a` **bundles libsodium** since 2.0.0, so the
+separate Android `libsodium.a` the old recipe built by hand is no longer needed:
 
 ```bash
 cd "$WBC"
@@ -168,7 +189,7 @@ cd "$WBC"
 cp build-android/libwbcrypto.a include/wbcrypto.h "$SOPACK/assets/wbc/"
 ```
 
-Then the helper (add YOUR O-MVLL plugin flags to this clang++ line):
+**4a — the shared provider.** Add YOUR O-MVLL plugin flags to this line:
 
 ```bash
 CXX="$NDK/toolchains/llvm/prebuilt/$(uname | tr A-Z a-z)-x86_64/bin/clang++"
@@ -177,15 +198,44 @@ CXX="$NDK/toolchains/llvm/prebuilt/$(uname | tr A-Z a-z)-x86_64/bin/clang++"
 "$CXX" --target=aarch64-linux-android24 -fPIC -shared -O2 -g0 \
     -ffile-prefix-map="$WBC=." -ffile-prefix-map="$SOPACK=." \
     -fvisibility=hidden -Wl,--exclude-libs,ALL -Wl,--no-undefined \
+    -Wl,-soname,libsopk_wb.so \
     -static-libstdc++ \
     -I"$WBC/include" -I"$SOPACK/stub" \
-    -x c "$SOPACK/stub/sopk_rt.c" -x none \
+    -x c "$SOPACK/stub/sopk_wb.c" -x none \
     "$SOPACK/assets/wbc/libwbcrypto.a" \
+    -o "$SOPACK/sopack/stubs/sopk_wb_arm64-v8a.so"
+
+"$(dirname "$CXX")/llvm-strip" --strip-all "$SOPACK/sopack/stubs/sopk_wb_arm64-v8a.so"
+```
+
+> **`-Wl,-soname,libsopk_wb.so` is load-bearing, not tidiness.** The thin helper's `DT_NEEDED`
+> string is whatever the linker recorded here. Without an explicit soname, lld records the file
+> **path** it was given (`.../sopack/stubs/sopk_wb_arm64-v8a.so`) and the resulting APK cannot
+> load. The packer *asserts* this rather than fixing it — it cannot fix it, because every thin
+> helper already recorded the string at link time.
+
+**4b — the thin helper.** Simpler than 4a: plain `clang`, no static libc++, no `-x c` dance, no
+`libwbcrypto.a`. But it **must** take the provider as a link input, so `--no-undefined` still
+holds and the `DT_NEEDED` comes from the provider's `DT_SONAME` rather than being invented:
+
+```bash
+CC="$(dirname "$CXX")/clang"
+
+"$CC" --target=aarch64-linux-android24 -fPIC -shared -O2 -g0 \
+    -ffile-prefix-map="$SOPACK=." \
+    -fvisibility=hidden -Wl,--no-undefined \
+    -I"$SOPACK/stub" \
+    "$SOPACK/stub/sopk_rt.c" \
+    "$SOPACK/sopack/stubs/sopk_wb_arm64-v8a.so" \
     -o "$SOPACK/sopack/stubs/sopk_rt_arm64-v8a.so"
 
 # -g0 stops OUR debug info; the static archive still contributes its own symbols.
 "$(dirname "$CXX")/llvm-strip" --strip-all "$SOPACK/sopack/stubs/sopk_rt_arm64-v8a.so"
 ```
+
+**Keep the thin helper under the same O-MVLL flags as the provider.** Otherwise every packed app
+ships an identical un-obfuscated copy of the decrypt-and-place dance — a hardening regression
+versus the pre-v3 single artifact.
 
 This is the RELEASE line, and it is the default for a reason. Built without `-g0` and the strip,
 the helper carries ~2.7 MB of DWARF (85% of the file) naming `sopk_rt_ctor`, the whole `wbc_*`
@@ -258,42 +308,64 @@ Six things about that link line, all load-bearing:
   the loader reaches through `DT_INIT_ARRAY`, not the symbol table.
 - No `-llog` unless you also pass `-DSOPK_RT_LOG` (Phase 6).
 
-**PASS — four checks.** `sopack pack` now re-runs all of these (and refuses on failure), so
-this is the early-warning copy, not the only line of defence:
+**PASS checks — and they DIFFER per artifact.** The expectations invert: the provider must export
+exactly one symbol and define every `wbc_*`; the thin helper must export nothing and reference no
+`wbc_*` at all. `sopack pack` re-runs all of these (and refuses on failure), so this is the
+early-warning copy, not the only line of defence:
 
 ```bash
-S="$SOPACK/sopack/stubs/sopk_rt_arm64-v8a.so"
+P="$SOPACK/sopack/stubs/sopk_wb_arm64-v8a.so"      # provider
+S="$SOPACK/sopack/stubs/sopk_rt_arm64-v8a.so"      # thin helper
 NM="$NDK"/toolchains/llvm/prebuilt/*/bin/llvm-readelf
 
-# 1. only bionic dependencies (sopack rejects it otherwise)
-$NM -dW "$S" | grep NEEDED
-# expect only libc.so / libm.so / libdl.so (+ liblog.so if you built with tracing).
-# libc++_shared.so here means the static libc++ did not take effect.
+# ---- the provider ----
+# P1. only bionic dependencies. libc++_shared.so means the static libc++ did not take effect.
+$NM -dW "$P" | grep NEEDED
+# P2. DT_SONAME must be exactly libsopk_wb.so — see the -Wl,-soname note above.
+$NM -dW "$P" | grep SONAME
+# P3. exports EXACTLY sopk_wb_k. Nothing means --exclude-libs/a version script swallowed the
+#     entry; extra names mean --exclude-libs did not take effect.
+$NM --dyn-syms "$P" | awk '($5=="GLOBAL"||$5=="WEAK") && $7!="UND" {print $8}'
+# expect exactly: sopk_wb_k
+# P4. IMPORTS no wbc_* — anything here means a PRE-3.0.0 archive. wbc_blob_kdf_tier in
+#     particular is the 3.0.0-only symbol.
+$NM --dyn-syms "$P" | awk '$7=="UND" && $8 ~ /^(wbc_|sodium_)/ {print $8}'
+# expect NO output
 
-# 2. exports nothing — no wbc_* leak
+# ---- the thin helper ----
+# S1. bionic + libsopk_wb.so, and libsopk_wb.so must be PRESENT (a helper that lost it fails on
+#     device as "cannot locate symbol sopk_wb_k", taking the target's dlopen with it).
+$NM -dW "$S" | grep NEEDED
+# expect libc.so / libm.so / libdl.so / libsopk_wb.so (+ liblog.so if built with tracing)
+# S2. exports nothing
 $NM --dyn-syms "$S" | awk '($5=="GLOBAL"||$5=="WEAK") && $7!="UND" {print $8}'
 # expect NO output
+# S3. imports sopk_wb_k and NO wbc_*/sodium_* — since v3 only the provider touches the white-box
+$NM --dyn-syms "$S" | awk '$7=="UND" {print $8}' | grep -E '^(sopk_wb_k|wbc_|sodium_)'
+# expect exactly: sopk_wb_k
 
-# 2b. IMPORTS no wbc_* either — anything here means it linked against a 1.x archive and
-#     will fail to load on device (see --no-undefined above)
-$NM --dyn-syms "$S" | awk '$7=="UND" && $8 ~ /^wbc_/ {print $8}'
-# expect NO output
-
-# 3. carries the build marker sopack greps for
+# ---- both ----
+# B1. each carries ITS OWN build marker. The two values differ on purpose: with one shared
+#     marker, a fresh thin helper + a stale provider would pass both checks.
 python3 -c "
-from sopack.rt_meta import HELPER_BUILD_MARKER as m
-print('build marker present:', m in open('$S','rb').read())"
-# expect True
+from sopack.rt_meta import HELPER_BUILD_MARKER as h, PROVIDER_BUILD_MARKER as p
+print('helper  marker:', h in open('$S','rb').read())
+print('provider marker:', p in open('$P','rb').read())"
+# expect True, True
 
-# 4. stripped: no symbol table, no DWARF, no host build paths — and still a section table
-$NM -SW "$S" | grep -cE '\.symtab|\.debug_'      # expect 0
-$NM -hW "$S" | grep -E 'section headers|Size of section'
-strings "$S" | grep -cE '^/(Users|home)/'         # expect 0
-# A release helper is ~470 KB. If it is ~3.2 MB you built without -g0/--strip-all; the packer
-# will strip it and warn, but fix the build rather than relying on that.
+# B2. stripped: no symbol table, no DWARF, no host build paths — and still a section table
+for f in "$P" "$S"; do
+  $NM -SW "$f" | grep -cE '\.symtab|\.debug_'    # expect 0
+  strings "$f" | grep -cE '^/(Users|home)/'       # expect 0
+done
+
+# B3. THE SIZE SPLIT — this is the point of the v3 design, so check it.
+ls -l "$P" "$S"
+# provider ~470 KB (ships ONCE per ABI); thin helper a few KB. A thin helper anywhere near
+# 470 KB means it still statically links libwbcrypto.a, and nothing was saved.
 ```
 
-Check 3 is what stops a **stale** skeleton shipping. The on-device ctor requires an exact
+Check B1 is what stops a **stale** skeleton shipping. The on-device ctor requires an exact
 region-version match and otherwise aborts with no explanation, so a skeleton built from an older
 `sopk_rt.c` would produce an APK that crashes with encrypted `.text` and no diagnostic.
 sopack refuses such a skeleton at pack time instead.
@@ -413,35 +485,70 @@ cause). Add
 ```bash
 adb install -r out.apk
 adb logcat -c && adb shell am start -n <pkg>/<launcher-activity>
-adb logcat -s sopk_rt DEBUG          # sopk_rt = our trace; DEBUG = native crash tombstones
+# TWO tags since the v3 split: sopk_rt = each thin helper, sopk_wb = the shared provider
+# (which is where the KDF-tier line comes from). DEBUG = native crash tombstones.
+adb logcat -s sopk_rt sopk_wb DEBUG
 ```
 
 With tracing you should see one line PER packed library, e.g.:
-`decrypted 'libapp.so' .text (5513872 bytes) at 0x… — OK`. A `SIGABRT` names the
-exact step that failed (region / target-not-loaded / `wbc_open` / `wbc_unwrap_key`).
+`decrypted 'libapp.so' .text (5513872 bytes) at 0x… — OK`, plus `blob kdf tier = 0` from the
+`sopk_wb` tag. A `SIGABRT` names the exact step that failed; `sopk_fail_code` in the tombstone
+gives the code, and provider failures arrive in the **10..19** band (see `stub/sopk_wb.h`).
 
 **PASS:**
 - One `… — OK` line per packed library, and the app launches and behaves normally — meaning
   each helper's constructor ran **before** its target's init and decrypted `.text` in place.
 - **No** `SIGILL`/`SIGSEGV` from a target (a crash there = its `.text` ran still-encrypted).
+- **COUNT THE LINES.** `sopack pack` reports how many libraries it injected; you need that many
+  `— OK` lines. A missing one does **not** necessarily mean failure — a library the app never
+  loads never runs its helper — but you must establish which it is rather than assume. Check
+  whether it was loaded at all:
+
+  ```bash
+  PID=$(adb shell pidof <pkg>)
+  adb shell run-as <pkg> cat /proc/$PID/maps | grep -E 'libvtap|libsopk'
+  ```
+
+  If the library IS mapped and there is no `— OK` line for it, that is a real failure: its
+  `.text` is running encrypted and it will `SIGILL` when reached.
 - If your app loads more than one packed library at **different** times (separate
   `System.loadLibrary` / `dlopen` calls), exercise each and confirm all work / all log OK —
-  this validates the one-helper-per-target design (a shared helper would only decrypt the
-  first group).
+  this validates the one-thin-helper-per-target design. Note the log will show different TIDs
+  for libraries loaded on different threads; that is the design working, not a problem. A single
+  helper shared by N targets would only ever decrypt the first group.
 
-**Also measure startup cost and memory.** Each helper runs its own `wbc_open`, and that
-Argon2id KDF is both the dominant time cost (~230 ms on a fast host, more on a phone) and a
-transient **64 MiB** allocation (`crypto_pwhash_MEMLIMIT_INTERACTIVE`) — per helper, inside
-an ELF constructor at startup. With N packed libraries you pay both N times:
+**Confirm the `light` KDF tier is actually in effect.** This is now a *confirmation* step, not a
+decision: since wbcrypto 3.0.0 the blob is sealed with `--kdf light`, so each helper's `wbc_open`
+should be single-digit-to-low-teens ms and there should be **no ~64 MiB spike per helper**. With a
+tracing skeleton the helper logs `blob kdf tier = 0` before opening. Things to read off logcat:
+
+- `blob kdf tier = 0` — anything else means a pre-3.0.0 host `wb_keygen` sealed the blob, which
+  the pack-time gate (`provision.assert_light_blob`) should have refused. If it packed anyway,
+  that is a bug worth reporting.
+- an `open=` in the hundreds of ms — same conclusion: an Argon2id-sized open means a `heavy` blob.
+- `SIGABRT` with `sopk_fail_code == 10` (`SOPK_FAIL_WBC_TIER`) — `wbc_blob_kdf_tier` rejected the
+  header, i.e. the runtime and the blob format disagree (a pre-3.0.0 `libwbcrypto.a` linked into
+  the skeleton against a v4 blob).
+
+**Then measure startup cost and memory.** Each helper still runs its own `wbc_open` — `Unseal`
+AEAD-decrypts the ~455 KB blob and builds the VM image, ~1 ms on a host — so with N packed
+libraries you pay that N times, just at a far smaller constant than the pre-3.0.0 ~230 ms:
 
 ```bash
 adb shell am start -W -n <pkg>/<launcher-activity>   # TotalTime = startup wall clock
 adb shell dumpsys meminfo <pkg> | head -20           # peak RSS around startup
 ```
 
-Record both. If N is large or the device is a 1–2 GB model, this is the number that decides
-whether to collapse the design to one shared helper carrying N regions (one KEK, one blob,
-one `wbc_open`). Nothing else in the load path scales with library count.
+Record both, and compare peak RSS against the pre-3.0.0 baseline (which carried N × 64 MiB of
+transient Argon2id arena). What these numbers now decide is **not** whether startup forces a
+redesign — the `light` tier took that pressure off — but whether the remaining per-library cost is
+worth collapsing to one shared blob, which is now mostly an **APK-size** question: each per-target
+helper ships ~465 KB of white-box code plus its own ~455 KB blob, ≈920 KB, duplicated N times.
+
+Note the shape to *avoid*: "one shared helper carrying N regions" cannot work, for the same reason
+the multi-library PASS check above exists — bionic runs a shared object's constructors once, so it
+would only decrypt the libraries mapped when the first target loads. The workable shape is N thin
+per-target helpers plus one shared white-box provider `.so`. See `docs/potential-improvements.md`.
 
 For a **release** build, drop `-DSOPK_RT_LOG -llog` — the helper then logs nothing and does
 not depend on liblog.

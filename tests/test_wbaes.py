@@ -32,7 +32,9 @@ import pytest
 from sopack import cipher, elf_inject
 from sopack.elf_inject import InjectError, _dynsym_names, _extract_region, _needed_via_strtab
 from sopack.provision import find_wb_keygen
-from sopack.rt_meta import HELPER_BUILD_MARKER, WRAPPED_KEY_BYTES, Region
+from sopack.rt_meta import (HELPER_BUILD_MARKER, PROVIDER_BUILD_MARKER, PROVIDER_ENTRY,
+                            PROVIDER_SONAME, WB_REGION_MAGIC, WRAPPED_KEY_BYTES,
+                            TargetRegion, WbRegion)
 
 lief.logging.disable()
 
@@ -68,6 +70,70 @@ def _marked_skeleton(tmp_path, src=FIXTURE) -> pathlib.Path:
     with open(path, "ab") as f:
         f.write(HELPER_BUILD_MARKER)
     return path
+
+
+def _marked_provider(tmp_path, src=FIXTURE, soname=None) -> pathlib.Path:
+    """Mock provider skeleton: `src` with a real DT_SONAME plus the PROVIDER build marker.
+
+    The soname is set with LIEF rather than faked, because it is genuinely load-bearing: each
+    thin helper's DT_NEEDED string is whatever the linker recorded here, so `emit_provider`
+    asserts it instead of setting it. The two markers differ on purpose, so a provider carrying
+    the helper's marker (or vice versa) is refused."""
+    path = tmp_path / "mock_provider.so"
+    b = lief.parse(src)
+    elf_inject._set_soname(b, soname or PROVIDER_SONAME)
+    b.write(str(path))
+    with open(path, "ab") as f:
+        f.write(PROVIDER_BUILD_MARKER)
+    return path
+
+
+def _wire_provider(monkeypatch):
+    """Make a mock provider satisfy the guards a real linker would satisfy: it must EXPORT
+    sopk_wb_k. The expectation genuinely inverts for this artifact — a thin helper exports
+    nothing — so this is patched rather than faked into the fixture.
+
+    Discriminates by the file's own DT_SONAME, not its path, so it covers both the skeleton and
+    the emitted copy (whose filename the packer chooses) while leaving the thin helper in the
+    same pack checked normally. A blanket patch would hide the very asymmetry being tested."""
+    real = elf_inject._exported_dynsyms
+
+    def exported(path):
+        b = lief.parse(str(path))
+        if b is not None and elf_inject._dynamic_soname(b) == PROVIDER_SONAME:
+            return [PROVIDER_ENTRY]
+        return real(path)
+
+    monkeypatch.setattr(elf_inject, "_exported_dynsyms", exported)
+
+
+def _target_region(soname: bytes = b"libtarget.so") -> bytes:
+    """A structurally valid v3 TARGET region. The fixtures cannot carry a real one, and a bare
+    magic + padding no longer parses now that the two kinds are distinguished."""
+    return TargetRegion(text_rva=0x1000, text_size=64, wrapped=bytes(48),
+                        nonce16=bytes(16), soname=soname).pack()
+
+
+def _wire_thin(monkeypatch, undefined=(), needed=()):
+    """Make a mock thin-helper skeleton satisfy the v3 pairing guards.
+
+    Since the provider split, a thin helper must DT_NEEDED libsopk_wb.so and import sopk_wb_k —
+    real linker output that a checked-in fixture cannot have. Tests that want to exercise a
+    DIFFERENT guard patch these so the pairing checks pass and the guard under test is what
+    fires; pass `undefined`/`needed` to add the symbols that test cares about."""
+    real_needed = elf_inject._needed_names
+
+    def needed_names(binary):
+        # Only a THIN helper gains the provider dependency. The provider itself must stay
+        # bionic-only, and a blanket patch would hide that asymmetry — which is one of the
+        # things the guards are for.
+        if elf_inject._dynamic_soname(binary) == PROVIDER_SONAME:
+            return real_needed(binary)
+        return [PROVIDER_SONAME, *needed]
+
+    monkeypatch.setattr(elf_inject, "_undefined_dynsyms",
+                        lambda path: [PROVIDER_ENTRY, *undefined])
+    monkeypatch.setattr(elf_inject, "_needed_names", needed_names)
 
 
 def _load_aligns(path: str) -> set[str]:
@@ -108,7 +174,7 @@ def test_emit_helper_refuses_a_skeleton_without_the_build_marker(monkeypatch, tm
     shutil.copyfile(FIXTURE, stale)              # a real .so, just without the marker
     monkeypatch.setattr(elf_inject, "helper_skeleton_path", lambda abi: stale)
     with pytest.raises(InjectError, match="build marker"):
-        elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", b"SRTR" + bytes(92),
+        elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", _target_region(),
                                 str(tmp_path / "helper.so"))
 
 
@@ -122,10 +188,11 @@ def test_emit_helper_refuses_a_skeleton_with_unresolved_wbc_symbols(monkeypatch,
     test exercises the guard itself instead of whichever skeleton happens to be present."""
     monkeypatch.setattr(elf_inject, "helper_skeleton_path",
                         lambda abi: _marked_skeleton(tmp_path))
-    monkeypatch.setattr(elf_inject, "_undefined_dynsyms",
-                        lambda path: ["memcpy", "wbc_unwrap_key", "wbc_wipe"])
-    with pytest.raises(InjectError, match="instead of defining them"):
-        elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", b"SRTR" + bytes(92),
+    _wire_thin(monkeypatch, undefined=["memcpy", "wbc_unwrap_key", "wbc_wipe"])
+    # Since v3 a thin helper must not reference the white-box AT ALL, so the message differs
+    # from the provider's "imports … instead of defining them".
+    with pytest.raises(InjectError, match="must not touch the white-box"):
+        elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", _target_region(),
                                 str(tmp_path / "helper.so"))
 
 
@@ -191,6 +258,7 @@ def test_self_verify_catches_a_desynced_string_table(monkeypatch, tmp_path):
     then crashes. Tests the guard, not the fix, so a refactor cannot quietly drop it."""
     monkeypatch.setattr(elf_inject, "helper_skeleton_path",
                         lambda abi: _marked_skeleton(tmp_path))
+    _wire_thin(monkeypatch)
     monkeypatch.setattr(elf_inject, "_effective_strtab",
                         lambda path: bytes(lief.parse(FIXTURE).get_section(".dynstr").content))
     with pytest.raises(InjectError, match="dynamic symbol names"):
@@ -212,6 +280,12 @@ def test_wbaes_injection_surgery(monkeypatch, tmp_path):
     src = FIXTURE
     monkeypatch.setattr(elf_inject, "helper_skeleton_path",
                         lambda abi: _marked_skeleton(tmp_path, src))
+    _wire_thin(monkeypatch)
+    # Since v3 a standalone inject_so also emits the shared provider, so both mock skeletons
+    # have to be in place.
+    provider = _marked_provider(tmp_path, src)
+    monkeypatch.setattr(elf_inject, "provider_skeleton_path", lambda abi: provider)
+    _wire_provider(monkeypatch)
     target_name = os.path.basename(src)
     out = str(tmp_path / "out.so")
 
@@ -231,12 +305,24 @@ def test_wbaes_injection_surgery(monkeypatch, tmp_path):
     assert ir.helper_soname in _needed_via_strtab(out)
 
     # the emitted helper's region round-trips and describes this target.
-    r = Region.unpack(_extract_region(ir.helper_path))
+    r = TargetRegion.unpack(_extract_region(ir.helper_path))
     assert r.text_rva == ir.text_rva and r.text_size == ir.text_size
     assert r.soname.decode() == target_name
-    assert len(r.blob) > 100_000        # a sealed white-box blob is hundreds of KB
+
+    # The blob and passphrase live in the SHARED provider now, not here. Assert both halves of
+    # that split: the thin helper is small and blob-free, and the provider carries the real one.
+    assert ir.provider_path and os.path.exists(ir.provider_path)
+    assert os.path.getsize(ir.helper_path) < 100_000, (
+        "thin helper looks like it still carries the sealed blob")
+    w = WbRegion.unpack(_extract_region(ir.provider_path, WB_REGION_MAGIC))
+    assert len(w.blob) > 100_000        # a sealed white-box blob is hundreds of KB
     # the whitened passphrase de-whitens (self-inverse, keyed off the blob).
-    assert cipher.whiten_pass(r.wpass, r.blob).isascii()
+    assert cipher.whiten_pass(w.wpass, w.blob).isascii()
+    # the provider keeps the soname every thin helper records as its DT_NEEDED. Only this half
+    # is checkable here: the helper's actual DT_NEEDED is written by the LINKER at Phase-4 time,
+    # and this mock skeleton has none on disk (the guards see a monkeypatched value). Phase 4's
+    # PASS checks verify the real pairing on a real skeleton.
+    assert elf_inject._dynamic_soname(lief.parse(ir.provider_path)) == PROVIDER_SONAME
 
     # the key-wrap fields the device reads as fixed-size arrays.
     assert len(r.wrapped) == WRAPPED_KEY_BYTES
@@ -431,10 +517,9 @@ def test_emit_helper_refuses_a_tracing_skeleton(monkeypatch, tmp_path):
     valid. A real APK shipped that way, so refuse it by default."""
     monkeypatch.setattr(elf_inject, "helper_skeleton_path",
                         lambda abi: _marked_skeleton(tmp_path))
-    monkeypatch.setattr(elf_inject, "_undefined_dynsyms",
-                        lambda path: ["memcpy", "__android_log_print"])
+    _wire_thin(monkeypatch, undefined=["memcpy", "__android_log_print"])
     with pytest.raises(InjectError, match="SOPK_RT_LOG"):
-        elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", b"SRTR" + bytes(92),
+        elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", _target_region(),
                                 str(tmp_path / "helper.so"))
 
 
@@ -444,10 +529,9 @@ def test_allow_helper_log_permits_a_tracing_skeleton_but_warns_loudly(monkeypatc
     every pack, because an unmarked opt-in is precisely the convention that already failed."""
     monkeypatch.setattr(elf_inject, "helper_skeleton_path",
                         lambda abi: _marked_skeleton(tmp_path))
-    monkeypatch.setattr(elf_inject, "_undefined_dynsyms",
-                        lambda path: ["__android_log_print"])
+    _wire_thin(monkeypatch, undefined=["__android_log_print"])
     out = tmp_path / "helper.so"
-    elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", b"SRTR" + bytes(92), str(out),
+    elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", _target_region(), str(out),
                             allow_helper_log=True)
     assert out.exists()
     err = capsys.readouterr().err
@@ -460,10 +544,11 @@ def test_emit_helper_refuses_a_skeleton_that_reexports_the_white_box(monkeypatch
     script the user can skip, and the skeleton is built by hand."""
     monkeypatch.setattr(elf_inject, "helper_skeleton_path",
                         lambda abi: _marked_skeleton(tmp_path))
+    _wire_thin(monkeypatch)
     monkeypatch.setattr(elf_inject, "_exported_dynsyms",
                         lambda path: ["wbc_open", "wbc_unwrap_key"])
     with pytest.raises(InjectError, match="re-exports white-box symbols"):
-        elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", b"SRTR" + bytes(92),
+        elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", _target_region(),
                                 str(tmp_path / "helper.so"))
 
 
@@ -474,8 +559,9 @@ def test_emitted_helper_is_stripped_and_keeps_its_dynamic_symbols(monkeypatch, t
     table, so a desync would silently empty the guard rather than break anything visibly."""
     skel = _marked_skeleton(tmp_path)
     monkeypatch.setattr(elf_inject, "helper_skeleton_path", lambda abi: skel)
+    _wire_thin(monkeypatch)
     out = tmp_path / "helper.so"
-    elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", b"SRTR" + bytes(92), str(out))
+    elf_inject._emit_helper("arm64-v8a", "libsopk_rt_x.so", _target_region(), str(out))
 
     alloc = lief.ELF.Section.FLAGS.ALLOC
     hlp = lief.parse(str(out))
@@ -582,3 +668,86 @@ def test_strip_handles_elf32_and_remaps_section_indices(tmp_path):
     # The remap: .dynsym's sh_link was 3, and .dynstr is now index 2.
     assert sh(1)[6] == 2, f".dynsym.sh_link is {sh(1)[6]}, expected 2 (.dynstr)"
     assert name(sh(1)[6]) == ".dynstr"
+
+
+# ---- the v3 shared provider: its guards invert the helper's ---------------------------
+
+def _fake_pack(blob_extra=64):
+    """A PackKey with a plausible blob (>= WHITEN_SPAN, so the whitening key can be derived) but
+    no real white-box — these tests exercise emit_provider's guards, not the crypto."""
+    from sopack.provision import PackKey
+    blob = os.urandom(cipher.WHITEN_SPAN + blob_extra)
+    return PackKey(kek=os.urandom(16), blob=blob,
+                   wpass=cipher.whiten_pass(b"passphrase", blob))
+
+
+def test_emit_provider_refuses_a_wrong_soname(monkeypatch, tmp_path):
+    """The single most dangerous new coupling. Each thin helper's DT_NEEDED string is whatever
+    the LINKER recorded as the provider's DT_SONAME, so the packer cannot correct a wrong one —
+    it can only refuse. Without -Wl,-soname, lld records the file PATH it was handed, which
+    produces an APK that cannot load."""
+    prov = _marked_provider(tmp_path, soname="sopk_wb_arm64-v8a.so")   # a path-shaped soname
+    monkeypatch.setattr(elf_inject, "provider_skeleton_path", lambda abi: prov)
+    # Patched unconditionally rather than via _wire_provider, which keys off the very soname
+    # this test deliberately gets wrong — otherwise the export check fires first and the
+    # assertion below would pass for the wrong reason.
+    monkeypatch.setattr(elf_inject, "_exported_dynsyms", lambda path: [PROVIDER_ENTRY])
+    with pytest.raises(InjectError, match="-Wl,-soname"):
+        elf_inject.emit_provider("arm64-v8a", _fake_pack(), str(tmp_path / "p.so"))
+
+
+def test_emit_provider_refuses_a_skeleton_without_the_provider_marker(monkeypatch, tmp_path):
+    """The two markers differ on purpose: a provider carrying the HELPER's marker means the two
+    artifacts were built from mismatched sources, which one shared marker could not detect."""
+    wrong = tmp_path / "wrong_marker.so"
+    b = lief.parse(FIXTURE)
+    elf_inject._set_soname(b, PROVIDER_SONAME)
+    b.write(str(wrong))
+    with open(wrong, "ab") as f:
+        f.write(HELPER_BUILD_MARKER)          # the THIN helper's marker, not the provider's
+    monkeypatch.setattr(elf_inject, "provider_skeleton_path", lambda abi: wrong)
+    with pytest.raises(InjectError, match="build marker"):
+        elf_inject.emit_provider("arm64-v8a", _fake_pack(), str(tmp_path / "p.so"))
+
+
+def test_emit_provider_refuses_a_provider_that_exports_nothing(monkeypatch, tmp_path):
+    """The expectation INVERTS for this artifact: a thin helper must export nothing, the provider
+    must export exactly sopk_wb_k. Zero exports means --exclude-libs,ALL or a `{ local: *; };`
+    version script swallowed the entry, and no thin helper could then resolve against it."""
+    prov = _marked_provider(tmp_path)
+    monkeypatch.setattr(elf_inject, "provider_skeleton_path", lambda abi: prov)
+    monkeypatch.setattr(elf_inject, "_exported_dynsyms", lambda path: [])
+    with pytest.raises(InjectError, match="does not export"):
+        elf_inject.emit_provider("arm64-v8a", _fake_pack(), str(tmp_path / "p.so"))
+
+
+def test_emit_provider_refuses_leftover_wbc_imports(monkeypatch, tmp_path):
+    """The pre-3.0.0-archive trap lives on the PROVIDER now, since it is the only artifact that
+    links libwbcrypto.a. wbc_blob_kdf_tier in particular is the 3.0.0-only symbol."""
+    prov = _marked_provider(tmp_path)
+    monkeypatch.setattr(elf_inject, "provider_skeleton_path", lambda abi: prov)
+    _wire_provider(monkeypatch)
+    monkeypatch.setattr(elf_inject, "_undefined_dynsyms",
+                        lambda path: ["memcpy", "wbc_blob_kdf_tier"])
+    with pytest.raises(InjectError, match="pre-3.0.0 libwbcrypto.a"):
+        elf_inject.emit_provider("arm64-v8a", _fake_pack(), str(tmp_path / "p.so"))
+
+
+def test_emitted_provider_keeps_its_soname_and_region(monkeypatch, tmp_path):
+    """The happy path: emit_provider must NOT rename the artifact (unlike _emit_helper, which
+    renames per target), and the region must round-trip as a PROVIDER region."""
+    prov = _marked_provider(tmp_path)
+    monkeypatch.setattr(elf_inject, "provider_skeleton_path", lambda abi: prov)
+    _wire_provider(monkeypatch)
+    pack = _fake_pack()
+    out = tmp_path / "emitted_provider.so"
+    elf_inject.emit_provider("arm64-v8a", pack, str(out))
+
+    assert elf_inject._dynamic_soname(lief.parse(str(out))) == PROVIDER_SONAME
+    w = WbRegion.unpack(_extract_region(str(out), WB_REGION_MAGIC))
+    assert (w.blob, w.wpass) == (pack.blob, pack.wpass)
+    # the long-term key must never reach a shipped artifact
+    assert pack.kek not in open(out, "rb").read()
+    # and a target-region read must refuse it rather than parse garbage
+    with pytest.raises(InjectError, match="could not find a region"):
+        _extract_region(str(out))

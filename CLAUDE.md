@@ -48,7 +48,7 @@ sopack pack in.apk --lib libfoo.so,libbar.so -o out.apk \
 sopack pack in.apk --libs libs.txt -o out.apk        # or a file, one .so per line
 # --cipher wbaes = white-box AES-128 KEY-WRAP mode (see "wbaes mode" below): the long-term key
 # is sealed into a white-box blob and never reconstructed at runtime, so no portable key ships.
-# Needs whitebox-cryptography >= 2.0.0, a HOST wb_keygen (--wb-keygen / $SOPACK_WBKEYGEN) and a
+# Needs whitebox-cryptography >= 3.0.0, a HOST wb_keygen (--wb-keygen / $SOPACK_WBKEYGEN) and a
 # per-ABI helper skeleton in sopack/stubs/ built from the CURRENT stub/sopk_rt.c.
 # Note: section-header stripping was researched and REMOVED — modern Android bionic
 # (Android 14+) requires a section table to exist and rejects a stripped lib at load
@@ -59,7 +59,8 @@ sopack pack in.apk --libs libs.txt -o out.apk        # or a file, one .so per li
 python -m pytest tests/                     # all
 python -m pytest tests/test_cipher.py       # ChaCha20/XOR + the wbaes key-wrap KAT + whitening
 python -m pytest tests/test_metadata.py     # decinfo layout vs decinfo.h
-python -m pytest tests/test_rt_meta.py      # sopk_rt_region layout vs stub/sopk_rt.h (wbaes)
+python -m pytest tests/test_rt_meta.py      # both region layouts vs stub/sopk_rt.h (wbaes)
+python -m pytest tests/test_provision.py    # the blob-header gate: v>=4 + light KDF tier
 python -m pytest tests/test_wbaes.py        # wbaes guards, the strip, and real injection
                                            #   (2 tests skip w/o a host wb_keygen)
 python -m pytest tests/test_integration.py -k init_array   # a single test by name
@@ -87,12 +88,15 @@ Three components + a thin CLI (`sopack/cli.py`):
 
 3. **APK repackager** — `sopack/apk.py`. unzip → inject each matched `lib/<abi>/*.so` →
    libs written STORED + 16 KB-aligned → `apksigner` self-sign with a generated keystore.
-   For `--cipher wbaes` it also **adds** the per-target helper `.so` into `lib/<abi>/`
-   (STORED + 16 KB) — the only add-file path in the tool.
+   For `--cipher wbaes` it also **adds** files into `lib/<abi>/` (STORED + 16 KB) — the only
+   add-file path in the tool: one thin helper per protected library, plus **one**
+   `libsopk_wb.so` per ABI. It also seals ONE white-box key per ABI before the entry loop and
+   asserts pack-level closure afterwards (every staged thin helper's provider is present) —
+   a per-target verifier structurally cannot see that.
 
 ### `--cipher wbaes` mode (white-box AES-128 key wrapping) — the alternative to the stub
 
-Requires **whitebox-cryptography >= 2.0.0**. Removes the "raw key ships in the binary"
+Requires **whitebox-cryptography >= 3.0.0**. Removes the "raw key ships in the binary"
 weakness: the long-term AES-128 key is sealed offline into a white-box blob (diffused into
 lookup tables, **never reconstructed at runtime**), so no portable key ships. Because the
 white-box runtime is C++/libsodium (needs libc/dynamic linker) it **cannot** run in the
@@ -105,12 +109,14 @@ stub, but with libc).
 `libapp.so` took *minutes* inside a constructor; 2.0.0 deleted the bulk entry points
 (`wbc_crypt_ctr`, `wbc_encrypt_ecb`) to make that shape unexpressible. Instead it wraps a
 **32-byte session key** (two blocks, fixed cost) and that key drives sopack's own ChaCha20 over
-`.text`. The cost breakdown, and why `wbc_open`'s Argon2id dominates and scales with **library
-count** rather than size, is in `docs/architecture.md` §11b. Pieces:
+`.text`. The cost breakdown, and why the per-library `wbc_open` scales with **library count**
+rather than size (and why the `light` KDF tier made it cheap), is in `docs/architecture.md` §11b.
+Pieces:
 
 - **Host provisioning** (`sopack/provision.py`): per target, generate a long-term key `kek`
-  and seal it with a **host** `wb_keygen` (the delivered `assets/wbc/wb_keygen` is an *Android*
-  build and does NOT run on the pack host — build one from the whitebox-cryptography repo
+  and seal it with a **host** `wb_keygen` at the **`light`** KDF tier (`assets/wbc/` holds only
+  `libwbcrypto.a` + `wbcrypto.h`; any `wb_keygen` delivered out of band is an *Android* build and
+  does NOT run on the pack host — build one from the whitebox-cryptography repo
   `scripts/gen_blob.sh`; point `--wb-keygen`/`$SOPACK_WBKEYGEN` at it). Then generate a 32-byte
   session key `sk` and **compute the wrap in pure Python**:
   `wrapped = wrap_iv + cipher.aes128_ctr(sk, kek, wrap_iv)`. That is byte-identical to what
@@ -119,21 +125,36 @@ count** rather than size, is in `docs/architecture.md` §11b. Pieces:
   and `wb_keygen`'s CLI is unchanged. Finally ChaCha20-encrypt `.text` with `sk`, whiten the
   passphrase off the blob, and DISCARD both keys. Only the sealed blob + wrapped key + nonce +
   whitened pass ship.
-- **Helper skeleton** (`stub/sopk_rt.c` + `stub/sopk_rt.h`): the USER builds this per ABI with
-  the NDK + O-MVLL, statically linking **only** `libwbcrypto.a` (it bundles libsodium since
-  2.0.0; `libwbvm.a`/`libwbprovision.a` carry the provisioning surface and must NOT ship). Use
-  **`clang++` with `-static-libstdc++`**, not `clang`: the archive is C++, so the C driver leaves
-  the whole C++ runtime unresolved, and a *shared* libc++ would add a `DT_NEEDED` the packer
-  rejects. `sopk_rt.c` itself is C, so pass it as `-x c sopk_rt.c -x none`. Add
-  `-Wl,--exclude-libs,ALL` so the `wbc_*` symbols are not re-exported — `-fvisibility=hidden`
-  and `-DWBC_STATIC` cannot do that, since `WBC_API` visibility is baked into the archive's
-  objects — and `-Wl,--no-undefined` (see the invariant below). The exact line lives in
-  `stub/sopk_rt.c`'s header comment and `docs/wbaes-verification.md` Phase 4. Drop the result at
-  `sopack/stubs/sopk_rt_<abi>.so`. Its ctor finds its appended
-  metadata region by **magic-scan** of its own program headers (no patched symbol),
-  `dl_iterate_phdr`s the target by soname basename, de-whitens the pass, `wbc_open`s,
-  `wbc_unwrap_key`s, closes the ctx (freeing the ~400 KB VM image), then ChaCha20-decrypts and
-  `wbc_wipe`s the session key. `SOPK_MAX_PASS` bounds the pass.
+- **Two hand-built skeletons per ABI** (region v3). The USER builds both with the NDK + O-MVLL;
+  `./scripts/build_wbaes.sh` does it in one step, and Phase 4 has the manual recipe.
+  - `stub/sopk_wb.c` → **`libsopk_wb.so`, ONE shared white-box provider per ABI.** It links
+    **only** `libwbcrypto.a` (it bundles libsodium since 2.0.0; `libwbvm.a`/`libwbprovision.a`
+    carry the provisioning surface and must NOT ship), carries the single sealed blob + whitened
+    passphrase, and exports exactly one symbol, `sopk_wb_k`. Use **`clang++` with
+    `-static-libstdc++`**, not `clang`: the archive is C++, so the C driver leaves the whole C++
+    runtime unresolved, and a *shared* libc++ would add a `DT_NEEDED` the packer rejects.
+    `sopk_wb.c` itself is C, so pass it as `-x c sopk_wb.c -x none`. Add
+    `-Wl,--exclude-libs,ALL` so the `wbc_*` symbols are not re-exported — `-fvisibility=hidden`
+    and `-DWBC_STATIC` cannot do that, since `WBC_API` visibility is baked into the archive's
+    objects — and `-Wl,--no-undefined`. **`-Wl,-soname,libsopk_wb.so` is load-bearing**: each thin
+    helper's `DT_NEEDED` is whatever the linker recorded here, so without it lld records the file
+    *path* and the APK cannot load. The packer asserts it and **never renames this artifact**.
+    It has **no constructor** — all work is lazy inside `sopk_wb_k`, so there is no ordering
+    question about it — and it is **stateless** (open → unwrap → close per call, no cached
+    `wbc_ctx`, which also sidesteps `wbc_ctx` not being thread-safe).
+  - `stub/sopk_rt.c` → **`sopk_rt_<abi>.so`, the THIN per-target helper.** Links **no** white-box
+    at all, so it is a few KB rather than ~465 KB; it must be linked *against* the provider so
+    `--no-undefined` holds and the `DT_NEEDED` string comes from the provider's `DT_SONAME`. The
+    packer clones it per target, renames its `DT_SONAME`, and appends that target's region.
+    Its ctor finds its own region by **magic-scan** of its own program headers (no patched
+    symbol), `dl_iterate_phdr`s the target by soname basename, calls `sopk_wb_k` for its session
+    key, then ChaCha20-decrypts and wipes the key.
+- **Why the trigger stays 1:1 with the target.** bionic runs a shared object's constructors
+  **exactly once**, so a single helper shared by N targets would only decrypt the libraries mapped
+  when the *first* target loads — a `libapp.so` that Flutter `dlopen`s later would never be
+  decrypted. Keeping one thin helper per target is the only thing that makes "is my target mapped
+  when my ctor runs?" answerable. Only the *provider* is shared, and it is not a trigger.
+
 - **The helper ctor FAILS CLOSED** (unlike the stub). Every failure path calls `sopk_fail(code)`
   → records the reason in `volatile sopk_fail_code` → `abort()`. Do not "restore" fail-open here:
   the helper has no fallback (decryption is its only job), so returning leaves the target running
@@ -160,8 +181,10 @@ count** rather than size, is in `docs/architecture.md` §11b. Pieces:
   Instead append a 16 KB-aligned copy of `.dynstr`+soname via `add(seg)`, repoint
   `DT_STRTAB`/`DT_STRSZ`, and overwrite the `.dynamic` `DT_NULL` terminator in place with
   `DT_NEEDED` (`_add_needed_inplace`; refuses loudly if `.dynamic` has no terminator slack).
-  Then emit the per-target helper (`libsopk_rt_<target>.so`) carrying the region. No stub /
-  decinfo / DT_INIT surgery — so this mode also handles `INIT_ARRAY`-only libs for free.
+  Then emit the thin per-target helper (`libsopk_rt_<target>.so`) carrying that target's region,
+  plus **one** `libsopk_wb.so` per ABI carrying the shared blob (emitted in `apk.py` after the
+  entry loop, since it cannot be produced per target). No stub / decinfo / DT_INIT surgery — so
+  this mode also handles `INIT_ARRAY`-only libs for free.
 
 Only `arm64-v8a` is protected in practice, by deliberate scope choice. The other ABIs ship
 cleartext `.text`, so an analyst after the *algorithm* reads the x86_64 build and never touches the
@@ -176,11 +199,32 @@ is an ordinary key in ordinary memory between the unwrap and the `wbc_wipe`, so 
 yields it without attacking the white-box at all. The *long-term* key keeps its full
 protection. Do not oversell it.
 
-**Known deferred cost:** one helper per library means one `wbc_open` per library, each ~230 ms
-of Argon2id plus a transient **64 MiB** allocation (`crypto_pwhash_MEMLIMIT_INTERACTIVE`),
-serialised in the loader at app startup. N libraries pay both N times. The fix is one KEK +
-one blob + one helper carrying N regions; deliberately deferred until device numbers exist
-(see docs/wbaes-verification.md Phase 6, which captures startup time and peak RSS).
+**The KDF tier — why startup used to be the problem, and is not now.** One helper per library
+still means one `wbc_open` per library, serialised in the loader at startup. That used to cost
+~230 ms on a host / **266 ms on device** plus a transient **64 MiB** allocation, because the
+seal's KDF was a compile-time Argon2id constant. Since wbcrypto 3.0.0 the KDF cost is a per-blob
+tier chosen at seal time, and sopack pins **`light`** (`--kdf light` → `WBC_KDF_NONE`,
+HKDF-SHA256): measured 1.1 ms, with the 64 MiB gone. Host round-trip for a 5.5 MB `.text` is now
+**13.7 ms total** (open 1.1 + unwrap 0.83 + ChaCha20 11.8), so the bulk cipher dominates again.
+
+This is **security-neutral here**, not a weakening: the whitened passphrase ships in the helper
+beside the blob and its whitening key comes from that blob's own first 1024 bytes, so an attacker
+with the APK has the passphrase and guesses nothing — Argon2id only ever slowed *guessing*. It is
+128 bits of machine entropy, which is exactly what `WBC_KDF_NONE` presumes. The tier is inside the
+seal's AEAD associated data, so a shipped blob cannot be tier-downgraded. `provision.py`'s
+`assert_light_blob` refuses to pack anything but a v≥4 tier-0 blob, and the helper ctor reads the
+tier back via `wbc_blob_kdf_tier` (which is also the 3.0.0 version tripwire — a pre-3.0.0 header
+fails to compile, a pre-3.0.0 archive fails to link).
+
+**What is still deferred:** `wbc_open` is not free — `Unseal` AEAD-decrypts the ~455 KB blob and
+builds the VM image once per library — and each per-target helper ships ~465 KB of white-box code
+plus its own ~455 KB blob, ≈920 KB duplicated N times. So the one-KEK/one-blob collapse is still
+open, but the motivation is now **APK size**, not startup. Note the shape named in earlier drafts
+of this file — "one helper carrying N regions" — **cannot work**: bionic runs a shared object's
+constructors once, so a helper shared by N targets only decrypts the libraries mapped when the
+first target loads, and a late-`dlopen`ed one (the Flutter `libapp.so` case) never gets decrypted.
+The workable shape is N thin per-target helpers plus one shared white-box provider `.so`. See
+`docs/architecture.md` §11b and `docs/potential-improvements.md`.
 
 ### Invariants that will break things silently if violated
 
@@ -189,9 +233,12 @@ one blob + one helper carrying N regions; deliberately deferred until device num
   - `sopack/cipher.py` ⇄ `stub/stub_cipher.h` (ChaCha20/XOR **and** the whitening
     `sopk_whiten_key` + `SOPK_WHITEN_NONCE` + `WHITEN_SPAN`).
   - `sopack/metadata.py` ⇄ `stub/decinfo.h` (the 128-byte `sopk_decinfo` struct).
-  - `sopack/rt_meta.py` ⇄ `stub/sopk_rt.h` (the **96-byte** v2 `sopk_rt_region` header + tail;
-    `--cipher wbaes` only). `tests/test_rt_meta.py` pins the layout, the build marker, and
-    that a foreign region version is rejected. The wbaes passphrase whitening
+  - `sopack/rt_meta.py` ⇄ `stub/sopk_rt.h` (`--cipher wbaes` only): the **96-byte** v3
+    `sopk_rt_region` (`'SRTT'`, in each thin helper) **and** the **24-byte** `sopk_wb_region`
+    (`'SRTW'`, in the shared provider). `tests/test_rt_meta.py` pins both layouts, both build
+    markers, and that a foreign region version is rejected. **The magic is the drift gate, not
+    the size**: v3 kept the target header at 96 bytes and `_FMT` textually identical
+    (`pass_len`/`blob_len` became `flags`/`reserved`), so a size assertion passes either way. The wbaes passphrase whitening
     (`cipher.whiten_pass`) reuses the same `whiten_key`/`WHITEN_NONCE`, keyed off the sealed
     blob's first `WHITEN_SPAN` bytes. Bump `REGION_VERSION` **and** the build marker together
     when this layout changes — the on-device version gate fails *open*, so the marker is the

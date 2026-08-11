@@ -25,9 +25,10 @@ is an external repo and line numbers drift.
 
 | piece | pinned at | consequence of a mismatch |
 |---|---|---|
-| WBC SDK | **>= 2.0.0** | 1.x has no `wbc_wrap_key`/`wbc_unwrap_key`/`wbc_wipe` at all |
-| sealed blob format | **v3** (`Unseal` rejects older) | every pre-2.0.0 blob and prebuilt archive is dead |
-| sopack region | **v2** (`rt_meta.REGION_VERSION`) | the on-device gate is exact, and a mismatch **aborts** |
+| WBC SDK | **>= 3.0.0** | pre-3.0.0 has no `wbc_blob_kdf_tier` and no KDF tier at all, so `stub/sopk_rt.c` will not **compile** against its header |
+| sealed blob format | **v4** (`trusted_storage.cpp` `kVersion`; `Unseal` rejects others) | v4 *inserted* `kdf_tier` after `version`, shifting every later field — a v3 blob is unopenable, not merely old |
+| KDF tier | **`WBC_KDF_NONE`** ("light") | pinned at seal time by `provision.py:_seal`'s `--kdf light`, and re-asserted from the blob header by `assert_light_blob`. `wb_keygen` DEFAULTS to `heavy`, so a dropped flag is *silently slow*, not an error |
+| sopack region | **v2** (`rt_meta.REGION_VERSION`) | unchanged at 3.0.0 — the tier work moved no region field, which is why the **build marker** was bumped instead. The on-device gate is exact, and a mismatch **aborts** |
 
 1.x is not merely unsupported, it is *silently* unsupported: a `-shared` link permits unresolved
 symbols, so a skeleton built against a 1.x `libwbcrypto.a` links cleanly and leaves the missing
@@ -37,10 +38,10 @@ symbols, so a skeleton built against a 1.x `libwbcrypto.a` links cleanly and lea
 
 | from WBC | used by | notes |
 |---|---|---|
-| `wb_keygen` CLI: `--key <hex> --pass <str> --seed <n> --out <path>` | `provision.py:_seal` | must be a **host** build (WBC `scripts/gen_blob.sh`). The delivered `assets/wbc/wb_keygen` is an *Android* binary, ships out of band and is not in this repo — `provision.py:_host_incompatible_reason` recognises that exact mistake by file magic |
+| `wb_keygen` CLI: `--key <hex> --pass <str> --seed <n> --kdf light --out <path>` | `provision.py:_seal` | must be a **host** build (WBC `scripts/gen_blob.sh`). `assets/wbc/` holds only `libwbcrypto.a` + `wbcrypto.h`; any `wb_keygen` delivered out of band is an *Android* binary and is not in this repo — `provision.py:_host_incompatible_reason` recognises that exact mistake by file magic |
 | `libwbcrypto.a` | the helper skeleton link | the **Android** archive, from WBC `scripts/build_android.sh` (distinct from `gen_blob.sh` above, which builds the host keygen). **Bundles libsodium** since 2.0.0, so no separate Android libsodium |
 | `wbcrypto.h` | `stub/sopk_rt.c` | |
-| `wbc_open`, `wbc_unwrap_key`, `wbc_close`, `wbc_wipe` | `stub/sopk_rt.c:sopk_rt_ctor` | **four calls — that is the entire device-side surface** |
+| `wbc_blob_kdf_tier`, `wbc_open`, `wbc_unwrap_key`, `wbc_close`, `wbc_wipe` | `stub/sopk_rt.c:sopk_rt_ctor` | **five calls — that is the entire device-side surface.** `wbc_blob_kdf_tier` is a header read (no passphrase, no cost) and doubles as the 3.0.0 version tripwire |
 
 ## 3. What sopack refuses
 
@@ -169,12 +170,24 @@ export hygiene is verified by hand in Phase 4 step 2. The exact command line liv
 
 ## 9. Cost
 
-`wbc_open`'s Argon2id dominates: ~230 ms plus a transient **64 MiB** allocation
-(`crypto_pwhash_MEMLIMIT_INTERACTIVE`), and it scales with **library count**, not `.text` size —
-the white-box term is a fixed two blocks (~1.4 ms) and only the ChaCha20 term grows. N libraries
-means N helpers, N blobs and N `wbc_open`s serialised in the loader at startup. The fix — one KEK,
-one blob, one helper carrying N regions — is deliberately deferred until device numbers exist
-(→ [Phase 6](./wbaes-verification.md), and §11b for the full breakdown).
+Since sopack seals at the **`light`** KDF tier, no term dominates. Host round-trip for a 5.5 MiB
+`.text` (Phase 3): `wbc_open` **1.1 ms**, `wbc_unwrap_key` 0.83 ms, ChaCha20 11.8 ms — **13.7 ms**
+total, and only the ChaCha20 line grows with `.text`.
+
+Before 3.0.0 the seal's KDF was a fixed Argon2id 64 MiB / 2, so `wbc_open` was ~230 ms on a host
+and **266 ms on device** (91% of load cost) plus a transient **64 MiB** allocation, paid per
+library. 3.0.0 made the tier a per-blob header field and sopack pins `light`; see §1 for the
+contract and §11b of [`architecture.md`](./architecture.md) for why that is security-neutral here.
+
+`wbc_open` is still **not free** — `Unseal` AEAD-decrypts the ~455 KB blob and builds the VM image
+once per library — so per-library cost still multiplies, at a much smaller constant. What remains
+is mostly an **APK-size** argument: each per-target helper ships ~465 KB of white-box code plus its
+own ~455 KB blob (≈920 KB), duplicated N times. The collapse to one KEK / one blob is still open,
+but note the shape named in earlier drafts — "one helper carrying N regions" — **cannot work**:
+bionic runs a shared object's constructors once, so it would only decrypt the libraries mapped when
+the first target loads. The workable shape is N thin per-target helpers plus one shared white-box
+provider `.so` (→ [`potential-improvements.md`](./potential-improvements.md), and
+[Phase 6](./wbaes-verification.md) for the numbers that decide it).
 
 ## 10. Security ceiling
 
@@ -187,11 +200,21 @@ unwrap and the `wbc_wipe`, so a process dump yields it without attacking the whi
 
 ## 11. Upgrading to a newer SDK
 
-1. Diff `wbcrypto.h` for the four consumed symbols (§2) and for the blob version.
-2. Re-run `python -m pytest tests/test_cipher.py` — the `aes128_ctr` KAT is the wrap tripwire.
+1. Diff `wbcrypto.h` for the five consumed symbols (§2), the blob version, **and the
+   `wbc_kdf_tier` enum numbering** — `provision.py` hardcodes tier 0 == light, and a
+   `_Static_assert` in `sopk_rt.c` turns a renumbering into a build error rather than a packer
+   that refuses every blob.
+2. Re-run `python -m pytest tests/test_cipher.py` — the `aes128_ctr` KAT is the wrap tripwire —
+   and `tests/test_provision.py`, which pins the blob-header offsets.
 3. Rebuild the per-ABI skeleton against the new `libwbcrypto.a` **with `-Wl,--no-undefined`**.
 4. If the region layout changes, bump `REGION_VERSION` **and** the build marker on both sides.
-5. Re-run [`wbaes-verification.md`](./wbaes-verification.md) Phases 1–4 (Phase 3 exercises every
+   Bump the build marker **whenever the ctor's WBC call sequence changes, even if
+   `REGION_VERSION` does not** — that is exactly what the 3.0.0 migration needed.
+5. Re-run Phase 1 **with `--force`**. A cached `build-host/wb_keygen` (and a cached
+   `build-android/libwbcrypto.a`) survives an SDK upgrade otherwise; both are documented traps
+   with their own gates now, but `--force` avoids the question.
+6. Confirm `blob kdf tier = 0` appears in Phase 3's output.
+7. Re-run [`wbaes-verification.md`](./wbaes-verification.md) Phases 1–4 (Phase 3 exercises every
    contract above through the real library, no device needed), then Phase 6 on hardware.
 
 ## 12. One request to send upstream: scrub build paths from `libwbcrypto.a`

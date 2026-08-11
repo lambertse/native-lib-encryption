@@ -31,10 +31,11 @@ import lief
 from .cipher import CIPHER_IDS, CIPHER_WBAES, WHITEN_SPAN, apply_cipher, gen_key_nonce, whiten
 from .metadata import (DecInfo, FLAG_CHAIN_INIT, FLAG_LOG, FLAG_NEED_ICACHE,
                        MAGIC, SIZE as DECINFO_SIZE, VERSION)
-from .provision import provision_text
-from .rt_meta import (HELPER_BUILD_MARKER, REGION_MAGIC, REGION_VERSION, WRAPPED_KEY_BYTES,
-                      Region)
-from .stubs import Stub, helper_skeleton_path, load_stub
+from .provision import PackKey, provision_pack, provision_text
+from .rt_meta import (HELPER_BUILD_MARKER, PROVIDER_ABI, PROVIDER_BUILD_MARKER,
+                      PROVIDER_ENTRY, PROVIDER_SONAME, REGION_MAGIC, REGION_VERSION,
+                      WB_REGION_MAGIC, WRAPPED_KEY_BYTES, TargetRegion, WbRegion)
+from .stubs import Stub, helper_skeleton_path, load_stub, provider_skeleton_path
 
 # Bionic-provided libraries an injected helper may depend on WITHOUT bundling anything
 # (present on every Android device). Anything else in the helper's DT_NEEDED means the
@@ -105,9 +106,13 @@ class InjectResult:
     entry_rva: int
     strategy: str          # how load-time execution was hijacked
     cipher: str
-    # wbaes only: the per-target helper .so that must be ADDED to the APK as a sibling.
+    # wbaes only: the per-target THIN helper .so that must be ADDED to the APK as a sibling.
     helper_path: str | None = None
     helper_soname: str | None = None
+    # wbaes only, and only when inject_so was called WITHOUT a pack_key: the shared provider
+    # emitted alongside. apk.py passes a pack_key and emits one provider per ABI itself, so it
+    # gets None here — otherwise every target would emit a provider carrying a different blob.
+    provider_path: str | None = None
 
 
 def _find_text(binary) -> "lief.ELF.Section":
@@ -512,122 +517,186 @@ def _helper_soname_for(target_soname: str) -> str:
     return f"libsopk_rt_{safe}.so"
 
 
-def _emit_helper(abi: str, helper_soname: str, region_bytes: bytes,
-                 out_path: str, allow_helper_log: bool = False) -> None:
-    """Clone the ABI helper skeleton: strip it, rename its DT_SONAME and append the metadata
-    region as a fresh read-only 16 KB-aligned PT_LOAD (its first bytes are the region, which the
-    helper's constructor finds by magic — see stub/sopk_rt.c).
+# The two hand-built wbaes artifacts. Guards differ per kind, so every check below says which
+# one it applies to rather than assuming there is only a helper.
+_KIND_THIN = "thin helper"
+_KIND_PROVIDER = "white-box provider"
 
-    Every guard here exists because the skeleton is hand-built OUTSIDE this repo, so the host is
-    the only place a bad one can be caught. `scripts/build_wbaes.sh --release` and Phase 4's
-    checks already describe a correct build; they did not prevent a tracing, unstripped helper
-    reaching a shipped APK, because nothing refused one."""
-    skeleton = helper_skeleton_path(abi)
 
-    # Build-marker guard. The skeleton is built by hand outside this repo, so a stale one is
-    # easy to leave behind — and a stale one is SILENT: its ctor requires an exact region
-    # version match and finds none. Catch it here instead. Safe across the strip below: the
-    # marker lives in .rodata (SHF_ALLOC), so it is still present in the emitted helper.
+def _check_wbaes_skeleton(skeleton: str, kind: str, allow_helper_log: bool) -> None:
+    """Every guard that can be applied to a hand-built skeleton BEFORE it is copied.
+
+    These exist because both skeletons are built OUTSIDE this repo, so the host is the only place
+    a bad one can be caught. `scripts/build_wbaes.sh --release` and Phase 4's checks already
+    describe a correct build; they did not prevent a tracing, unstripped helper reaching a shipped
+    APK, because nothing refused one."""
+    name = os.path.basename(skeleton)
+    is_thin = kind == _KIND_THIN
+    marker = HELPER_BUILD_MARKER if is_thin else PROVIDER_BUILD_MARKER
+    source = "stub/sopk_rt.c" if is_thin else "stub/sopk_wb.c"
+    phase = "Phase 4 step 4b" if is_thin else "Phase 4 step 4a"
+
+    # Build-marker guard. A stale skeleton is SILENT: its ctor requires an exact region version
+    # match and finds none. Catch it here instead. Safe across the strip below: the marker lives
+    # in .rodata (SHF_ALLOC), so it survives into the emitted artifact.
+    #
+    # The two kinds carry DIFFERENT markers on purpose. With one shared value, "freshly built
+    # thin helper + stale provider" would pass both guards — and that mismatched pair is the real
+    # failure mode now that two artifacts must be rebuilt together. So name the file to rebuild.
     with open(skeleton, "rb") as f:
-        if HELPER_BUILD_MARKER not in f.read():
+        if marker not in f.read():
             raise InjectError(
-                f"helper skeleton {os.path.basename(str(skeleton))} lacks the v{REGION_VERSION} build marker "
-                f"({HELPER_BUILD_MARKER.hex()}) — it was built from an older stub/sopk_rt.c, "
-                "so its region layout or crypto flow no longer matches this packer. "
-                "Rebuild it from the current stub/sopk_rt.c against whitebox-cryptography "
-                ">= 2.0.0 (see docs/wbaes-verification.md Phase 4, or run "
-                "./scripts/build_wbaes.sh --release).")
+                f"{kind} skeleton {name} lacks the v{REGION_VERSION} build marker "
+                f"({marker.hex()}) — it was built from an older {source}, so its region layout "
+                f"or flow no longer matches this packer. Rebuild THIS artifact from the current "
+                f"{source} against whitebox-cryptography >= 3.0.0 (docs/wbaes-verification.md "
+                f"{phase}, or run ./scripts/build_wbaes.sh --release, which builds both).")
 
-    binary = lief.parse(str(skeleton))
+    binary = lief.parse(skeleton)
     if binary is None:
-        raise InjectError(f"LIEF failed to parse helper skeleton {skeleton}")
+        raise InjectError(f"LIEF failed to parse {kind} skeleton {skeleton}")
 
-    # dependency-closure guard: a correctly static-linked helper needs only bionic libs.
-    stray = [n for n in _needed_names(binary) if n not in _BIONIC_ALLOWED]
+    # Dependency-closure guard. `_BIONIC_ALLOWED` means "provided by every Android device" and
+    # must keep meaning exactly that, so the provider soname is added as ONE literal extra name
+    # for the thin kind only — never a pattern or prefix. Everything this guard was built to
+    # catch (a leaked libc++_shared.so from a non-static white-box, a dynamic libwbcrypto) is
+    # still caught.
+    allowed = _BIONIC_ALLOWED | ({PROVIDER_SONAME} if is_thin else set())
+    needed = _needed_names(binary)
+    stray = [n for n in needed if n not in allowed]
     if stray:
+        extra = (f" (besides bionic, a {kind} may depend only on {PROVIDER_SONAME})" if is_thin
+                 else f" (a {kind} may depend only on bionic libs)")
         raise InjectError(
-            f"helper skeleton {os.path.basename(str(skeleton))} has non-bionic DT_NEEDED {stray} — the "
-            "white-box was not statically linked in (libwbcrypto/libc++/libsodium must be "
-            "static). Rebuild the skeleton.")
-
-    # A `-shared` link permits unresolved symbols, so a skeleton built against a 1.x
-    # libwbcrypto.a (no wbc_wrap_key/wbc_unwrap_key/wbc_wipe) links CLEANLY and leaves them as
-    # UND imports. bionic then fails to load the helper, which makes dlopen of the TARGET fail,
-    # which surfaces as a crash in whatever was loading the target — nowhere near the cause.
-    # Catch it here; also tell the user the link flag that would have caught it at build time.
-    unresolved = sorted({n for n in _undefined_dynsyms(str(skeleton))
-                         if n.startswith(("wbc_", "sodium_"))})
-    if unresolved:
+            f"{kind} skeleton {name} has unexpected DT_NEEDED {stray}{extra} — the white-box "
+            "was not statically linked in (libwbcrypto/libc++/libsodium must be static). "
+            "Rebuild the skeleton.")
+    # POSITIVE containment, and this is new: a thin helper that lost its provider dependency
+    # would otherwise fail on device as "cannot locate symbol sopk_wb_k", taking the target's
+    # dlopen down with it, nowhere near the cause.
+    if is_thin and PROVIDER_SONAME not in needed:
         raise InjectError(
-            f"helper skeleton {os.path.basename(str(skeleton))} imports {unresolved} instead of defining them — "
-            "it was linked against a 1.x libwbcrypto.a (or none). The helper would fail to "
-            "load, taking the target's dlopen down with it. Rebuild assets/wbc/ from "
-            "whitebox-cryptography >= 2.0.0 (scripts/build_android.sh) and link with "
-            "-Wl,--no-undefined so this fails at build time instead.")
+            f"{kind} skeleton {name} does not depend on {PROVIDER_SONAME} — since the v3 split "
+            f"it must call into the shared provider for its session key. It was probably linked "
+            f"without the provider .so as an input; see docs/wbaes-verification.md {phase}.")
+    if not is_thin and any(n.startswith("libsopk_rt") for n in needed):
+        raise InjectError(
+            f"{kind} skeleton {name} depends on a thin helper {needed} — the dependency runs the "
+            "other way, and a cycle would deadlock bionic's loader.")
 
-    name = os.path.basename(str(skeleton))
+    # A `-shared` link permits unresolved symbols, so a skeleton built against a pre-3.0.0
+    # libwbcrypto.a (no wbc_blob_kdf_tier) links CLEANLY and leaves it as a UND import. bionic
+    # then fails to load it, which makes dlopen of the TARGET fail, which surfaces as a crash in
+    # whatever was loading the target — nowhere near the cause.
+    undefined = _undefined_dynsyms(skeleton)
+    wb_unresolved = sorted({n for n in undefined if n.startswith(("wbc_", "sodium_"))})
+    if wb_unresolved:
+        if is_thin:
+            # Since v3 the thin helper links no white-box at all, so ANY reference is wrong.
+            raise InjectError(
+                f"{kind} skeleton {name} references white-box symbols {wb_unresolved} — since "
+                f"the v3 split it must not touch the white-box; only {PROVIDER_SONAME} does. It "
+                f"was probably built from stub/sopk_wb.c, or linked libwbcrypto.a by mistake.")
+        raise InjectError(
+            f"{kind} skeleton {name} imports {wb_unresolved} instead of defining them — it was "
+            "linked against a pre-3.0.0 libwbcrypto.a (or none). Note wbc_blob_kdf_tier in "
+            "particular is the 3.0.0-only symbol. It would fail to load, taking every thin "
+            "helper and their targets with it. Rebuild assets/wbc/ from whitebox-cryptography "
+            ">= 3.0.0 (scripts/build_android.sh) and link with -Wl,--no-undefined so this fails "
+            "at build time instead.")
+    # The thin helper must import the provider entry point — the other half of the pairing check.
+    if is_thin and PROVIDER_ENTRY not in undefined:
+        raise InjectError(
+            f"{kind} skeleton {name} does not import {PROVIDER_ENTRY} — it cannot obtain a "
+            f"session key, so its ctor would abort on every load. Rebuild it from {source}.")
 
-    # Tracing guard. A -DSOPK_RT_LOG helper announces the target soname, .text RVA and size,
-    # and a final "OK" to logcat under tag sopk_rt — which hands anyone with adb the exact
-    # address and length to dump, plus confirmation the dump is valid. Refuse by default.
-    logging_built = ("liblog.so" in _needed_names(binary)
-                     or "__android_log_print" in _undefined_dynsyms(str(skeleton)))
+    # Tracing guard. A -DSOPK_RT_LOG build announces the target soname, .text RVA and size, and a
+    # final "OK" to logcat — which hands anyone with adb the exact address and length to dump,
+    # plus confirmation the dump is valid. Refuse by default.
+    logging_built = ("liblog.so" in needed or "__android_log_print" in undefined)
     if logging_built and not allow_helper_log:
         raise InjectError(
-            f"helper skeleton {name} was built with -DSOPK_RT_LOG (imports "
-            "__android_log_print / needs liblog.so). A shipped helper then logs the target "
-            "soname, .text RVA and size, and a final \"OK\" to logcat under tag sopk_rt — an "
-            "attacker with adb gets the exact address and length to dump.\n"
+            f"{kind} skeleton {name} was built with -DSOPK_RT_LOG (imports __android_log_print "
+            "/ needs liblog.so). Shipped, it logs the target soname, .text RVA and size, and a "
+            "final \"OK\" to logcat — an attacker with adb gets the exact address and length to "
+            "dump.\n"
             "  To fix:  ./scripts/build_wbaes.sh --release\n"
             "  To keep: pass --allow-helper-log (for on-device Phase 6 verification only; "
             "the result is NOT shippable)")
     if logging_built:
-        # Every pack, not once per run: the whole reason this flag needs a loud footprint is
-        # that "remember to drop -DSOPK_RT_LOG" is exactly the convention that already failed.
-        _warn(f"{helper_soname} is a TRACING build (--allow-helper-log): it logs the target "
-              "name, .text address and size to logcat. DO NOT SHIP THIS APK.")
+        # Every pack, not once per run: the whole reason this flag needs a loud footprint is that
+        # "remember to drop -DSOPK_RT_LOG" is exactly the convention that already failed. Name
+        # the artifact, since either of the two can be the tracing one.
+        _warn(f"{name} is a TRACING build (--allow-helper-log): it logs the target name, .text "
+              "address and size to logcat. DO NOT SHIP THIS APK.")
 
-    # The helper is supposed to export nothing (-Wl,--exclude-libs,ALL + -fvisibility=hidden).
-    # Re-exported white-box symbols publish the SDK's whole API surface, and Phase 4 checks for
-    # them only in a script the user can skip, so check here too. Narrow to the white-box names:
-    # a blanket "exports nothing" rule would reject the test fixtures, which double as targets.
-    exported = _exported_dynsyms(str(skeleton))
+    # Export hygiene. Re-exported white-box symbols publish the SDK's whole API surface, and
+    # Phase 4 checks for them only in a script the user can skip.
+    exported = _exported_dynsyms(skeleton)
     leaked = sorted({n for n in exported
-                     if n.startswith(("wbc_", "sodium_")) or "wbaes" in n or n.startswith("_ZN2vm")})
+                     if n.startswith(("wbc_", "sodium_")) or "wbaes" in n
+                     or n.startswith("_ZN2vm")})
     if leaked:
         raise InjectError(
-            f"helper skeleton {name} re-exports white-box symbols {leaked[:8]}"
+            f"{kind} skeleton {name} re-exports white-box symbols {leaked[:8]}"
             f"{' …' if len(leaked) > 8 else ''} — WBC_API visibility is baked into "
             "libwbcrypto.a's objects, so -fvisibility=hidden cannot hide them. Relink with "
-            "-Wl,--exclude-libs,ALL (or a `{ local: *; };` version script).")
-    elif exported:
-        _warn(f"{helper_soname} exports {len(exported)} symbol(s) (expected none): "
-              f"{exported[:5]}. Relink with -Wl,--exclude-libs,ALL.")
+            "-Wl,--exclude-libs,ALL (or a version script).")
+    if is_thin:
+        if exported:
+            _warn(f"{name} exports {len(exported)} symbol(s) (expected none): "
+                  f"{exported[:5]}. Relink with -Wl,--exclude-libs,ALL.")
+    else:
+        # The provider is the first sopack artifact that legitimately EXPORTS something, so the
+        # expectation inverts: exactly one name, no more and no fewer. Zero means
+        # --exclude-libs,ALL or a `{ local: *; };` version script swallowed the entry, which the
+        # thin link would then fail on — loudly, but far from here.
+        if PROVIDER_ENTRY not in exported:
+            raise InjectError(
+                f"{kind} skeleton {name} does not export {PROVIDER_ENTRY} (exports "
+                f"{exported[:5] or 'nothing'}) — a `{{ local: *; }};` version script or "
+                f"-fvisibility=hidden without an explicit "
+                f"__attribute__((visibility(\"default\"))) swallowed it. No thin helper could "
+                f"then link or load against this provider.")
+        extra_exports = [n for n in exported if n != PROVIDER_ENTRY]
+        if extra_exports:
+            _warn(f"{name} exports {len(extra_exports)} symbol(s) beyond {PROVIDER_ENTRY}: "
+                  f"{extra_exports[:5]}. Only the one entry point should be visible.")
+
+
+def _emit_wbaes_artifact(skeleton: str, region_bytes: bytes, out_path: str,
+                         new_soname: str | None, kind: str) -> None:
+    """Strip a checked skeleton, optionally rename its DT_SONAME, and append `region_bytes` as a
+    fresh read-only 16 KB-aligned PT_LOAD whose first bytes are the region — which the artifact's
+    own code finds by magic (stub/sopk_rt.c, stub/sopk_wb.c).
+
+    `new_soname=None` means DO NOT RENAME, which is mandatory for the provider: every thin
+    helper's DT_NEEDED string is the provider's DT_SONAME as recorded at link time, so renaming
+    it here would silently break all of them."""
+    name = os.path.basename(skeleton)
 
     # Snapshot before any write. LIEF rebuilds .dynstr with the strings SORTED on write(),
-    # rewriting every st_name to match; on the target that desync shipped once and cost a
-    # Flutter app its Dart snapshot pointers (§11f). Here the risk is not dlsym — the helper
-    # exports nothing — but its UNDEFINED imports, which is exactly what the "must DEFINE
-    # every wbc_*, never import one" guard above reads. If a write perturbs the
-    # .dynsym/.dynstr correspondence, that guard silently stops meaning anything.
-    dynsyms_before = _dynsym_names(str(skeleton))
-    del binary          # everything below works on the output copy, not the skeleton
+    # rewriting every st_name to match; on the target that desync shipped once and cost a Flutter
+    # app its Dart snapshot pointers (§11f). Here it would silently break the undefined/exported
+    # symbol guards above — and, for the provider, the exported name a thin helper resolves by
+    # string.
+    dynsyms_before = _dynsym_names(skeleton)
 
     # Strip FIRST, on a copy, and only then let LIEF append the region. The order matters twice:
     #   * LIEF re-creates `.symtab`/`.strtab` from its own symbol model on write(), so stripping
     #     after a LIEF write does not remove them. Stripping first leaves LIEF nothing to
     #     regenerate from.
     #   * `_strip_nonalloc` truncates at the last byte any PT_LOAD still needs. LIEF picks the
-    #     appended region segment's file offset itself, and if it landed above the debug
-    #     sections that truncation point would jump past them — content still erased, but the
-    #     file would stay multi-megabyte. Stripping before the segment exists removes the
-    #     dependency on where LIEF chooses to put it.
-    shutil.copyfile(str(skeleton), out_path)
+    #     appended region segment's file offset itself, and if it landed above the debug sections
+    #     that truncation point would jump past them — content still erased, but the file would
+    #     stay multi-megabyte. Stripping before the segment exists removes the dependency on
+    #     where LIEF chooses to put it.
+    shutil.copyfile(skeleton, out_path)
     removed = _strip_nonalloc(out_path)
     if removed:
         total = sum(sz for _, sz in removed)
         shown = ", ".join(n for n, _ in removed[:6])
-        _warn(f"helper skeleton {name} shipped {len(removed)} non-ALLOC sections "
+        _warn(f"{kind} skeleton {name} shipped {len(removed)} non-ALLOC sections "
               f"({shown}{' …' if len(removed) > 6 else ''}; {total:,} bytes) — stripped them. "
               "Build with ./scripts/build_wbaes.sh --release, which passes -g0 and "
               "llvm-strip --strip-all, so the packer does not have to.")
@@ -638,7 +707,8 @@ def _emit_helper(abi: str, helper_soname: str, region_bytes: bytes,
             f"LIEF cannot parse {name} after stripping it — the section surgery produced a "
             "malformed ELF, which is a bug in _strip_nonalloc, not in the skeleton")
 
-    _set_soname(binary, helper_soname)
+    if new_soname is not None:
+        _set_soname(binary, new_soname)
 
     seg = lief.ELF.Segment()
     seg.type = _seg_type_load()
@@ -654,9 +724,10 @@ def _emit_helper(abi: str, helper_soname: str, region_bytes: bytes,
         detail = f"e.g. {bad[0]!r} -> {bad[1]!r}" if bad else \
                  f"count {len(dynsyms_before)} -> {len(dynsyms_after)}"
         raise InjectError(
-            f"emitting helper {helper_soname} changed its dynamic symbol names ({detail}) — "
-            "DT_STRTAB and the .dynsym offsets are out of sync, so the undefined-symbol guard "
-            "no longer inspects what it claims to and bionic may fail to load the helper")
+            f"emitting {kind} {os.path.basename(out_path)} changed its dynamic symbol names "
+            f"({detail}) — DT_STRTAB and the .dynsym offsets are out of sync, so the "
+            "undefined/exported symbol guards no longer inspect what they claim to, and bionic "
+            "may fail to resolve between the helper and the provider")
 
     # Residual host paths. After the strip there should be none; anything left is in a mapped
     # section, which no amount of post-processing here can fix — it needs the archive rebuilt
@@ -664,15 +735,49 @@ def _emit_helper(abi: str, helper_soname: str, region_bytes: bytes,
     with open(out_path, "rb") as f:
         residual = _host_paths_in(f.read())
     if residual:
-        _warn(f"{helper_soname} still contains host build paths in mapped sections: "
-              f"{residual[:3]}. These leak a developer username and pin dependency versions. "
-              "Rebuild libwbcrypto.a with -ffile-prefix-map=<src>=. in the "
+        _warn(f"{os.path.basename(out_path)} still contains host build paths in mapped "
+              f"sections: {residual[:3]}. These leak a developer username and pin dependency "
+              "versions. Rebuild libwbcrypto.a with -ffile-prefix-map=<src>=. in the "
               "whitebox-cryptography repo.")
+
+
+def _emit_helper(abi: str, helper_soname: str, region_bytes: bytes,
+                 out_path: str, allow_helper_log: bool = False) -> None:
+    """Emit one THIN per-target helper: guards, strip, rename to `helper_soname`, append its
+    target region. Renaming is correct here (one per target) and forbidden for the provider."""
+    skeleton = str(helper_skeleton_path(abi))
+    _check_wbaes_skeleton(skeleton, _KIND_THIN, allow_helper_log)
+    _emit_wbaes_artifact(skeleton, region_bytes, out_path, helper_soname, _KIND_THIN)
+
+
+def emit_provider(abi: str, pack: PackKey, out_path: str,
+                  allow_helper_log: bool = False) -> None:
+    """Emit the ONE shared white-box provider for `abi`, carrying the pack's sealed blob and
+    whitened passphrase. Called once per ABI by apk.py, after the per-entry loop.
+
+    Deliberately does NOT rename the artifact: each thin helper's DT_NEEDED string is whatever
+    the linker recorded as this skeleton's DT_SONAME, so it is asserted rather than set."""
+    skeleton = str(provider_skeleton_path(abi))
+    _check_wbaes_skeleton(skeleton, _KIND_PROVIDER, allow_helper_log)
+
+    soname = _dynamic_soname(lief.parse(skeleton))
+    if soname != PROVIDER_SONAME:
+        raise InjectError(
+            f"{_KIND_PROVIDER} skeleton {os.path.basename(skeleton)} has DT_SONAME "
+            f"{soname!r}, expected {PROVIDER_SONAME!r}. Every thin helper records the provider's "
+            f"DT_SONAME as its DT_NEEDED at LINK time, so this cannot be corrected here — "
+            f"relink with -Wl,-soname,{PROVIDER_SONAME}. Without an explicit -soname, lld "
+            f"records the file PATH it was handed and the APK will not load.")
+
+    region = WbRegion(wpass=pack.wpass, blob=pack.blob).pack()
+    _emit_wbaes_artifact(skeleton, region, out_path, None, _KIND_PROVIDER)
+    _self_verify_provider(out_path, abi, pack)
 
 
 def _inject_wbaes(in_path: str, out_path: str, abi: str,
                   wb_keygen: str | None, target_name: str | None,
-                  allow_helper_log: bool = False) -> InjectResult:
+                  allow_helper_log: bool = False,
+                  pack_key: PackKey | None = None) -> InjectResult:
     """`--cipher wbaes`: encrypt `.text` with ChaCha20 under a session key that is wrapped
     by a sealed white-box AES-128 key, and inject a per-target DT_NEEDED helper that unwraps
     and decrypts at load. No stub/decinfo/DT_INIT surgery — the helper's constructor runs
@@ -693,7 +798,12 @@ def _inject_wbaes(in_path: str, out_path: str, abi: str,
     plain = bytes(text.content)[:text_size]
     if len(plain) != text_size:
         raise InjectError(".text content shorter than declared size")
-    prov = provision_text(plain, wb_keygen=wb_keygen)
+    # One long-term key per (pack, ABI), supplied by apk.py which knows the whole target set.
+    # Standalone callers get one sealed here, plus a matching provider emitted at step 6.
+    own_pack_key = pack_key is None
+    if own_pack_key:
+        pack_key = provision_pack(wb_keygen=wb_keygen)
+    prov = provision_text(plain, pack_key)
     text.content = list(prov.ciphertext)
 
     # 2. inject the per-target helper as a DT_NEEDED. We do NOT use LIEF add_library: it
@@ -751,11 +861,13 @@ def _inject_wbaes(in_path: str, out_path: str, abi: str,
         f.write(new_strtab)
     _add_needed_inplace(out_path, name_off, strtab_rva, strtab_foff, len(new_strtab))
 
-    # 4. build + emit the helper carrying this target's metadata region.
-    region = Region(
+    # 4. build + emit the THIN helper carrying this target's region. Since v3 the region holds
+    #    no blob and no passphrase — those live once, in the shared provider — so this artifact
+    #    is a few KB rather than ~920 KB.
+    region = TargetRegion(
         text_rva=text_rva, text_size=text_size,
         wrapped=prov.wrapped, nonce16=prov.nonce16,
-        soname=target_soname.encode("utf-8"), wpass=prov.wpass, blob=prov.blob,
+        soname=target_soname.encode("utf-8"),
     ).pack()
     helper_path = out_path + ".helper.so"
     _emit_helper(abi, helper_soname, region, helper_path,
@@ -763,16 +875,23 @@ def _inject_wbaes(in_path: str, out_path: str, abi: str,
 
     # 5. self-verify both artifacts.
     _self_verify_wbaes(out_path, helper_path, prov.ciphertext, text_rva, text_size,
-                       target_soname, helper_soname, abi, in_path)
+                       target_soname, helper_soname, abi, in_path, pack_key)
+
+    # 6. A standalone caller (tests, direct inject_so use) gets a provider emitted beside the
+    #    helper, since nobody else will. apk.py supplies pack_key and emits one per ABI itself.
+    provider_path = None
+    if own_pack_key:
+        provider_path = out_path + ".provider.so"
+        emit_provider(abi, pack_key, provider_path, allow_helper_log=allow_helper_log)
 
     return InjectResult(abi=abi, text_rva=text_rva, text_size=text_size,
                         seg_rva=0, entry_rva=0, strategy="DT_NEEDED-wbaes",
                         cipher="wbaes", helper_path=helper_path,
-                        helper_soname=helper_soname)
+                        helper_soname=helper_soname, provider_path=provider_path)
 
 
 def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size,
-                       target_soname, helper_soname, abi, in_path):
+                       target_soname, helper_soname, abi, in_path, pack_key=None):
     """Assert every invariant the on-device helper depends on, for both artifacts."""
     tgt = lief.parse(target_path)
     if tgt is None:
@@ -809,9 +928,12 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
         raise InjectError("re-parse of wbaes helper failed")
     if _dynamic_soname(hlp) != helper_soname:
         raise InjectError("helper DT_SONAME not renamed")
-    stray = [n for n in _needed_names(hlp) if n not in _BIONIC_ALLOWED]
+    # Bionic libs plus exactly one more: the shared provider. Not a loosening — the name is a
+    # single literal, so a leaked libc++_shared.so is still caught.
+    stray = [n for n in _needed_names(hlp)
+             if n not in _BIONIC_ALLOWED and n != PROVIDER_SONAME]
     if stray:
-        raise InjectError(f"emitted helper has non-bionic DT_NEEDED {stray}")
+        raise InjectError(f"emitted helper has unexpected DT_NEEDED {stray}")
     _assert_16k_and_no_textrel(hlp, abi)
     # The strip actually happened. A silently-skipped strip ships 2.7 MB of DWARF and the full
     # symbol table, which is the single largest analysis shortcut in the whole design.
@@ -853,13 +975,42 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
     # test fixture carrying the marker as trailing bytes rather than in .rodata).
     # (d) the region round-trips and describes THIS target.
     region = _extract_region(helper_path)
-    r = Region.unpack(region)
+    r = TargetRegion.unpack(region)
     if (r.text_rva, r.text_size) != (text_rva, text_size):
         raise InjectError("helper region text_rva/size mismatch")
     if r.soname.decode("utf-8", "replace") != target_soname:
         raise InjectError("helper region soname mismatch")
-    if len(r.blob) < WHITEN_SPAN or len(r.wpass) == 0:
-        raise InjectError("helper region blob/pass missing")
+    # (d2) the thin helper must still be wired to the shared provider AFTER the emit. Read both
+    # the way bionic does: LIEF re-sorts .dynstr on write(), and if that desynced the st_name
+    # offsets these names would resolve mid-string on device — the failure that shipped once.
+    # A missing dependency here is a 100% load failure that surfaces inside whatever dlopen'd
+    # the target, so it must never leave the host.
+    if PROVIDER_SONAME not in _needed_names(hlp):
+        raise InjectError(
+            f"emitted helper {helper_soname} does not depend on {PROVIDER_SONAME} — it cannot "
+            "obtain a session key, and bionic would fail the target's dlopen")
+    if PROVIDER_ENTRY not in _undefined_dynsyms(helper_path):
+        raise InjectError(
+            f"emitted helper {helper_soname} no longer imports {PROVIDER_ENTRY} — the emit "
+            "desynced its .dynsym/.dynstr, so the symbol it resolves at load is not the one the "
+            "provider exports")
+    # (d3) the blob must NOT be here. It lives once, in the provider; a target region carrying it
+    # would mean a v2-shaped region slipped through and every helper is ~920 KB again.
+    if len(region) > 4096:
+        raise InjectError(
+            f"emitted helper {helper_soname} region is {len(region):,} bytes — a target region "
+            "is a 96-byte header plus a soname. This looks like a pre-v3 region still carrying "
+            "the sealed blob.")
+    # (d4) neither the long-term key nor anything derived from it may reach a thin helper.
+    if pack_key is not None:
+        with open(helper_path, "rb") as f:
+            helper_bytes = f.read()
+        for secret, what in ((pack_key.kek, "the long-term key"), (pack_key.blob, "the blob")):
+            if secret in helper_bytes:
+                raise InjectError(
+                    f"emitted helper {helper_soname} contains {what} — thin helpers must carry "
+                    "neither; only the shared provider does")
+
     # The helper reads these as fixed-size fields, so a wrong length here is a wrong-length
     # unwrap on device (i.e. a silent garbage session key), not a parse error.
     if len(r.wrapped) != WRAPPED_KEY_BYTES:
@@ -910,10 +1061,64 @@ def _assert_16k_and_no_textrel(binary, abi, orig_path: str | None = None):
         raise InjectError("output has DT_TEXTREL (text relocations) — must be absent")
 
 
-def _extract_region(helper_path: str) -> bytes:
-    """Read the appended region back out of an emitted helper by locating the read-only
-    PT_LOAD whose file bytes start with the region magic (mirrors the ctor's magic-scan)."""
-    magic = REGION_MAGIC.to_bytes(4, "little")
+def _self_verify_provider(provider_path: str, abi: str, pack: PackKey) -> None:
+    """Assert every invariant the thin helpers depend on in the SHARED provider.
+
+    Kept separate from `_self_verify_wbaes` because the provider is emitted once per ABI, after
+    the per-target loop — a per-target verifier structurally cannot see it."""
+    name = os.path.basename(provider_path)
+    b = lief.parse(provider_path)
+    if b is None:
+        raise InjectError(f"re-parse of emitted provider {name} failed")
+
+    # (a) DT_SONAME survived the emit unchanged. Every thin helper's DT_NEEDED is this string.
+    soname = _dynamic_soname(b)
+    if soname != PROVIDER_SONAME:
+        raise InjectError(
+            f"emitted provider {name} has DT_SONAME {soname!r}, expected {PROVIDER_SONAME!r} — "
+            "the emit must not rename it, or every thin helper's DT_NEEDED dangles")
+
+    # (b) it still exports exactly the one entry point, read the way bionic resolves it.
+    exported = _exported_dynsyms(provider_path)
+    if PROVIDER_ENTRY not in exported:
+        raise InjectError(
+            f"emitted provider {name} no longer exports {PROVIDER_ENTRY} — no thin helper could "
+            "resolve against it, and bionic would fail every target's dlopen")
+
+    # (c) bionic-only dependencies (the provider is the bottom of the chain).
+    stray = [n for n in _needed_names(b) if n not in _BIONIC_ALLOWED]
+    if stray:
+        raise InjectError(f"emitted provider {name} has non-bionic DT_NEEDED {stray}")
+
+    # (d) the region round-trips, and is a PROVIDER region rather than a target one.
+    r = WbRegion.unpack(_extract_region(provider_path, WB_REGION_MAGIC))
+    if r.blob != pack.blob or r.wpass != pack.wpass:
+        raise InjectError(f"emitted provider {name} region does not round-trip")
+    # blob >= WHITEN_SPAN is a precondition, not a nicety: the passphrase's whitening key is
+    # derived from the blob's first WHITEN_SPAN bytes, so a shorter blob reads past it on device.
+    if len(r.blob) < WHITEN_SPAN or len(r.wpass) == 0:
+        raise InjectError(f"emitted provider {name} region blob/pass missing or too short")
+
+    # (e) the long-term key must never reach any output. Cheap byte-scan, and the one check that
+    # would catch a refactor accidentally packing PackKey.kek instead of PackKey.blob.
+    with open(provider_path, "rb") as f:
+        blob_bytes = f.read()
+    if pack.kek in blob_bytes:
+        raise InjectError(
+            f"emitted provider {name} CONTAINS THE LONG-TERM KEY in cleartext — the whole point "
+            "of the white-box is that this key is never reconstructable from what ships")
+
+    _assert_16k_and_no_textrel(b, abi)
+
+
+def _extract_region(helper_path: str, magic_int: int = REGION_MAGIC) -> bytes:
+    """Read an appended region back out of an emitted artifact by locating the read-only
+    PT_LOAD whose file bytes start with the region magic (mirrors the ctor's magic-scan).
+
+    `magic_int` selects the kind: REGION_MAGIC ('SRTT', a thin helper's target region) or
+    WB_REGION_MAGIC ('SRTW', the provider's). They differ so neither can be mistaken for the
+    other — passing the wrong one finds nothing rather than parsing garbage."""
+    magic = magic_int.to_bytes(4, "little")
     b = lief.parse(helper_path)
     F = _seg_flags()
     with open(helper_path, "rb") as f:
@@ -928,17 +1133,20 @@ def _extract_region(helper_path: str) -> bytes:
         if data[off:off + 4] == magic:
             size = int(s.physical_size) or (len(data) - off)
             return data[off:off + size]
-    raise InjectError("could not find the region segment in the emitted helper")
+    raise InjectError(
+        f"could not find a region segment with magic {magic!r} in "
+        f"{os.path.basename(helper_path)}")
 
 
 def inject_so(in_path: str, out_path: str, abi: str,
               cipher: str = "chacha20", log: bool = False,
               wb_keygen: str | None = None,
               target_name: str | None = None,
-              allow_helper_log: bool = False) -> InjectResult:
+              allow_helper_log: bool = False,
+              pack_key: "PackKey | None" = None) -> InjectResult:
     if CIPHER_IDS[cipher] == CIPHER_WBAES:
         return _inject_wbaes(in_path, out_path, abi, wb_keygen, target_name,
-                             allow_helper_log=allow_helper_log)
+                             allow_helper_log=allow_helper_log, pack_key=pack_key)
     stub: Stub = load_stub(abi)
     cipher_id = CIPHER_IDS[cipher]
     # Whitening span: the WHITEN_SPAN stub bytes immediately before g_decinfo — real

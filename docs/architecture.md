@@ -542,18 +542,47 @@ session key ─drives──▶  ChaCha20 over .text    (~360 MB/s)
 ```
 
 The white-box charge does not grow with the payload, so only the ChaCha20 term scales.
-Measured on an aarch64 host for a 5.5 MiB `.text`:
+Measured on an aarch64 host for a 5.5 MiB `.text` (Phase 3's round-trip probe, `light` tier):
 
 | step | cost | scales with `.text`? |
 |---|---|---|
-| `wbc_open` (Argon2id KDF + Unseal) | ~230 ms | no — but once **per library** |
-| `wbc_unwrap_key` (2 white-box blocks) | ~1.4 ms | no |
-| ChaCha20 over `.text` | ~15 ms | yes |
-| **total** | **~245 ms** | |
+| `wbc_blob_kdf_tier` (header read) | ~0 ms | no |
+| `wbc_open` (HKDF + `Unseal` of the ~455 KB blob) | **1.1 ms** | no — but once **per library** |
+| `wbc_unwrap_key` (2 white-box blocks) | 0.83 ms | no |
+| ChaCha20 over `.text` | 11.8 ms (467 MB/s) | yes |
+| **total** | **13.7 ms** | |
 
-Note that the KDF, not the crypto, is now the dominant term — and it is the one that
-multiplies by library count, since each target gets its own helper and blob. Collapsing that
-to one shared helper is a known, deliberately deferred optimisation.
+ChaCha20 is the dominant term again, and it is the only one that grows. That is a deliberate
+result, not luck — see the tier discussion below.
+
+#### The KDF tier: why `wbc_open` used to dominate, and does not now
+
+Before wbcrypto 3.0.0 the seal's key-derivation cost was a compile-time constant pinned at
+Argon2id 64 MiB / 2 passes. `wbc_open` was ~230 ms on this host and **266 ms on device**, i.e.
+91% of the whole load-time cost, plus a transient **64 MiB** allocation — all inside an ELF
+constructor at app startup, and paid once *per library*.
+
+3.0.0 moved that cost into the blob header as a per-blob tier, chosen at seal time
+(`wb_keygen --kdf light|medium|heavy` → `WBC_KDF_NONE`/`_LOW`/`_HIGH`) and readable afterwards
+with `wbc_blob_kdf_tier`. sopack pins **`light`** (HKDF-SHA256): the row above drops from ~230 ms
+to 1.1 ms and the 64 MiB allocation disappears entirely. N libraries no longer multiply either.
+
+That is **security-neutral here**, and the reason is worth being precise about. Argon2id makes
+each passphrase *guess* expensive. sopack's passphrase is 128 bits of machine entropy that
+**ships in the helper beside the blob**, whitened with a key derived from that same blob's first
+1024 bytes (§11f) — so an attacker holding the APK holds the passphrase and guesses nothing.
+Argon2id was never buying guessing resistance in this threat model; it was pure startup cost.
+`light` is the correct construction for a high-entropy machine secret, and upstream documents
+the ≥128-bit precondition that `secrets.token_hex(16)` meets exactly. The tier also sits inside
+the seal's AEAD associated data, so a shipped blob cannot be tier-downgraded: rewriting the field
+changes both the derived key and the authenticated data, and the tag then fails for every
+passphrase.
+
+What survives is that `wbc_open` is **not free** — `Unseal` still AEAD-decrypts the ~455 KB blob
+and builds the VM image, once per library. So per-library cost still multiplies, just at a much
+smaller constant. The remaining argument for collapsing to one shared blob is therefore **APK
+size**, not startup: each per-target helper ships ~465 KB of white-box code plus a ~455 KB blob,
+≈920 KB, and N of them duplicate both. See §11g.
 
 ### 11c. Why the bulk cipher is sopack's own ChaCha20, not the SDK's AEAD
 
@@ -583,9 +612,10 @@ moment it seals it, so it can compute the wrap directly:
 wrapped = wrap_iv + cipher.aes128_ctr(sk, kek, wrap_iv)   # == wbc_wrap_key(ctx, sk, …)
 ```
 
-Verified byte-exact against the real 2.0.0 `wbc_unwrap_key` and pinned by a KAT in
+Verified byte-exact against the real 2.0.0 `wbc_unwrap_key` — and unchanged at 3.0.0, whose
+release notes keep the runtime ABI and `CtrSessionKey` byte-identical — pinned by a KAT in
 `tests/test_cipher.py`. So provisioning stays "pure Python + the unchanged `wb_keygen` CLI",
-and `assets/wbc/wb_keygen`'s interface did not have to change.
+and `wb_keygen`'s interface did not have to change beyond the `--kdf` flag 3.0.0 added.
 
 ### 11e. Finding the metadata without a patched symbol
 

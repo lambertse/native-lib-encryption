@@ -21,7 +21,7 @@ CIPHER_WBAES = 2   # white-box AES-128-CTR: host encrypts, on-device white-box d
 
 CIPHER_IDS = {"xor": CIPHER_XOR, "chacha20": CIPHER_CHACHA20, "wbaes": CIPHER_WBAES}
 
-# wbcrypto 2.0.0 key-wrap sizes. Must equal WBC_SESSION_KEY_BYTES / WBC_WRAPPED_KEY_BYTES
+# wbcrypto key-wrap sizes (unchanged since 2.0.0). Must equal WBC_SESSION_KEY_BYTES / WBC_WRAPPED_KEY_BYTES
 # in the SDK header; stub/sopk_rt.h mirrors them and stub/sopk_rt.c static_asserts them.
 # A session key is also exactly a ChaCha20 key, which is why the bulk needs no second key.
 SESSION_KEY_BYTES = 32
@@ -208,7 +208,8 @@ def whiten(record: bytes, span: bytes) -> bytes:
 #
 # Counter convention MUST match CtrSessionKey: the full 16-byte IV is the initial counter,
 # incremented as a 128-bit BIG-ENDIAN integer; keystream block = E(counter); a partial final
-# block is truncated. Verified byte-exact against the real 2.0.0 wbc_unwrap_key — see the
+# block is truncated. Verified byte-exact against the real 2.0.0 wbc_unwrap_key, and still
+# exact at 3.0.0 (CtrSessionKey is byte-identical; only the seal's KDF tier changed) — see the
 # KAT in tests/test_cipher.py.
 AES_BLOCK = 16
 

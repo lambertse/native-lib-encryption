@@ -149,6 +149,14 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
         seen_names: set[str] = set()          # every entry written (collision guard)
         # wbaes: (lib/<abi>/name, bytes, target's ZIP date_time)
         extra_helpers: list[tuple[str, bytes, tuple[int, int, int, int, int, int]]] = []
+        # wbaes: ONE long-term key and ONE shared provider per ABI. Sealed lazily on that
+        # ABI's first target, then reused for every later target in it — which is what lets a
+        # single ~455 KB blob replace N of them.
+        pack_keys: dict[str, object] = {}
+        # abi -> ZIP date_time to stamp that ABI's provider with (see the helper note below).
+        provider_dates: dict[str, tuple[int, int, int, int, int, int]] = {}
+        # abi -> thin helper sonames staged, for the pack-level closure assertion afterwards.
+        thin_by_abi: dict[str, list[str]] = {}
         with zipfile.ZipFile(in_apk, "r") as zin, \
                 zipfile.ZipFile(unsigned, "w") as zout:
             for item in zin.infolist():
@@ -165,9 +173,19 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                     dst = os.path.join(tmp, "out.so")
                     with open(src, "wb") as f:
                         f.write(data)
+                    if cipher == "wbaes" and abi not in pack_keys:
+                        # Sealed lazily, on this ABI's first target. That means a stale
+                        # pre-3.0.0 wb_keygen fails mid-loop rather than up front — which is
+                        # safe here only because every intermediate lives in `tmp` and
+                        # `out_apk` is not written until signing, so a raise leaves no partial
+                        # output. Do not move the output into the loop without hoisting this.
+                        from .provision import provision_pack
+                        logger(f"  sealing the shared white-box key for {abi} …")
+                        pack_keys[abi] = provision_pack(wb_keygen=wb_keygen)
                     ir = inject_so(src, dst, abi, cipher=cipher, log=log,
                                    wb_keygen=wb_keygen, target_name=m.group(2),
-                                   allow_helper_log=allow_helper_log)
+                                   allow_helper_log=allow_helper_log,
+                                   pack_key=pack_keys.get(abi))
                     with open(dst, "rb") as f:
                         data = f.read()
                     result.injected.append(ir)
@@ -182,6 +200,8 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                         hname = f"lib/{abi}/{ir.helper_soname}"
                         with open(ir.helper_path, "rb") as hf:
                             extra_helpers.append((hname, hf.read(), item.date_time))
+                        thin_by_abi.setdefault(abi, []).append(ir.helper_soname)
+                        provider_dates.setdefault(abi, item.date_time)
                     # STORED so the .so stays uncompressed & page-alignable.
                     zi = zipfile.ZipInfo(name, date_time=item.date_time)
                     zi.compress_type = zipfile.ZIP_STORED
@@ -195,19 +215,56 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                     zout.writestr(item, data)
                     seen_names.add(name)
 
-            # Add the wbaes helper libraries as NEW STORED entries (the packer's only
-            # add-file path). Skip a name already present (shouldn't collide — helper
-            # sonames are per-target and prefixed libsopk_rt_).
+            # Emit ONE shared white-box provider per ABI, after the loop — it carries that
+            # ABI's single sealed blob, so it cannot be produced per target.
+            from .elf_inject import emit_provider
+            from .rt_meta import PROVIDER_SONAME
+            for abi, pk in pack_keys.items():
+                pname = f"lib/{abi}/{PROVIDER_SONAME}"
+                ppath = os.path.join(tmp, f"provider-{abi}.so")
+                logger(f"  emitting shared white-box provider for {abi} …")
+                emit_provider(abi, pk, ppath, allow_helper_log=allow_helper_log)
+                with open(ppath, "rb") as pf:
+                    extra_helpers.append(
+                        (pname, pf.read(), provider_dates.get(abi, (1980, 1, 1, 0, 0, 0))))
+
+            # Add the wbaes helpers and providers as NEW STORED entries (the packer's only
+            # add-file path).
+            #
+            # A collision is handled differently for the two kinds. For a per-target helper it is
+            # benign — the soname is derived from the target and prefixed libsopk_rt_, so a clash
+            # means the APK already had one and skipping keeps the existing bytes. For the
+            # PROVIDER it is fatal: silently skipping it would leave every thin helper resolving
+            # against a pre-existing libsopk_wb.so carrying a FOREIGN blob, so no session key
+            # would unwrap and every target would abort on device.
+            provider_names = {f"lib/{abi}/{PROVIDER_SONAME}" for abi in pack_keys}
             for hname, hdata, hdate in extra_helpers:
                 if hname in seen_names:
+                    if hname in provider_names:
+                        raise RuntimeError(
+                            f"{hname} already exists in this APK. It cannot be reused: it would "
+                            "carry a different sealed blob than the one the thin helpers were "
+                            "wrapped against, so every packed library would fail to decrypt. "
+                            "Pack an APK that has not already been packed.")
                     logger(f"  warning: helper {hname} already present; not overwriting")
                     continue
-                logger(f"  adding helper {hname} …")
+                logger(f"  adding {hname} …")
                 zi = zipfile.ZipInfo(hname, date_time=hdate)
                 zi.compress_type = zipfile.ZIP_STORED
                 zi.external_attr = (0o644 << 16)
                 zout.writestr(zi, hdata)
                 seen_names.add(hname)
+
+            # Pack-level closure. `_self_verify_wbaes` runs per target and structurally cannot
+            # see this: every thin helper depends on lib/<abi>/libsopk_wb.so, so if that entry is
+            # missing the app fails 100% of the time, inside whatever dlopen'd the target.
+            for abi, thin in thin_by_abi.items():
+                pname = f"lib/{abi}/{PROVIDER_SONAME}"
+                if pname not in seen_names:
+                    raise RuntimeError(
+                        f"{len(thin)} thin helper(s) for {abi} were staged but {pname} was not — "
+                        f"every one of them DT_NEEDEDs it, so the app would fail to load. This "
+                        f"is a packer bug, not a bad input.")
 
         if not matched_any:
             raise RuntimeError(

@@ -14,6 +14,10 @@
   `--cipher wbaes` (white-box AES-128 key wrapping): building the host `wb_keygen` and the
   per-ABI helper skeleton, a host round-trip through the real white-box, and what to check
   on device. Read it before using that mode — it has prerequisites the other modes do not.
+- **[potential-improvements.md](./potential-improvements.md)** — changes that are understood
+  and deliberately **not** done, each with the trade-off it loses on today and the measurement
+  that would justify revisiting it. Read it before proposing an optimisation — the shapes that
+  look obvious and do not work are recorded here.
 - **[static-analysis-hardening.md](./static-analysis-hardening.md)** — every technique
   used to make static analysis of a packed `.so` harder (metadata whitening, string hygiene;
   and why section-header stripping was rejected), with the code and the honest limits.
