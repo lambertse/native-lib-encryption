@@ -100,7 +100,7 @@ def test_build_marker_matches_the_c_header():
 
 
 def test_build_marker_is_not_a_superseded_value():
-    """The test above only proves the two languages agree — it passes automatically
+    """The test above only proves the two languages agree - it passes automatically
     once both sides are edited, so on its own it does not gate a bump at all.
     This does: the marker must differ from every value that ever shipped, and
     each retired value must stay documented in the C header so a future bump

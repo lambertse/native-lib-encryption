@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build_stubs.sh — compile the injectable decryption stub into flat, relocation-free
+# build_stubs.sh - compile the injectable decryption stub into flat, relocation-free
 # blobs (one per ABI) plus a JSON sidecar recording the offsets the injector needs
 # (sopk_entry and g_decinfo within the blob).
 #
@@ -14,7 +14,7 @@
 # Usage: ANDROID_NDK_HOME=/path/to/ndk ./build_stubs.sh [API_LEVEL]
 #    or: ./build_stubs.sh            # plain LLVM on PATH
 #
-# Requires an NDK r19+ (recommend r26-r28; must bundle lld — a real version looks like
+# Requires an NDK r19+ (recommend r26-r28; must bundle lld - a real version looks like
 # 27.0.12077973, NOT 4.8.0) OR a modern LLVM (clang + lld + llvm-objcopy + llvm-readelf)
 # on PATH. Run with bash (>= 3.2), not sh.
 set -euo pipefail
@@ -102,7 +102,7 @@ for PAIR in $TARGETS; do
     if [ "$ABI" = "arm64-v8a" ]; then
         OBJDUMP="$(dirname "$READELF")/llvm-objdump"
         if "$OBJDUMP" -d "$ELF" | grep -qw adrp; then
-            echo "ERROR: $ABI stub uses adrp (page-relative) — must build with -mcmodel=tiny" >&2
+            echo "ERROR: $ABI stub uses adrp (page-relative) - must build with -mcmodel=tiny" >&2
             exit 1
         fi
     fi

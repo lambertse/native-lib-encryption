@@ -66,7 +66,7 @@ def _cmd_pack(args: argparse.Namespace) -> int:
         print("\nSignature:")
         print(verify_signature(args.output, min_sdk=args.min_sdk))
     print(f"\nDone: {args.output}")
-    print("Note: re-signed with a new certificate — this is a new app identity "
+    print("Note: re-signed with a new certificate - this is a new app identity "
           "(cannot update-install over the original).")
     return 0
 
@@ -87,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "(e.g. --lib libfoo.so,libbar.so)")
     pk.add_argument("--cipher", choices=["chacha20", "xor", "wbaes"], default="chacha20",
                     help="chacha20/xor: freestanding stub (raw key ships whitened). "
-                         "wbaes: white-box AES-128 key wrapping via an injected helper — the "
+                         "wbaes: white-box AES-128 key wrapping via an injected helper - the "
                          "long-term key is sealed and never reconstructed, and the white-box "
                          "unwraps a session key that ChaCha20-decrypts .text. Requires "
                          "whitebox-cryptography >= 3.0.0 for both assets/wbc/ and the helper "
@@ -105,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="(--cipher wbaes) permit a helper skeleton built with -DSOPK_RT_LOG. "
                          "Such a helper logs the target name, .text address and size to logcat, "
                          "so packing one is refused by default. Use it for on-device Phase 6 "
-                         "verification only — the resulting APK is NOT shippable.")
+                         "verification only - the resulting APK is NOT shippable.")
     pk.add_argument("--keystore", help="keystore path (auto-generated if missing)")
     pk.add_argument("--ks-alias", default="sopack")
     pk.add_argument("--ks-pass", default="sopack")

@@ -2,8 +2,8 @@
 
 A short, practical guide: install the toolchain, build the stub blobs once, pack an
 APK, and verify the result. For *why* any of this is shaped the way it is, see
-[`architecture.md`](./architecture.md); when something breaks, see
-[`troubleshooting.md`](./troubleshooting.md).
+[`technical/ARCHITECTURE.md`](./technical/ARCHITECTURE.md); when something breaks, see
+[`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md).
 
 ---
 
@@ -44,8 +44,9 @@ Easiest is the per-cipher wrapper, which also runs the tests and prints the pack
 ```
 
 For `--cipher wbaes` the equivalent is `./scripts/build_wbaes.sh`, which additionally builds
-the white-box artifacts and the per-ABI helper — see
-[wbaes-verification.md](./wbaes-verification.md).
+the white-box artifacts and **both** per-ABI skeletons (the thin helper and the shared
+provider) - see [technical/WBAES.md](./technical/WBAES.md). It needs the
+whitebox-cryptography SDK and an NDK; `--host-only` runs the parts that do not.
 
 Or drive the stub build directly:
 
@@ -62,7 +63,7 @@ package data), so expect a dirty tree afterwards.
 
 `24` is the Android API level (any modern level is fine). The script **fails hard** if
 any blob ends up with a dynamic relocation, an undefined external symbol, or (on
-arm64) an `adrp` instruction — those guarantee the blob is self-contained and
+arm64) an `adrp` instruction - those guarantee the blob is self-contained and
 alignment-independent. A clean run means good blobs.
 
 > Run it with **bash**, not `sh` (`bash stub/build_stubs.sh 24`). It is bash-3.2
@@ -107,30 +108,39 @@ sopack pack in.apk \
   matches that library in **every** selected ABI; a full path
   (`lib/arm64-v8a/libapp.so`) targets one ABI. For many libraries you can instead use
   `--libs libs.txt` (one entry per line; `#` comments allowed).
-- `--abi` — omit to encrypt all three ABIs by default.
-- `--cipher` — `chacha20` (default), `xor`, or `wbaes`. The first two use the freestanding
-  stub. `wbaes` is white-box AES-128 key wrapping via an injected helper: it ships no
-  portable key, but it needs a host `wb_keygen` (`--wb-keygen` or `$SOPACK_WBKEYGEN`), a
-  per-ABI helper skeleton you build yourself, and whitebox-cryptography >= 3.0.0. See
-  [wbaes-verification.md](./wbaes-verification.md) before using it.
-- `--wb-keygen` — path to a HOST `wb_keygen` (for `--cipher wbaes`); otherwise
+- `--abi` - omit to encrypt all three ABIs by default.
+- `--cipher` - `chacha20` (default), `xor`, or `wbaes`. The first two use the freestanding
+  stub. `wbaes` is white-box AES-128 key wrapping via injected helpers: it ships no
+  portable key, but it has prerequisites the other modes do not -
+  whitebox-cryptography >= 3.0.0, a host `wb_keygen` (`--wb-keygen` or `$SOPACK_WBKEYGEN`),
+  and **two** hand-built per-ABI skeletons in `sopack/stubs/`: the thin helper
+  `sopk_rt_<abi>.so` **and** the shared white-box provider `sopk_wb_<abi>.so`. Run
+  `./scripts/build_wbaes.sh` to produce both; read
+  [technical/WBAES.md](./technical/WBAES.md) before using this mode.
+- `--wb-keygen` - path to a HOST `wb_keygen` (for `--cipher wbaes`); otherwise
   `$SOPACK_WBKEYGEN`, otherwise one on `PATH`.
-- `--log` — the stub emits a logcat confirmation on the device (see §5). Omit for a
-  silent stub.
-- `--keystore` — auto-generated on first use (self-signed, password `sopack`). Reuse
+- `--min-sdk` - minimum SDK passed through to `apksigner`.
+- `--allow-helper-log` - permit packing a *tracing* wbaes skeleton (built with
+  `-DSOPK_RT_LOG`). Warns on every pack; the result is **not shippable**. Only for a first
+  device bring-up.
+- `--log` - the stub emits a logcat confirmation on the device (see §5). Omit for a
+  silent stub. (Stub ciphers only - for `wbaes` tracing, see `--allow-helper-log` above.)
+- `--keystore` - auto-generated on first use (self-signed, password `sopack`). Reuse
   the same file to keep a stable signing identity across rebuilds. Defaults to
   `~/.sopack/debug.keystore`.
-- `--verify` — print the signer certificate after signing.
+- `--verify` - print the signer certificate after signing.
 
 The injector runs a **self-verification** on every library (round-trip decrypt, vaddr
 stability, 16 KB congruence, correct hook target, no `TEXTREL`) and aborts with a clear
-error rather than emitting a silently-broken `.so`.
+error rather than emitting a silently-broken `.so`. For `--cipher wbaes` it additionally
+checks, after all libraries are done, that every thin helper's provider was emitted - a
+per-library check cannot see that, and a missing provider fails on every device launch.
 
 ---
 
 ## 5. Verify the output
 
-**Static** — confirm the library is encrypted and well-formed:
+**Static** - confirm the library is encrypted and well-formed:
 
 ```bash
 # extract one lib (no unzip needed: python works too)
@@ -142,7 +152,7 @@ llvm-readelf -dW      /tmp/chk/lib/arm64-v8a/libapp.so | grep -E 'INIT|TEXTREL' 
 apksigner verify --print-certs out.apk        # or: java -jar "$SOPACK_APKSIGNER_JAR" verify --print-certs out.apk
 ```
 
-**On device** — install and watch for the decrypt confirmation and any denials:
+**On device** - install and watch for the decrypt confirmation and any denials:
 
 ```bash
 adb install -r out.apk
@@ -155,6 +165,11 @@ One `sopack` line appears per encrypted library that actually loads (normally ju
 one for the device's ABI). No line ⇒ either you didn't pass `--log`, the device loaded
 a different (unencrypted) ABI, or decryption didn't run.
 
+For `--cipher wbaes` the tags are different - `sopk_rt` (each thin helper) and `sopk_wb`
+(the shared provider) - and a release build logs **nothing** at all; it fails closed with
+an abort instead. Use `adb logcat -s sopk_rt sopk_wb DEBUG`, and see
+[technical/WBAES.md](./technical/WBAES.md) Phase 6 for the full device procedure.
+
 ---
 
 ## 6. Reminders
@@ -163,9 +178,9 @@ a different (unencrypted) ABI, or decryption didn't run.
   original, and in-app signature/integrity checks will see the new certificate.
   Uninstall the original first if needed.
 - **Encrypt the library that holds *your* code.** For Flutter that's `libapp.so` (the
-  Dart AOT snapshot). `libflutter.so` is the stock public engine — encrypting it costs
+  Dart AOT snapshot). `libflutter.so` is the stock public engine - encrypting it costs
   load time and fragility while protecting nothing proprietary (the tool handles it
   correctly, it's just rarely worth it).
-- **arm64 is the reference ABI** — get it green before trusting armv7 / x86_64.
+- **arm64 is the reference ABI** - get it green before trusting armv7 / x86_64.
 - **Rebuild stubs only when you change `stub/`.** Packing itself doesn't need the
   NDK/LLVM once `sopack/stubs/*.bin` exist.

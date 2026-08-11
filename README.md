@@ -1,20 +1,20 @@
-# sopack — black-box Android `.so` encryptor / APK repackager
+# sopack - black-box Android `.so` encryptor / APK repackager
 
 `sopack` takes an **existing APK** plus a list of native libraries and produces a
 **self-signed APK** in which each listed `.so` has its code (`.text`) encrypted at
-rest and transparently decrypted at load time — **without any access to the library
+rest and transparently decrypted at load time - **without any access to the library
 source**. It is a black-box ELF-injection packer; see [`docs/`](./docs/) for the full
 design and reasoning.
 
 > ⚠️ **This is obfuscation, not security.** The decryption key ships inside the
 > binary, and plaintext exists in a readable `R-X` mapping at runtime. Any Frida hook
 > or `/proc/self/maps` dump recovers everything. Treat this as anti-static-analysis
-> only. Also: re-signing gives the APK a **new signing identity** — it cannot be
+> only. Also: re-signing gives the APK a **new signing identity** - it cannot be
 > installed as an update over the original, and in-app signature checks will see the
-> new certificate.
+> new certificate. Full threat model: [`docs/SECURITY.md`](./docs/SECURITY.md).
 
 ```
-sopack pack in.apk --libs libs.txt -o out.apk [--cipher chacha20|xor|wbaes] [--abi ...]
+sopack pack in.apk --lib libfoo.so,libbar.so -o out.apk [--cipher chacha20|xor|wbaes] [--abi ...]
 ```
 
 ## Two modes
@@ -23,33 +23,29 @@ sopack pack in.apk --libs libs.txt -o out.apk [--cipher chacha20|xor|wbaes] [--a
 key ships inside the library, whitened at rest.
 
 `--cipher wbaes` instead protects the key with a **white-box AES-128**, so no portable key
-ships at all. It needs a different delivery mechanism (a normal-linkage helper injected as a
-`DT_NEEDED`, because the white-box runtime needs libc) and a per-ABI helper you build
-yourself. See [`docs/architecture.md`](./docs/architecture.md) §11 for how it works and
-[`docs/wbaes-verification.md`](./docs/wbaes-verification.md) for the setup and verification
+ships at all. It needs a different delivery mechanism (normal-linkage helpers injected as a
+`DT_NEEDED`, because the white-box runtime needs libc) and **two** per-ABI skeletons you build
+yourself - a thin per-target helper plus one shared white-box provider. See
+[`docs/technical/ARCHITECTURE.md`](./docs/technical/ARCHITECTURE.md) §11 for how it works and
+[`docs/technical/WBAES.md`](./docs/technical/WBAES.md) for the setup and verification
 procedure. The rest of this page describes the stub mode.
 
 ## How it works
 
 For each requested `lib/<abi>/*.so` inside the APK:
 
-1. **Encrypt `.text`** in place with a stream cipher (ChaCha20 or XOR) — same length,
+1. **Encrypt `.text`** in place with a stream cipher (ChaCha20 or XOR) - same length,
    same file offsets, so ELF layout is untouched. Random per-library key + nonce.
 2. **Inject a freestanding stub** (`stub/stub.c`, compiled per ABI to a flat,
    relocation-free blob) as a new **R+X `PT_LOAD`** segment, 16 KB-aligned.
 3. **Hijack load-time execution** so the stub runs before any encrypted code. If the
-   library exposes a usable `DT_INIT`, repoint it (chaining the original). Otherwise —
-   whether the library has a `DT_INIT_ARRAY` (e.g. `libflutter.so` and most NDK-built
-   C++ libraries) or no init hook at all (e.g. Flutter's `libapp.so`) — add a `DT_INIT`
-   **in place** by overwriting the existing `DT_NULL` terminator (relying on the
-   following zero word as the new terminator), which keeps `.dynamic` writable and in
-   place and avoids adding a mis-aligned segment that would break 16 KB loading. We
-   **never** hijack `DT_INIT_ARRAY`: on position-independent libraries (every Android
-   `.so`) each array slot is filled by an `R_*_RELATIVE` relocation at load, so a file
-   overwrite is silently reverted by the loader and the stub never runs. A `DT_INIT`
-   entry is not relocated and, per bionic's `soinfo::call_constructors`, runs **before**
-   `DT_INIT_ARRAY` — so the stub decrypts `.text` first and the library's own
-   constructors then execute on decrypted code.
+   library exposes a usable `DT_INIT`, repoint it (chaining the original); otherwise add
+   a `DT_INIT` **in place** over the existing `DT_NULL` terminator. `DT_INIT_ARRAY` is
+   **never** hijacked - each slot is rewritten by an `R_*_RELATIVE` relocation at load, so
+   a file overwrite is silently reverted and the stub never runs. This was the hardest
+   part to get right; the full reasoning, including why growing `.dynamic` breaks 16 KB
+   loading, is in
+   [`docs/technical/ARCHITECTURE.md`](./docs/technical/ARCHITECTURE.md) §5c.
 4. **At runtime**, the stub (W^X / SELinux `execmem`-safe):
    `mmap`s anonymous RW scratch → copies the encrypted `.text` page window → decrypts
    the exact `.text` sub-range → `mremap(MREMAP_FIXED)` onto the **original `.text`
@@ -71,33 +67,39 @@ sopack/               Python package (the tool)
   cli.py              `sopack pack …`
   apk.py              unzip → inject → zipalign → apksigner; keystore mgmt
   elf_inject.py       LIEF: encrypt .text, add segment, hijack init, patch metadata
-  cipher.py           ChaCha20 / XOR — MUST match stub/stub_cipher.h; plus AES-128-CTR,
+  cipher.py           ChaCha20 / XOR - MUST match stub/stub_cipher.h; plus AES-128-CTR,
                       which is the wbaes key-wrap primitive
-  metadata.py         decinfo pack/parse — MUST match stub/decinfo.h
-  provision.py        wbaes: seal a key via wb_keygen, wrap a session key under it
-  rt_meta.py          wbaes: sopk_rt_region pack/parse — MUST match stub/sopk_rt.h
-  stubs.py            loads the prebuilt per-ABI blobs
+  metadata.py         decinfo pack/parse - MUST match stub/decinfo.h
+  provision.py        wbaes: seal one key per ABI, wrap a session key per library
+  rt_meta.py          wbaes: both region layouts - MUST match stub/sopk_rt.h
+  stubs.py            loads the prebuilt per-ABI blobs and the wbaes skeletons
   stubs/              stub_<abi>.bin + stub_<abi>.json  (built by build_stubs.sh)
 stub/                 the injectable runtime stub (C)
   stub.c              entry: mmap/decrypt/mremap-onto-base/mprotect/flush/chain
   syscalls.h          freestanding syscalls (arm64/x86_64/arm), page size, memcpy
-  stub_cipher.h       ChaCha20 / XOR — mirror of cipher.py
+  stub_cipher.h       ChaCha20 / XOR - mirror of cipher.py
+  stub_log.h          freestanding logd writer (the --log line)
   decinfo.h           the 128-byte injector<->stub contract
   stub.ld             link at vaddr 0 → single R+X image
   build_stubs.sh      NDK build → flat blobs + offsets (fails on any relocation)
-  sopk_rt.c/.h        wbaes: the DT_NEEDED helper and its injector<->helper contract
-tests/                cipher KATs, metadata + region layout, wbaes injection, dlopen
+  sopk_rt.c/.h        wbaes: the thin per-target helper + both region contracts
+  sopk_wb.c/.h        wbaes: the shared per-ABI white-box provider
+scripts/              build_chacha20.sh / build_wbaes.sh - one entry point per cipher
+                      mode; rt_roundtrip.c, the host verification probe
+tests/                cipher KATs, metadata + region layouts, wbaes injection, dlopen
   fixtures/           committed aarch64 .so so the wbaes tests need no local APK
 ```
 
 ## Build & run
 
-**Prerequisites** (not bundled): Python 3.10+, LIEF, a JDK (`keytool`), Android SDK
-build-tools (`zipalign`, `apksigner`), and the NDK (to build the stub blobs once).
+**Prerequisites** (not bundled): Python 3.9+, LIEF, a JDK (`keytool`), Android SDK
+build-tools (`apksigner`; `zipalign` optional), and LLVM or the NDK (to build the stub
+blobs once). Details in [`docs/BUILDING.md`](./docs/BUILDING.md).
 
 ```bash
-# 1. Build the stub blobs (once, needs the NDK)
-ANDROID_NDK_HOME=/path/to/ndk ./stub/build_stubs.sh        # -> sopack/stubs/*.bin
+# 1. Build the stub blobs (once). This wrapper also runs the tests and prints
+#    the pack command; it uses an NDK if one is set, else plain LLVM on PATH.
+./scripts/build_chacha20.sh                                # -> sopack/stubs/*.bin
 
 # 2. Install the tool
 pip install -e .                                           # pulls in LIEF
@@ -106,15 +108,17 @@ pip install -e .                                           # pulls in LIEF
 export ANDROID_SDK_ROOT=/path/to/android/sdk
 
 # 4. Pack
-printf 'libnative-lib.so\n' > libs.txt
-sopack pack app.apk --libs libs.txt -o app-packed.apk --verify
+sopack pack app.apk --lib libnative-lib.so -o app-packed.apk --verify
 
 # 5. Sanity-check the result
 python -m pytest tests/
 ```
 
-`libs.txt` entries may be bare basenames (`libfoo.so` → matches every selected ABI)
-or full APK paths (`lib/arm64-v8a/libfoo.so`).
+`--lib` is repeatable and/or comma-separated; entries may be bare basenames
+(`libfoo.so` → matches every selected ABI) or full APK paths
+(`lib/arm64-v8a/libfoo.so`). `--libs libs.txt` reads the same entries from a file, one per
+line. For `--cipher wbaes`, use `./scripts/build_wbaes.sh` in step 1 instead - it builds the
+two extra per-ABI skeletons that mode needs.
 
 ## Verification checklist
 
@@ -124,15 +128,23 @@ or full APK paths (`lib/arm64-v8a/libfoo.so`).
 - **Dynamic:** install & launch; `adb logcat | grep -E 'avc|SIGSEGV'` must be clean;
   a `/proc/<pid>/maps` dump should show plaintext at the original `.text` VA post-load.
 - **Decrypt confirmation (opt-in):** pack with `--log` and the stub emits a logcat line
-  on success — `adb logcat -s sopack:I` shows `I sopack: native .text decrypted OK`
+  on success - `adb logcat -s sopack:I` shows `I sopack: native .text decrypted OK`
   (written straight to `logd`; no liblog dependency). Omit `--log` for a silent stub.
 - **Device matrix:** Android 14 (4 KB) and 15/16 (16 KB emulator + real device),
-  each ABI. See `stub/phase0/` for a standalone runtime-path spike to run first.
+  each ABI. Run [`stub/execmem-probe/`](./stub/execmem-probe/) on a new device class
+  first - it checks the decrypt-and-execute path in isolation, before any packing.
+
+For `--cipher wbaes` the checks differ (two added `.so`s per ABI, different logcat tags, and
+a fail-closed abort instead of a silent degrade) - see
+[`docs/technical/WBAES.md`](./docs/technical/WBAES.md) Phases 5–6.
 
 ## Known limitations
 
-- Per-library fragility (section-stripped libs, exotic init code) — the tool fails
+- Per-library fragility (section-stripped libs, exotic init code) - the tool fails
   loudly rather than silently corrupting.
-- 32-bit ARM and x86_64 stubs exist but need the same on-device validation as arm64.
+- **Only `arm64-v8a` is protected in practice.** 32-bit ARM and x86_64 stubs exist but need
+  the same on-device validation as arm64, so those ABIs ship cleartext `.text` - an analyst
+  after the algorithm reads one of those builds instead. See
+  [`docs/SECURITY.md`](./docs/SECURITY.md).
 - LIEF-rebuilt ELFs occasionally trip strict loaders; validate a real `dlopen`.
 - Security is obfuscation only (see the warning above).

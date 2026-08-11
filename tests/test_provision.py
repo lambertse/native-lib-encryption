@@ -1,12 +1,12 @@
 """The sealed-blob header gate (`--cipher wbaes`, wbcrypto >= 3.0.0).
 
-Pure functions over synthetic blobs, so this runs everywhere — no host `wb_keygen` needed,
+Pure functions over synthetic blobs, so this runs everywhere - no host `wb_keygen` needed,
 unlike the two skipping tests in test_wbaes.py.
 
 What is being pinned: sopack seals at the `light` KDF tier (`WBC_KDF_NONE`) because the
 passphrase is a 128-bit machine secret that ships beside the blob, so Argon2id buys nothing
 here. wb_keygen DEFAULTS to `heavy`, which means a dropped `--kdf` flag is *silently slow*
-rather than an error — 266 ms and a transient 64 MiB per library at app startup. These tests
+rather than an error - 266 ms and a transient 64 MiB per library at app startup. These tests
 are what make that unshippable.
 """
 import struct
@@ -51,7 +51,7 @@ def test_future_version_is_accepted():
 
 def test_v3_blob_is_refused_and_blames_a_stale_keygen():
     """A 2.0.0 blob. v4 inserted kdf_tier and shifted every later field, so a 3.0.0 helper
-    cannot open this at all — on device it aborts with nothing pointing at the host tool."""
+    cannot open this at all - on device it aborts with nothing pointing at the host tool."""
     with pytest.raises(ProvisionError, match="STALE HOST wb_keygen") as e:
         assert_light_blob(_blob(version=3, tier=0), tool="/path/to/old/wb_keygen")
     assert "v3" in str(e.value) and "3.0.0" in str(e.value)
@@ -90,8 +90,8 @@ def test_one_pack_key_serves_many_targets_with_distinct_session_keys():
     """The whole point of the v3 split: N targets share ONE sealed blob (so the APK carries it
     once instead of N times) but each gets its OWN session key and nonce.
 
-    Per-target session keys are what keep the documented ceiling — "a process dump yields the
-    *session* key" — scoped to one library rather than all of them, and they make keystream reuse
+    Per-target session keys are what keep the documented ceiling - "a process dump yields the
+    *session* key" - scoped to one library rather than all of them, and they make keystream reuse
     impossible by construction instead of by relying on nonce uniqueness."""
     from sopack.provision import provision_pack, provision_text
 
@@ -110,14 +110,14 @@ def test_one_pack_key_serves_many_targets_with_distinct_session_keys():
     # ...and the wrap IV is fresh each time (CTR under one KEK with a repeated IV would leak
     # the XOR of the two session keys).
     assert a.wrapped[:16] != b.wrapped[:16]
-    # No blob or passphrase per target any more — they live once, in the pack key.
+    # No blob or passphrase per target any more - they live once, in the pack key.
     assert not hasattr(a, "blob") and not hasattr(a, "wpass")
 
 
 @_needs_wb_keygen
 def test_pack_key_never_exposes_the_long_term_key():
     """`kek` is host-only. It must not be derivable from anything that ships (`blob`, `wpass`),
-    and in particular must not appear verbatim in them — the white-box's entire claim is that
+    and in particular must not appear verbatim in them - the white-box's entire claim is that
     the long-term key is not reconstructable from the shipped bytes."""
     from sopack.provision import provision_pack
 

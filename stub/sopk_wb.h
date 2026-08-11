@@ -1,5 +1,5 @@
 /*
- * sopk_wb.h — the ONE symbol the shared white-box provider exports, and its
+ * sopk_wb.h - the ONE symbol the shared white-box provider exports, and its
  * contract.
  *
  * `--cipher wbaes` ships two hand-built artifacts per ABI:
@@ -17,11 +17,11 @@
  * loads; a library dlopen'd later (Flutter's libapp.so) would never be
  * decrypted, and the helper fails closed. Keeping one thin helper per target is
  * the only thing that makes "is my target mapped when my ctor runs?"
- * answerable. The provider is shared, but it is not a trigger — it has NO
+ * answerable. The provider is shared, but it is not a trigger - it has NO
  * constructor and does all its work lazily inside the call below, so there is
  * no ordering question about it at all.
  *
- * See docs/wbaes-verification.md Phase 4 for the two build commands. The
+ * See docs/technical/WBAES.md Phase 4 for the two build commands. The
  * provider's is the one that needs clang++, -static-libstdc++,
  * --exclude-libs,ALL and -Wl,-soname.
  */
@@ -37,7 +37,7 @@
 #define SOPK_WB_ABI 3u
 
 /* Provider reason codes. 0 == success. The thin helper folds a non-zero value
- * into its own fail code as (10 + reason), i.e. the 10..19 band — see
+ * into its own fail code as (10 + reason), i.e. the 10..19 band - see
  * sopk_rt.c. */
 enum {
   SOPK_WB_OK = 0,
@@ -65,9 +65,9 @@ enum {
  * wbc_unwrap_key -> wbc_close. Nothing is cached. That costs ~1 ms per call at
  * the `light` KDF tier and buys two things: the ~400 KB white-box VM image is
  * resident for microseconds instead of the whole process lifetime, and there is
- * no shared wbc_ctx — which matters because upstream documents wbc_ctx as NOT
+ * no shared wbc_ctx - which matters because upstream documents wbc_ctx as NOT
  * thread-safe. Caching it is a recorded, deliberately-deferred change; see
- * docs/potential-improvements.md before "optimising" this.
+ * docs/technical/IMPROVEMENTS.md before "optimising" this.
  *
  * NEVER ABORTS and never logs unless built with -DSOPK_RT_LOG. Failing closed
  * is the CALLER's job: this is a library, and the thin helper owns the abort so

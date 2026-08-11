@@ -1,4 +1,4 @@
-"""sopack — black-box Android .so encryptor / APK repackager.
+"""sopack - black-box Android .so encryptor / APK repackager.
 
 Given an APK and a list of native libraries, encrypts each library's `.text` and
 injects a freestanding runtime stub that decrypts it at load time (W^X / SELinux

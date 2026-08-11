@@ -11,7 +11,7 @@ non-aarch64 host), so it never blocks the pure-Python unit tests.
 
 The stub uses only standard Linux syscalls, so a green run here validates the whole
 runtime mechanism (mmap → decrypt → mremap-onto-original-base → mprotect → cache flush)
-on real ARM64 hardware — everything except Android's SELinux execmem policy.
+on real ARM64 hardware - everything except Android's SELinux execmem policy.
 """
 import ctypes
 import os
@@ -108,7 +108,7 @@ def test_no_init_lib_uses_inplace_dtinit(tmp_path):
 
 def test_init_array_no_dtinit_adds_dtinit_not_array_hijack(tmp_path):
     """A library with a DT_INIT_ARRAY but NO DT_INIT (the shape of Flutter's libflutter.so
-    and most C++ .so built with the Android NDK) must get a DT_INIT ADDED in place — never
+    and most C++ .so built with the Android NDK) must get a DT_INIT ADDED in place - never
     a DT_INIT_ARRAY[0] hijack.
 
     On PIC libraries every INIT_ARRAY slot is populated by an R_*_RELATIVE relocation at

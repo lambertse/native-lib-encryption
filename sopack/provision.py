@@ -1,15 +1,15 @@
 """Host-side provisioning for `--cipher wbaes` (wbcrypto 3.0.0 key wrapping).
 
-The white-box never touches bulk data — it runs at well under 1 MB/s, and 2.0.0 deleted
+The white-box never touches bulk data - it runs at well under 1 MB/s, and 2.0.0 deleted
 the bulk entry points (`wbc_crypt_ctr`, `wbc_encrypt_ecb`) to make that unexpressible. It
 protects a *key* instead. Per target `.text` we:
 
   1. generate a long-term AES-128 key `kek` and seal it into a passphrase-protected
      white-box blob with the host `wb_keygen` tool;
-  2. generate a 32-byte session key `sk` and wrap it under `kek` —
+  2. generate a 32-byte session key `sk` and wrap it under `kek` -
      `wrapped = wrap_iv || aes128_ctr(sk, kek, wrap_iv)`, which is byte-for-byte what
      the device's `wbc_wrap_key` would emit (see cipher.aes128_ctr for why);
-  3. encrypt `.text` with ChaCha20(sk, nonce16) — length-preserving, so the ciphertext
+  3. encrypt `.text` with ChaCha20(sk, nonce16) - length-preserving, so the ciphertext
      occupies the same bytes in the ELF and the device decrypts it in place;
   4. whiten the passphrase off the blob, and DISCARD both `kek` and `sk`.
 
@@ -18,20 +18,20 @@ reconstructable from the blob, and `sk` only exists on device between the white-
 unwrap and the wipe.
 
 `wb_keygen` is host-only and un-obfuscated (see the whitebox-cryptography repo
-scripts/gen_blob.sh). It must be a *host* build — an Android one does NOT run on the pack
+scripts/gen_blob.sh). It must be a *host* build - an Android one does NOT run on the pack
 host; provide it via `--wb-keygen`, `SOPACK_WBKEYGEN` or on `PATH`.
 
 THE KDF TIER (wbcrypto 3.0.0). 3.0.0 moved the seal's key-derivation cost out of a
 compile-time constant and into the blob header, selectable at seal time with
 `--kdf light|medium|heavy` (= `WBC_KDF_NONE`/`_LOW`/`_HIGH`). It is the ONLY dial on
 `wbc_open`'s latency: at `heavy` (the upstream DEFAULT, and the pre-3.0.0 behaviour) ~99% of
-an open is Argon2id — measured at 266 ms per library on device, plus a transient 64 MiB
+an open is Argon2id - measured at 266 ms per library on device, plus a transient 64 MiB
 allocation, inside an ELF constructor at app startup. sopack pins `light` (HKDF-SHA256).
 
 That is **security-neutral here**, not a weakening. Argon2id exists to make each passphrase
 GUESS expensive. Our passphrase is 128 bits of machine entropy that SHIPS in the helper
 beside the blob, and its whitening key is derived from that blob's own first WHITEN_SPAN
-bytes — so an attacker holding the APK holds the passphrase and guesses nothing. `light` is
+bytes - so an attacker holding the APK holds the passphrase and guesses nothing. `light` is
 the correct construction for a high-entropy machine secret; upstream documents the >= 128-bit
 precondition, which `secrets.token_hex(16)` below meets exactly. The tier also lives inside
 the seal's AEAD associated data, so a shipped blob cannot be tier-downgraded: rewriting the
@@ -63,16 +63,16 @@ _MACHO_MAGICS = (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce",
 # ---- sealed blob header (wbcrypto >= 3.0.0) ---------------------------------------------
 # Mirrors src/storage/trusted_storage.cpp. v4 layout:
 #     magic[4] | version(u32) | kdf_tier(u32) | salt[16] | nonce[24] | ...
-# v4 *inserted* kdf_tier after version, shifting every later field — which is exactly why a
+# v4 *inserted* kdf_tier after version, shifting every later field - which is exactly why a
 # pre-3.0.0 blob is not merely "older", it is unreadable to a 3.0.0 runtime. Both u32s are
 # little-endian (`PutU32` emits `x & 0xFF` first). Verified against a real sealed blob.
 BLOB_MAGIC = b"WBTS"          # kMagic
 BLOB_MIN_VERSION = 4          # kVersion
 BLOB_TIER_OFF = 8             # kTierOff
-BLOB_HDR_MIN = 12             # kTierEnd — bytes needed before the tier is readable
+BLOB_HDR_MIN = 12             # kTierEnd - bytes needed before the tier is readable
 KDF_TIER_NONE = 0             # KdfTier::kNone  ("light", HKDF-SHA256)
 KDF_TIER_LOW = 1              # KdfTier::kLow   ("medium", Argon2id 16 MiB)
-KDF_TIER_HIGH = 2             # KdfTier::kHigh  ("heavy", Argon2id 64 MiB) — wb_keygen's DEFAULT
+KDF_TIER_HIGH = 2             # KdfTier::kHigh  ("heavy", Argon2id 64 MiB) - wb_keygen's DEFAULT
 _TIER_NAMES = {KDF_TIER_NONE: "light", KDF_TIER_LOW: "medium", KDF_TIER_HIGH: "heavy"}
 
 
@@ -102,7 +102,7 @@ def assert_light_blob(blob: bytes, *, tool: str) -> None:
 
     `version >= BLOB_MIN_VERSION` is deliberate, not sloppiness: a future v5 that keeps the
     tier where it is should not brick the packer. (Upstream's own `PeekTier` is exact-match, so
-    a v5 blob would be rejected on device — but that is upstream's call to relax, not ours to
+    a v5 blob would be rejected on device - but that is upstream's call to relax, not ours to
     pre-empt by refusing to pack.)"""
     magic, version, tier = blob_header(blob)
     if magic != BLOB_MAGIC:
@@ -121,7 +121,7 @@ def assert_light_blob(blob: bytes, *, tool: str) -> None:
         raise ProvisionError(
             f"sealed blob was sealed at KDF tier {tier} "
             f"({_TIER_NAMES.get(tier, 'unknown')}), expected {KDF_TIER_NONE} (light). "
-            f"wb_keygen DEFAULTS to heavy, so this means `--kdf light` did not reach it — a "
+            f"wb_keygen DEFAULTS to heavy, so this means `--kdf light` did not reach it - a "
             f"sopack bug in provision._seal, not a problem with {tool}. Shipping it would "
             f"cost ~266 ms of Argon2id and a transient 64 MiB per library at app startup.")
 
@@ -157,21 +157,21 @@ class PackKey:
     """One long-term key per (pack, ABI), shared by every target in that ABI.
 
     Why per-ABI rather than per-pack: the blob is architecture-neutral, but one blob across ABIs
-    would let the x86_64 provider — which is unobfuscated and ships cleartext `.text` by scope
-    choice — carry the same long-term key that protects arm64. One extra `wb_keygen` run removes
+    would let the x86_64 provider - which is unobfuscated and ships cleartext `.text` by scope
+    choice - carry the same long-term key that protects arm64. One extra `wb_keygen` run removes
     that cross-ABI leak.
 
     `kek` lives in the pack process for the whole run (it must, to wrap each target's session
-    key) and is never written to any output — `_self_verify_wbaes` byte-scans for it. Only
+    key) and is never written to any output - `_self_verify_wbaes` byte-scans for it. Only
     `blob` and `wpass` ship, both in that ABI's single `libsopk_wb.so`."""
-    kek: bytes             # 16-byte AES-128 long-term key. HOST-ONLY — never shipped.
+    kek: bytes             # 16-byte AES-128 long-term key. HOST-ONLY - never shipped.
     blob: bytes            # sealed white-box blob (ships in the shared provider)
     wpass: bytes           # whitened passphrase (ships in the shared provider, beside the blob)
 
 
 @dataclass
 class Provisioned:
-    """Per-target results. Carries no blob/passphrase since v3 — see PackKey."""
+    """Per-target results. Carries no blob/passphrase since v3 - see PackKey."""
     ciphertext: bytes      # ChaCha20(sk, nonce16) of the .text plaintext (ships in the lib)
     wrapped: bytes         # 48 bytes: wrap IV || session key wrapped under the pack's kek
     nonce16: bytes         # 16-byte ChaCha20 nonce block (12-byte nonce + LE counter)
@@ -194,7 +194,7 @@ def find_wb_keygen(explicit: str | None = None) -> str:
            "(scripts/gen_blob.sh -> build-host/wb_keygen) and pass --wb-keygen / set "
            "SOPACK_WBKEYGEN, or put it on PATH.")
     if bad:
-        msg += f" (the one found is not runnable here — {bad})"
+        msg += f" (the one found is not runnable here - {bad})"
     raise FileNotFoundError(msg)
 
 
@@ -241,16 +241,16 @@ def _seal(key: bytes, passphrase: str, seed: int, wb_keygen: str) -> bytes:
 
 def provision_pack(wb_keygen: str | None = None) -> PackKey:
     """Seal ONE long-term key for a whole (pack, ABI). Call once per ABI, before the per-target
-    loop — `apk.py:repackage` is the only place that knows the full target set.
+    loop - `apk.py:repackage` is the only place that knows the full target set.
 
     Provision every ABI *before* writing any output. `_seal` runs the host `wb_keygen` and gates
     its blob (`assert_light_blob`), so a stale pre-3.0.0 tool fails here; doing that up front
     means it fails before the packer has produced a partial APK."""
     tool = find_wb_keygen(wb_keygen)
     kek = gen_wbaes_params()[0]
-    # 32 hex chars — argv-safe, < SOPK_MAX_PASS. The 16 bytes are load-bearing: exactly 128
+    # 32 hex chars - argv-safe, < SOPK_MAX_PASS. The 16 bytes are load-bearing: exactly 128
     # bits of uniform machine entropy, which is the precondition WBC_KDF_NONE ("light")
-    # documents. Do NOT shorten it — at this tier there is no KDF stretching to compensate.
+    # documents. Do NOT shorten it - at this tier there is no KDF stretching to compensate.
     passphrase = secrets.token_hex(16)
     blob = _seal(kek, passphrase, secrets.randbits(64), tool)
     return PackKey(kek=kek, blob=blob, wpass=whiten_pass(passphrase.encode("ascii"), blob))
@@ -270,7 +270,7 @@ def provision_text(plain: bytes, pack: PackKey) -> Provisioned:
     wrapped = wrap_iv + aes128_ctr(sk, pack.kek, wrap_iv)
     ciphertext = apply_cipher(CIPHER_CHACHA20, plain, sk, nonce16)
     # `sk` is deliberately NOT "wiped" here. Rebinding it would drop our reference without
-    # overwriting the `bytes` object, so it would only look diligent — CPython gives no way to
+    # overwriting the `bytes` object, so it would only look diligent - CPython gives no way to
     # scrub an immutable value. It dies with the frame; what actually matters is that neither it
     # nor `pack.kek` is ever written to the output (asserted by _self_verify_wbaes).
     return Provisioned(ciphertext=ciphertext, wrapped=wrapped, nonce16=nonce16)

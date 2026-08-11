@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# _common.sh — shared preflight / prompt / reporting helpers for scripts/build_<cipher>.sh.
+# _common.sh - shared preflight / prompt / reporting helpers for scripts/build_<cipher>.sh.
 # Sourced, never executed on its own.
 #
 # Bash 3.2 compatible on purpose: macOS still ships /bin/bash 3.2, and that is the primary
@@ -21,7 +21,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # need TOOL ["why it is needed"]
 need() {
-    have "$1" || die "missing required tool: $1${2:+ — $2}"
+    have "$1" || die "missing required tool: $1${2:+ - $2}"
 }
 
 # ask_path VAR "prompt" VALIDATOR ["hint on failure"]
@@ -30,7 +30,7 @@ need() {
 # prompting. VALIDATOR is a function name invoked with the candidate path; it must explain the
 # problem on stderr and return non-zero when the path is unusable.
 #
-# Deliberately dies rather than prompting when stdin is not a terminal — a build script that
+# Deliberately dies rather than prompting when stdin is not a terminal - a build script that
 # blocks forever waiting on a read is worse than one that fails with a usage message.
 ask_path() {
     local var="$1" prompt="$2" validator="$3" hint="${4:-}"

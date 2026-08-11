@@ -30,7 +30,7 @@ def test_pack_unpack_roundtrip():
 
 def test_whiten_is_self_inverse():
     """Whitening is XOR with a keystream, so applying it twice with the same span is the
-    identity — this is exactly what the injector (whiten) and the stub (de-whiten) rely on."""
+    identity - this is exactly what the injector (whiten) and the stub (de-whiten) rely on."""
     span = os.urandom(WHITEN_SPAN)
     record = os.urandom(SIZE)
     assert whiten(whiten(record, span), span) == record

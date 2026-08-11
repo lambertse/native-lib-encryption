@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# build_chacha20.sh — get the freestanding-stub ciphers (`--cipher chacha20`, `--cipher xor`)
+# build_chacha20.sh - get the freestanding-stub ciphers (`--cipher chacha20`, `--cipher xor`)
 # to a packable state: build the per-ABI stub blobs, run the tests, print the pack command.
 #
 # Deliberately thin, and that is the point of comparing it with build_wbaes.sh: the stub ciphers
 # need no provisioning, no second repo and no per-ABI helper. Their key ships inside the library
-# (whitened at rest), which is exactly the weakness `--cipher wbaes` exists to remove — at the
+# (whitened at rest), which is exactly the weakness `--cipher wbaes` exists to remove - at the
 # cost of everything build_wbaes.sh has to check.
 #
 # Usage:
@@ -44,7 +44,7 @@ done
 say "preflight"
 need python3
 ( cd "$SOPACK" && python3 -c 'import sopack' >/dev/null 2>&1 ) \
-    || die "cannot import sopack from $SOPACK — run: pip install -e ."
+    || die "cannot import sopack from $SOPACK - run: pip install -e ."
 
 NDK="${NDK_ARG:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${NDK:-}}}}"
 if [ -n "$NDK" ]; then
@@ -61,9 +61,9 @@ fi
 # Note this REWRITES tracked files: sopack/stubs/stub_<abi>.bin/.json are package data and are
 # committed. Rebuilding with a different LLVM produces different (still valid) blobs, so expect
 # a dirty tree afterwards and only commit them if you meant to.
-say "building the per-ABI stub blobs (api $API) — this rewrites tracked sopack/stubs/stub_*"
+say "building the per-ABI stub blobs (api $API) - this rewrites tracked sopack/stubs/stub_*"
 ( cd "$SOPACK" && bash stub/build_stubs.sh "$API" ) \
-    || die "stub/build_stubs.sh failed — it hard-fails on any relocation, undefined symbol or
+    || die "stub/build_stubs.sh failed - it hard-fails on any relocation, undefined symbol or
        (arm64) adrp, which is deliberate: the stub has no load bias and cannot tolerate them"
 
 for f in "$SOPACK"/sopack/stubs/stub_*.bin; do
@@ -98,5 +98,5 @@ cat <<EOF
   --log makes the stub emit a logcat confirmation line; drop it for a silent stub.
 
 Unlike --cipher wbaes, the key ships inside each packed library (whitened, not plaintext).
-See docs/architecture.md §9 for what that does and does not buy you.
+See docs/technical/ARCHITECTURE.md §9 for what that does and does not buy you.
 EOF

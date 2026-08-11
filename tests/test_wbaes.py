@@ -2,19 +2,19 @@
 
 Three tiers, deliberately:
 
-* Everything driven by `tests/fixtures/mini_arm64.so` runs with **no setup at all** — it is a
+* Everything driven by `tests/fixtures/mini_arm64.so` runs with **no setup at all** - it is a
   committed 50 KB aarch64 `.so` built for this purpose (see `mini_arm64.c` for the three
   properties it must keep). That covers the guards and the `.dynstr` re-sort behaviour that
   the whole mode depends on.
 * The two full-injection tests additionally need a **host** `wb_keygen`, because `--cipher
   wbaes` seals a real white-box blob and there is no way to fake that meaningfully. They skip
   without one.
-* The strip tests need a compiler that emits **ELF** — not merely a compiler. macOS `cc`
+* The strip tests need a compiler that emits **ELF** - not merely a compiler. macOS `cc`
   produces Mach-O, so there `_elf_cc` falls back to the NDK's clang if `ANDROID_NDK_HOME` is
   set, and they skip if it is not.
 
 The on-device decrypt is validated separately: the host round-trip probe in
-`docs/wbaes-verification.md` Phase 3, then Phase 6 on a device.
+`docs/technical/WBAES.md` Phase 3, then Phase 6 on a device.
 """
 import functools
 import glob
@@ -90,8 +90,8 @@ def _marked_provider(tmp_path, src=FIXTURE, soname=None) -> pathlib.Path:
 
 def _wire_provider(monkeypatch):
     """Make a mock provider satisfy the guards a real linker would satisfy: it must EXPORT
-    sopk_wb_k. The expectation genuinely inverts for this artifact — a thin helper exports
-    nothing — so this is patched rather than faked into the fixture.
+    sopk_wb_k. The expectation genuinely inverts for this artifact - a thin helper exports
+    nothing - so this is patched rather than faked into the fixture.
 
     Discriminates by the file's own DT_SONAME, not its path, so it covers both the skeleton and
     the emitted copy (whose filename the packer chooses) while leaving the thin helper in the
@@ -117,7 +117,7 @@ def _target_region(soname: bytes = b"libtarget.so") -> bytes:
 def _wire_thin(monkeypatch, undefined=(), needed=()):
     """Make a mock thin-helper skeleton satisfy the v3 pairing guards.
 
-    Since the provider split, a thin helper must DT_NEEDED libsopk_wb.so and import sopk_wb_k —
+    Since the provider split, a thin helper must DT_NEEDED libsopk_wb.so and import sopk_wb_k -
     real linker output that a checked-in fixture cannot have. Tests that want to exercise a
     DIFFERENT guard patch these so the pairing checks pass and the guard under test is what
     fires; pass `undefined`/`needed` to add the symbols that test cares about."""
@@ -125,7 +125,7 @@ def _wire_thin(monkeypatch, undefined=(), needed=()):
 
     def needed_names(binary):
         # Only a THIN helper gains the provider dependency. The provider itself must stay
-        # bionic-only, and a blanket patch would hide that asymmetry — which is one of the
+        # bionic-only, and a blanket patch would hide that asymmetry - which is one of the
         # things the guards are for.
         if elf_inject._dynamic_soname(binary) == PROVIDER_SONAME:
             return real_needed(binary)
@@ -147,8 +147,8 @@ def test_lief_reorders_dynstr_on_write(tmp_path):
     """`_effective_strtab` exists because LIEF rebuilds `.dynstr` **sorted** during `write()`
     and rewrites every `st_name` to match. Pin that behaviour directly: if a future LIEF
     stopped reordering, this test failing is the signal that the appended-copy dance can be
-    simplified — and if it still reorders, taking the table from the pre-write section is
-    still wrong. See docs/architecture.md §11f."""
+    simplified - and if it still reorders, taking the table from the pre-write section is
+    still wrong. See docs/technical/ARCHITECTURE.md §11f."""
     pre = bytes(lief.parse(FIXTURE).get_section(".dynstr").content)
     b = lief.parse(FIXTURE)
     seg = lief.ELF.Segment()
@@ -161,7 +161,7 @@ def test_lief_reorders_dynstr_on_write(tmp_path):
     b.write(out)
 
     post = elf_inject._effective_strtab(out)
-    assert pre != post, "LIEF no longer reorders .dynstr — revisit _effective_strtab"
+    assert pre != post, "LIEF no longer reorders .dynstr - revisit _effective_strtab"
     # same strings, different order: that is exactly what desynchronises the offsets
     assert sorted(pre.split(b"\x00")) == sorted(post.split(b"\x00"))
 
@@ -202,7 +202,7 @@ def test_dynsym_count_handles_a_gnu_hash_only_lib():
     `DT_HASH`'s `nchain`; the fixture is such a library. Cross-check against the section
     header, which is independent of the dynamic tags."""
     v = elf_inject._LoaderView(FIXTURE)
-    assert 4 not in v.tags, "fixture gained a DT_HASH — it no longer covers this branch"
+    assert 4 not in v.tags, "fixture gained a DT_HASH - it no longer covers this branch"
     assert 0x6FFFFEF5 in v.tags
     assert v.dynsym_count() == lief.parse(FIXTURE).get_section(".dynsym").size // 24
     assert len(_dynsym_names(FIXTURE)) == 3
@@ -210,7 +210,7 @@ def test_dynsym_count_handles_a_gnu_hash_only_lib():
 
 def test_16k_failure_blames_the_input_when_the_input_is_at_fault(tmp_path):
     """`_assert_16k_and_no_textrel` fires on the packed output, but the offending LOAD segment is
-    often inherited from the input — and then no packer fix can help. A bare
+    often inherited from the input - and then no packer fix can help. A bare
     "LOAD seg align 4096" sent a reader hunting for an injection bug that was not there, so the
     two causes must read differently.
 
@@ -253,8 +253,8 @@ def test_fixture_keeps_the_properties_the_tests_depend_on():
 
 @_needs_wb_keygen
 def test_self_verify_catches_a_desynced_string_table(monkeypatch, tmp_path):
-    """Reintroduce the shipped bug — take `.dynstr` from the PRE-write section, as the
-    original code did — and assert the pack FAILS rather than producing an APK that loads and
+    """Reintroduce the shipped bug - take `.dynstr` from the PRE-write section, as the
+    original code did - and assert the pack FAILS rather than producing an APK that loads and
     then crashes. Tests the guard, not the fix, so a refactor cannot quietly drop it."""
     monkeypatch.setattr(elf_inject, "helper_skeleton_path",
                         lambda abi: _marked_skeleton(tmp_path))
@@ -274,9 +274,9 @@ def test_wbaes_injection_surgery(monkeypatch, tmp_path):
     tight libraries), and emit the per-target helper carrying the region.
 
     Runs against the committed fixture only. A variant against a large real library used to run
-    from `assets/`, but that directory is gitignored, so what it tested varied by machine — and
+    from `assets/`, but that directory is gitignored, so what it tested varied by machine - and
     some LIEF versions add a 4 KB-aligned segment to a big library, failing the 16 KB assertion
-    below for reasons that are neither sopack's nor the test's. See docs/troubleshooting.md."""
+    below for reasons that are neither sopack's nor the test's. See docs/TROUBLESHOOTING.md."""
     src = FIXTURE
     monkeypatch.setattr(elf_inject, "helper_skeleton_path",
                         lambda abi: _marked_skeleton(tmp_path, src))
@@ -362,7 +362,7 @@ _BUILD_FLAGS = ("-g", "-O1", "-fPIC", "-shared")     # -g: there must be somethi
 
 def _ndk_clang():
     """The NDK's clang, if the environment points at an NDK. It cross-compiles ELF from any
-    host, which is the whole reason it is here — see `_elf_cc`. The prebuilt directory is
+    host, which is the whole reason it is here - see `_elf_cc`. The prebuilt directory is
     globbed rather than derived from `uname`, because on Apple Silicon the only toolchain an
     NDK ships is `darwin-x86_64`, run under Rosetta."""
     root = (os.environ.get("ANDROID_NDK_HOME") or os.environ.get("ANDROID_NDK_ROOT")
@@ -384,8 +384,8 @@ def _elf_cc():
     `.o` files instead of the linked image, and `_strip_nonalloc` refuses it on the `\\x7fELF`
     check. All three assumptions these tests make are wrong there at once.
 
-    Prefer the host's own compiler when it emits ELF — that fixture is also *loadable*, which
-    `_elf_so(native=True)` needs — and otherwise cross-compile for arm64 Android, which is the
+    Prefer the host's own compiler when it emits ELF - that fixture is also *loadable*, which
+    `_elf_so(native=True)` needs - and otherwise cross-compile for arm64 Android, which is the
     target the shipped helper is built for anyway. Probes the output rather than the platform,
     so any host that does emit ELF is used as-is."""
     candidates = [[_HOST_CC], [_ndk_clang(), "--target=aarch64-linux-android24"]]
@@ -451,7 +451,7 @@ def test_strip_removes_debug_and_symbols_but_keeps_the_loader_view(tmp_path):
     assert b".debug_info" not in raw, "dropped section NAMES should go too"
 
     # The surviving links must still name the right sections. On this fixture the check is weak
-    # by construction — a real toolchain puts every strippable section at the END of the table,
+    # by construction - a real toolchain puts every strippable section at the END of the table,
     # so the index remap is an identity and a bug in it would not show up here. The remap itself
     # is exercised by test_strip_handles_elf32_and_remaps_section_indices, which deliberately
     # drops a section that comes FIRST.
@@ -468,8 +468,8 @@ def test_strip_removes_debug_and_symbols_but_keeps_the_loader_view(tmp_path):
 
 def test_a_stripped_library_still_loads(tmp_path):
     """The one check that matters and that no amount of ELF parsing can substitute for: a real
-    loader accepts the result and its exports still resolve. Host `dlopen` is not bionic — the
-    §Method 3 post-mortem records glibc accepting files bionic refused — so this proves the
+    loader accepts the result and its exports still resolve. Host `dlopen` is not bionic - the
+    §Method 3 post-mortem records glibc accepting files bionic refused - so this proves the
     surgery is sane, not that it is Android-safe. Phase 6 on a device is still required."""
     lib = _elf_so(tmp_path, native=True)
     elf_inject._strip_nonalloc(str(lib))
@@ -513,7 +513,7 @@ def test_strip_refuses_a_library_with_no_section_table(tmp_path):
 
 def test_emit_helper_refuses_a_tracing_skeleton(monkeypatch, tmp_path):
     """A `-DSOPK_RT_LOG` helper logs the target soname, `.text` RVA and size, and a final "OK"
-    to logcat — which is the exact address and length to dump, plus confirmation the dump is
+    to logcat - which is the exact address and length to dump, plus confirmation the dump is
     valid. A real APK shipped that way, so refuse it by default."""
     monkeypatch.setattr(elf_inject, "helper_skeleton_path",
                         lambda abi: _marked_skeleton(tmp_path))
@@ -540,7 +540,7 @@ def test_allow_helper_log_permits_a_tracing_skeleton_but_warns_loudly(monkeypatc
 
 def test_emit_helper_refuses_a_skeleton_that_reexports_the_white_box(monkeypatch, tmp_path):
     """`WBC_API` visibility is baked into libwbcrypto.a's objects, so `-fvisibility=hidden`
-    cannot hide it — only `--exclude-libs,ALL` can. Phase 4 checks this, but Phase 4 is a
+    cannot hide it - only `--exclude-libs,ALL` can. Phase 4 checks this, but Phase 4 is a
     script the user can skip, and the skeleton is built by hand."""
     monkeypatch.setattr(elf_inject, "helper_skeleton_path",
                         lambda abi: _marked_skeleton(tmp_path))
@@ -555,7 +555,7 @@ def test_emit_helper_refuses_a_skeleton_that_reexports_the_white_box(monkeypatch
 def test_emitted_helper_is_stripped_and_keeps_its_dynamic_symbols(monkeypatch, tmp_path):
     """End-to-end through `_emit_helper`: the emitted helper carries no non-ALLOC sections, and
     its dynamic symbol names are byte-identical to the skeleton's. The second half matters
-    because `_undefined_dynsyms` — the guard that catches a 1.x archive — reads exactly that
+    because `_undefined_dynsyms` - the guard that catches a 1.x archive - reads exactly that
     table, so a desync would silently empty the guard rather than break anything visibly."""
     skel = _marked_skeleton(tmp_path)
     monkeypatch.setattr(elf_inject, "helper_skeleton_path", lambda abi: skel)
@@ -573,7 +573,7 @@ def test_emitted_helper_is_stripped_and_keeps_its_dynamic_symbols(monkeypatch, t
 def test_host_path_detector_finds_a_leaked_build_path():
     """The report found `/Users/<name>/src/.../libsodium-1.0.20/...` in a shipped helper. Those
     strings come from `__FILE__`/DWARF; the ones in mapped sections need the archive rebuilt
-    with `-ffile-prefix-map`, so the packer can only warn — but it has to spot them first."""
+    with `-ffile-prefix-map`, so the packer can only warn - but it has to spot them first."""
     assert elf_inject._host_paths_in(
         b"\x00/Users/someone/src/whitebox-cryptography/src/sdk/wbcrypto.cpp\x00")
     assert elf_inject._host_paths_in(b"junk /home/dev/project/third_party/libsodium/x.c junk")
@@ -585,7 +585,7 @@ def _synthetic_elf32(path, sections):
 
     The armeabi-v7a helper would be ELF32, and `_strip_nonalloc` carries a second set of
     struct offsets for that class. No 32-bit host toolchain is assumed to exist, so exercise
-    those offsets directly rather than leaving the branch untested — a wrong offset here would
+    those offsets directly rather than leaving the branch untested - a wrong offset here would
     silently corrupt a v7a helper. `sections` is [(name, sh_flags, payload, sh_link)], where
     `sh_link` is an index into `sections` (1-based, matching the on-disk table's leading null
     entry) or 0 for none.
@@ -629,7 +629,7 @@ def test_strip_handles_elf32_and_remaps_section_indices(tmp_path):
 
     Index remapping: `sh_link`/`sh_info` hold section INDICES, so every one shifts when earlier
     entries are removed. On a normal toolchain layout the strippable sections all sit at the END
-    of the table, which makes the remap an identity and hides a bug in it — so this fixture puts
+    of the table, which makes the remap an identity and hides a bug in it - so this fixture puts
     a dropped section FIRST, before a kept `.dynsym` whose `sh_link` must follow `.dynstr` down
     by one. A stale `sh_link` would leave `.dynsym` pointing at whatever now occupies the old
     index, which no other check here would notice.
@@ -674,7 +674,7 @@ def test_strip_handles_elf32_and_remaps_section_indices(tmp_path):
 
 def _fake_pack(blob_extra=64):
     """A PackKey with a plausible blob (>= WHITEN_SPAN, so the whitening key can be derived) but
-    no real white-box — these tests exercise emit_provider's guards, not the crypto."""
+    no real white-box - these tests exercise emit_provider's guards, not the crypto."""
     from sopack.provision import PackKey
     blob = os.urandom(cipher.WHITEN_SPAN + blob_extra)
     return PackKey(kek=os.urandom(16), blob=blob,
@@ -683,13 +683,13 @@ def _fake_pack(blob_extra=64):
 
 def test_emit_provider_refuses_a_wrong_soname(monkeypatch, tmp_path):
     """The single most dangerous new coupling. Each thin helper's DT_NEEDED string is whatever
-    the LINKER recorded as the provider's DT_SONAME, so the packer cannot correct a wrong one —
+    the LINKER recorded as the provider's DT_SONAME, so the packer cannot correct a wrong one -
     it can only refuse. Without -Wl,-soname, lld records the file PATH it was handed, which
     produces an APK that cannot load."""
     prov = _marked_provider(tmp_path, soname="sopk_wb_arm64-v8a.so")   # a path-shaped soname
     monkeypatch.setattr(elf_inject, "provider_skeleton_path", lambda abi: prov)
     # Patched unconditionally rather than via _wire_provider, which keys off the very soname
-    # this test deliberately gets wrong — otherwise the export check fires first and the
+    # this test deliberately gets wrong - otherwise the export check fires first and the
     # assertion below would pass for the wrong reason.
     monkeypatch.setattr(elf_inject, "_exported_dynsyms", lambda path: [PROVIDER_ENTRY])
     with pytest.raises(InjectError, match="-Wl,-soname"):

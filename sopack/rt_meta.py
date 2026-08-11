@@ -14,7 +14,7 @@ blob. v2 = key wrapping (wbcrypto 2.0.0); v1 carried a bare AES-CTR `iv` and rel
 `wbc_crypt_ctr`, which 2.0.0 deleted.
 
 WARNING FOR ANYONE EDITING `TargetRegion`: v3 kept the header at 96 bytes and `_FMT` textually
-identical — `pass_len`/`blob_len` were replaced by `flags`/`reserved` of the same widths. So
+identical - `pass_len`/`blob_len` were replaced by `flags`/`reserved` of the same widths. So
 `HDR_SIZE == 96` and a literal-`_FMT` assertion do NOT detect v2/v3 drift. The **magic** is what
 does; keep the `b"SRTT"` and version-3 assertions in tests/test_rt_meta.py.
 """
@@ -51,7 +51,7 @@ PROVIDER_ABI = REGION_VERSION
 # without them, turning that into a pack-time error that names the rebuild.
 #
 # The two values are deliberately DIFFERENT. With one shared marker, "fresh thin helper + stale
-# provider" would pass both guards — and that mismatched pair is the real failure mode now that
+# provider" would pass both guards - and that mismatched pair is the real failure mode now that
 # two artifacts must be rebuilt together.
 #
 # Bumped ONCE for the two changes that landed together: the wbcrypto 3.0.0 migration (the
@@ -77,7 +77,7 @@ assert WB_HDR_SIZE == 24, f"sopk_wb_region header drift: {WB_HDR_SIZE} != 24"
 
 @dataclass
 class TargetRegion:
-    """Per-target metadata, appended to one thin helper. Carries no blob and no passphrase —
+    """Per-target metadata, appended to one thin helper. Carries no blob and no passphrase -
     those live once, in the shared provider's WbRegion."""
     text_rva: int
     text_size: int
@@ -103,7 +103,7 @@ class TargetRegion:
         # unpacking first would raise struct.error and hide which artifact was passed.
         if len(data) >= 4 and data[:4] == WB_REGION_MAGIC.to_bytes(4, "little"):
             raise ValueError(
-                "this is a PROVIDER region ('SRTW'), not a target region ('SRTT') — the "
+                "this is a PROVIDER region ('SRTW'), not a target region ('SRTT') - the "
                 "two artifacts were mixed up")
         if len(data) < HDR_SIZE:
             raise ValueError(
@@ -113,7 +113,7 @@ class TargetRegion:
         if magic != TARGET_REGION_MAGIC:
             if magic == WB_REGION_MAGIC:
                 raise ValueError(
-                    "this is a PROVIDER region ('SRTW'), not a target region ('SRTT') — the "
+                    "this is a PROVIDER region ('SRTW'), not a target region ('SRTT') - the "
                     "two artifacts were mixed up")
             raise ValueError(f"bad sopk_rt_region magic 0x{magic:08x}")
         _check_version(version, "sopk_rt_region")
@@ -124,7 +124,7 @@ class TargetRegion:
 @dataclass
 class WbRegion:
     """The shared provider's metadata: one sealed blob and one whitened passphrase per (pack,
-    ABI). They MUST stay in the same artifact — the whitening key is derived from the blob's own
+    ABI). They MUST stay in the same artifact - the whitening key is derived from the blob's own
     first `cipher.WHITEN_SPAN` bytes (see cipher.whiten_pass)."""
     wpass: bytes
     blob: bytes
@@ -146,7 +146,7 @@ class WbRegion:
         if magic != WB_REGION_MAGIC:
             if magic == TARGET_REGION_MAGIC:
                 raise ValueError(
-                    "this is a TARGET region ('SRTT'), not a provider region ('SRTW') — the "
+                    "this is a TARGET region ('SRTT'), not a provider region ('SRTW') - the "
                     "two artifacts were mixed up")
             raise ValueError(f"bad sopk_wb_region magic 0x{magic:08x}")
         _check_version(version, "sopk_wb_region")
@@ -159,11 +159,11 @@ def _check_version(version: int, what: str) -> None:
     if version != REGION_VERSION:
         # The on-device ctor gates on an exact version match, and a mismatch means its self-scan
         # matches no segment at all: it aborts naming "no region" rather than "wrong version".
-        # So it does NOT fail open — but this host-side check is the only place the real cause
+        # So it does NOT fail open - but this host-side check is the only place the real cause
         # is stated.
         raise ValueError(
-            f"{what} version {version} != {REGION_VERSION} — the skeletons and the packer are "
-            f"from different versions; rebuild both (docs/wbaes-verification.md Phase 4)")
+            f"{what} version {version} != {REGION_VERSION} - the skeletons and the packer are "
+            f"from different versions; rebuild both (docs/technical/WBAES.md Phase 4)")
 
 
 # Historical name. v2 packed target fields and the blob together; v3 split them, so there is no

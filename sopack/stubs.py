@@ -52,7 +52,7 @@ def helper_skeleton_path(abi: str) -> Path:
     """Path to the user-built white-box helper skeleton for `abi`.
 
     A normal Android .so (NDK + O-MVLL) built from stub/sopk_rt.c. Since v3 it links NO
-    white-box — it calls into the shared provider below — so it is a few KB, not ~465 KB. The
+    white-box - it calls into the shared provider below - so it is a few KB, not ~465 KB. The
     packer clones it per target, renames its DT_SONAME, and appends the target region.
     See stub/sopk_rt.h."""
     if abi not in SUPPORTED_ABIS:
@@ -62,7 +62,7 @@ def helper_skeleton_path(abi: str) -> Path:
         raise StubMissingError(
             f"wbaes helper skeleton for {abi} not found ({p.name} in {_STUB_DIR}). Build "
             "it from stub/sopk_rt.c with the NDK + O-MVLL and drop it there "
-            "(docs/wbaes-verification.md Phase 4 step 4b — it links against the provider, so "
+            "(docs/technical/WBAES.md Phase 4 step 4b - it links against the provider, so "
             "build that first).")
     return p
 
@@ -71,7 +71,7 @@ def provider_skeleton_path(abi: str) -> Path:
     """Path to the user-built SHARED white-box provider skeleton for `abi`.
 
     Built from stub/sopk_wb.c, statically linking libwbcrypto.a. One per ABI, shared by every
-    thin helper in that ABI — it carries the single sealed blob and exports `sopk_wb_k`.
+    thin helper in that ABI - it carries the single sealed blob and exports `sopk_wb_k`.
 
     It must be linked with `-Wl,-soname,libsopk_wb.so`: each thin helper's DT_NEEDED string is
     whatever the linker recorded here, so without an explicit soname lld records this file's
@@ -84,5 +84,5 @@ def provider_skeleton_path(abi: str) -> Path:
             f"wbaes white-box provider skeleton for {abi} not found ({p.name} in {_STUB_DIR}). "
             "Build it from stub/sopk_wb.c with the NDK + O-MVLL, statically linking "
             "libwbcrypto.a and passing -Wl,-soname,libsopk_wb.so "
-            "(docs/wbaes-verification.md Phase 4 step 4a).")
+            "(docs/technical/WBAES.md Phase 4 step 4a).")
     return p

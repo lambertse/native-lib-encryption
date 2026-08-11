@@ -12,7 +12,7 @@ Per target .so:
   5. write the rebuilt ELF.
 
 The stub reaches `.text` and the original init at runtime via signed byte deltas from
-the address of the decinfo record (which it references PC-relatively) — so no load
+the address of the decinfo record (which it references PC-relatively) - so no load
 bias is needed. See stub/stub.c.
 
 Requires LIEF >= 0.15. LIEF's enum names shifted across versions; _E() shims that.
@@ -45,7 +45,7 @@ _BIONIC_ALLOWED = {
     "libEGL.so", "libGLESv2.so", "libGLESv3.so", "libvulkan.so", "libjnigraphics.so",
 }
 
-# 16 KB — mandatory max-page-size alignment for the injected LOAD segment so the lib
+# 16 KB - mandatory max-page-size alignment for the injected LOAD segment so the lib
 # still loads on 16 KB-page devices (Android 15+, Play requirement).
 SEGMENT_ALIGN = 16384
 
@@ -111,7 +111,7 @@ class InjectResult:
     helper_soname: str | None = None
     # wbaes only, and only when inject_so was called WITHOUT a pack_key: the shared provider
     # emitted alongside. apk.py passes a pack_key and emits one provider per ABI itself, so it
-    # gets None here — otherwise every target would emit a provider carrying a different blob.
+    # gets None here - otherwise every target would emit a provider carrying a different blob.
     provider_path: str | None = None
 
 
@@ -242,11 +242,11 @@ class _LoaderView:
     def dynsym_count(self) -> int | None:
         """Number of `.dynsym` entries.
 
-        `DT_HASH`'s `nchain` IS the count. Otherwise use the `.dynsym` SECTION header size —
+        `DT_HASH`'s `nchain` IS the count. Otherwise use the `.dynsym` SECTION header size -
         safe despite this class's rule, because sopack never moves or rewrites `.dynsym`: count
         from the untouched section header, strings from the relocated `DT_STRTAB`.
 
-        Deliberately NO `DT_GNU_HASH` fallback — it covers only defined exported symbols, so it
+        Deliberately NO `DT_GNU_HASH` fallback - it covers only defined exported symbols, so it
         under-counts (badly, for a library that exports nothing). See CLAUDE.md's invariant."""
         if _DT_HASH in self.tags:
             o = self.vaddr_to_off(self.tags[_DT_HASH])
@@ -274,13 +274,13 @@ class _LoaderView:
 
 
 def _needed_via_strtab(path: str) -> list[str]:
-    """Resolve DT_NEEDED names the way the LOADER does — via DT_STRTAB read from .dynamic
+    """Resolve DT_NEEDED names the way the LOADER does - via DT_STRTAB read from .dynamic
     (not the .dynstr section, which we may have superseded with a copy)."""
     return _LoaderView(path).needed()
 
 
 def _effective_strtab(path: str) -> bytes:
-    """The DT_STRTAB bytes as written — the table `.dynsym`'s st_name offsets actually index.
+    """The DT_STRTAB bytes as written - the table `.dynsym`'s st_name offsets actually index.
 
     Read this AFTER LIEF's write, never from a pre-write `.dynstr` section: LIEF rebuilds the
     string table with the strings sorted and rewrites every st_name to match, so the pre-write
@@ -297,7 +297,7 @@ def _walk_dynsyms(path: str, undefined_only: bool = False,
     """Dynamic symbol names, resolved exactly as `dlsym` would: `DT_SYMTAB` indexed against
     `DT_STRTAB`, count from `_LoaderView.dynsym_count`, section headers ignored.
 
-    `undefined_only` keeps just the `SHN_UNDEF` entries — what this `.so` needs the loader to
+    `undefined_only` keeps just the `SHN_UNDEF` entries - what this `.so` needs the loader to
     resolve for it; `defined_only` keeps the complement, what it offers others. Returns [] for a
     `.so` with no dynamic symbols at all, but RAISES if it has a `DT_SYMTAB` whose length cannot
     be established: every caller is a guard, and a guard that silently inspects nothing is how
@@ -324,13 +324,13 @@ def _walk_dynsyms(path: str, undefined_only: bool = False,
 
 
 def _dynsym_names(path: str) -> list[str]:
-    """Every dynamic symbol name — pins the invariant that an injection must never change the
+    """Every dynamic symbol name - pins the invariant that an injection must never change the
     target's exported symbol names (see `_self_verify_wbaes`)."""
     return _walk_dynsyms(path)
 
 
 def _undefined_dynsyms(path: str) -> list[str]:
-    """Symbols this `.so` imports — catches a helper skeleton linked against a 1.x
+    """Symbols this `.so` imports - catches a helper skeleton linked against a 1.x
     `libwbcrypto.a`, which links cleanly and then cannot load."""
     return _walk_dynsyms(path, undefined_only=True)
 
@@ -342,9 +342,9 @@ def _exported_dynsyms(path: str) -> list[str]:
 
 
 # Sections the loader never maps, so the helper has no business shipping them. This is NOT the
-# section-header stripping that docs/static-analysis-hardening.md §Method 3 researched and
+# section-header stripping that docs/technical/HARDENING.md §Method 3 researched and
 # rejected: that zeroed e_shoff/e_shnum, and bionic on Android 14+ refuses to load a library
-# with no section headers. Here the table itself stays valid — only its non-ALLOC entries go,
+# with no section headers. Here the table itself stays valid - only its non-ALLOC entries go,
 # and `.shstrtab` has to stay because e_shstrndx must point at a real string table.
 _KEEP_NONALLOC = frozenset({".shstrtab"})
 
@@ -362,7 +362,7 @@ def _strip_nonalloc(path: str) -> list[tuple[str, int]]:
     `(name, size)` for each section removed, largest first.
 
     On the arm64 skeleton the removed set is exactly `.symtab`, `.strtab`, `.comment` and the six
-    `.debug_*` sections — 2.7 MB of a 3.2 MB file, and the only place the `sopk_rt_ctor`/`wbc_*`/
+    `.debug_*` sections - 2.7 MB of a 3.2 MB file, and the only place the `sopk_rt_ctor`/`wbc_*`/
     VM-handler symbol names and the host build paths appear. A static-analysis report on a
     shipped APK named the unstripped helper as the single largest shortcut it had.
 
@@ -374,7 +374,7 @@ def _strip_nonalloc(path: str) -> list[tuple[str, int]]:
         content is gone, but a STORED APK entry still carries every zero.
     Nothing mapped moves here: only non-ALLOC content is touched, plus `.shstrtab` and the
     section header table, neither of which is covered by a `PT_LOAD`. That also means this is
-    NOT the section-header stripping bionic rejects (see `_KEEP_NONALLOC`) — the table stays,
+    NOT the section-header stripping bionic rejects (see `_KEEP_NONALLOC`) - the table stays,
     it just gets shorter and moves down."""
     with open(path, "rb") as f:
         buf = bytearray(f.read())
@@ -401,7 +401,7 @@ def _strip_nonalloc(path: str) -> list[tuple[str, int]]:
         PH_OFF, PH_FILESZ = 0x04, 0x10
     if e_shoff == 0 or e_shnum == 0:
         raise InjectError(
-            f"{os.path.basename(path)} has no section header table — bionic (Android 14+) "
+            f"{os.path.basename(path)} has no section header table - bionic (Android 14+) "
             "refuses to load such a library, so it cannot have come from this tool")
 
     def shdr(i: int) -> int:
@@ -447,7 +447,7 @@ def _strip_nonalloc(path: str) -> list[tuple[str, int]]:
             continue
         keep_end = max(keep_end, offs[i] + sizes[i])
 
-    # Erase dropped content wherever it lies — a dropped section below keep_end cannot be
+    # Erase dropped content wherever it lies - a dropped section below keep_end cannot be
     # truncated away, so zero it rather than leave readable DWARF in the shipped file.
     for i in dropped:
         if types[i] == _SHT_NOBITS:
@@ -541,15 +541,15 @@ def _check_wbaes_skeleton(skeleton: str, kind: str, allow_helper_log: bool) -> N
     # in .rodata (SHF_ALLOC), so it survives into the emitted artifact.
     #
     # The two kinds carry DIFFERENT markers on purpose. With one shared value, "freshly built
-    # thin helper + stale provider" would pass both guards — and that mismatched pair is the real
+    # thin helper + stale provider" would pass both guards - and that mismatched pair is the real
     # failure mode now that two artifacts must be rebuilt together. So name the file to rebuild.
     with open(skeleton, "rb") as f:
         if marker not in f.read():
             raise InjectError(
                 f"{kind} skeleton {name} lacks the v{REGION_VERSION} build marker "
-                f"({marker.hex()}) — it was built from an older {source}, so its region layout "
+                f"({marker.hex()}) - it was built from an older {source}, so its region layout "
                 f"or flow no longer matches this packer. Rebuild THIS artifact from the current "
-                f"{source} against whitebox-cryptography >= 3.0.0 (docs/wbaes-verification.md "
+                f"{source} against whitebox-cryptography >= 3.0.0 (docs/technical/WBAES.md "
                 f"{phase}, or run ./scripts/build_wbaes.sh --release, which builds both).")
 
     binary = lief.parse(skeleton)
@@ -558,7 +558,7 @@ def _check_wbaes_skeleton(skeleton: str, kind: str, allow_helper_log: bool) -> N
 
     # Dependency-closure guard. `_BIONIC_ALLOWED` means "provided by every Android device" and
     # must keep meaning exactly that, so the provider soname is added as ONE literal extra name
-    # for the thin kind only — never a pattern or prefix. Everything this guard was built to
+    # for the thin kind only - never a pattern or prefix. Everything this guard was built to
     # catch (a leaked libc++_shared.so from a non-static white-box, a dynamic libwbcrypto) is
     # still caught.
     allowed = _BIONIC_ALLOWED | ({PROVIDER_SONAME} if is_thin else set())
@@ -568,7 +568,7 @@ def _check_wbaes_skeleton(skeleton: str, kind: str, allow_helper_log: bool) -> N
         extra = (f" (besides bionic, a {kind} may depend only on {PROVIDER_SONAME})" if is_thin
                  else f" (a {kind} may depend only on bionic libs)")
         raise InjectError(
-            f"{kind} skeleton {name} has unexpected DT_NEEDED {stray}{extra} — the white-box "
+            f"{kind} skeleton {name} has unexpected DT_NEEDED {stray}{extra} - the white-box "
             "was not statically linked in (libwbcrypto/libc++/libsodium must be static). "
             "Rebuild the skeleton.")
     # POSITIVE containment, and this is new: a thin helper that lost its provider dependency
@@ -576,49 +576,49 @@ def _check_wbaes_skeleton(skeleton: str, kind: str, allow_helper_log: bool) -> N
     # dlopen down with it, nowhere near the cause.
     if is_thin and PROVIDER_SONAME not in needed:
         raise InjectError(
-            f"{kind} skeleton {name} does not depend on {PROVIDER_SONAME} — since the v3 split "
+            f"{kind} skeleton {name} does not depend on {PROVIDER_SONAME} - since the v3 split "
             f"it must call into the shared provider for its session key. It was probably linked "
-            f"without the provider .so as an input; see docs/wbaes-verification.md {phase}.")
+            f"without the provider .so as an input; see docs/technical/WBAES.md {phase}.")
     if not is_thin and any(n.startswith("libsopk_rt") for n in needed):
         raise InjectError(
-            f"{kind} skeleton {name} depends on a thin helper {needed} — the dependency runs the "
+            f"{kind} skeleton {name} depends on a thin helper {needed} - the dependency runs the "
             "other way, and a cycle would deadlock bionic's loader.")
 
     # A `-shared` link permits unresolved symbols, so a skeleton built against a pre-3.0.0
     # libwbcrypto.a (no wbc_blob_kdf_tier) links CLEANLY and leaves it as a UND import. bionic
     # then fails to load it, which makes dlopen of the TARGET fail, which surfaces as a crash in
-    # whatever was loading the target — nowhere near the cause.
+    # whatever was loading the target - nowhere near the cause.
     undefined = _undefined_dynsyms(skeleton)
     wb_unresolved = sorted({n for n in undefined if n.startswith(("wbc_", "sodium_"))})
     if wb_unresolved:
         if is_thin:
             # Since v3 the thin helper links no white-box at all, so ANY reference is wrong.
             raise InjectError(
-                f"{kind} skeleton {name} references white-box symbols {wb_unresolved} — since "
+                f"{kind} skeleton {name} references white-box symbols {wb_unresolved} - since "
                 f"the v3 split it must not touch the white-box; only {PROVIDER_SONAME} does. It "
                 f"was probably built from stub/sopk_wb.c, or linked libwbcrypto.a by mistake.")
         raise InjectError(
-            f"{kind} skeleton {name} imports {wb_unresolved} instead of defining them — it was "
+            f"{kind} skeleton {name} imports {wb_unresolved} instead of defining them - it was "
             "linked against a pre-3.0.0 libwbcrypto.a (or none). Note wbc_blob_kdf_tier in "
             "particular is the 3.0.0-only symbol. It would fail to load, taking every thin "
             "helper and their targets with it. Rebuild assets/wbc/ from whitebox-cryptography "
             ">= 3.0.0 (scripts/build_android.sh) and link with -Wl,--no-undefined so this fails "
             "at build time instead.")
-    # The thin helper must import the provider entry point — the other half of the pairing check.
+    # The thin helper must import the provider entry point - the other half of the pairing check.
     if is_thin and PROVIDER_ENTRY not in undefined:
         raise InjectError(
-            f"{kind} skeleton {name} does not import {PROVIDER_ENTRY} — it cannot obtain a "
+            f"{kind} skeleton {name} does not import {PROVIDER_ENTRY} - it cannot obtain a "
             f"session key, so its ctor would abort on every load. Rebuild it from {source}.")
 
     # Tracing guard. A -DSOPK_RT_LOG build announces the target soname, .text RVA and size, and a
-    # final "OK" to logcat — which hands anyone with adb the exact address and length to dump,
+    # final "OK" to logcat - which hands anyone with adb the exact address and length to dump,
     # plus confirmation the dump is valid. Refuse by default.
     logging_built = ("liblog.so" in needed or "__android_log_print" in undefined)
     if logging_built and not allow_helper_log:
         raise InjectError(
             f"{kind} skeleton {name} was built with -DSOPK_RT_LOG (imports __android_log_print "
             "/ needs liblog.so). Shipped, it logs the target soname, .text RVA and size, and a "
-            "final \"OK\" to logcat — an attacker with adb gets the exact address and length to "
+            "final \"OK\" to logcat - an attacker with adb gets the exact address and length to "
             "dump.\n"
             "  To fix:  ./scripts/build_wbaes.sh --release\n"
             "  To keep: pass --allow-helper-log (for on-device Phase 6 verification only; "
@@ -639,7 +639,7 @@ def _check_wbaes_skeleton(skeleton: str, kind: str, allow_helper_log: bool) -> N
     if leaked:
         raise InjectError(
             f"{kind} skeleton {name} re-exports white-box symbols {leaked[:8]}"
-            f"{' …' if len(leaked) > 8 else ''} — WBC_API visibility is baked into "
+            f"{' …' if len(leaked) > 8 else ''} - WBC_API visibility is baked into "
             "libwbcrypto.a's objects, so -fvisibility=hidden cannot hide them. Relink with "
             "-Wl,--exclude-libs,ALL (or a version script).")
     if is_thin:
@@ -650,11 +650,11 @@ def _check_wbaes_skeleton(skeleton: str, kind: str, allow_helper_log: bool) -> N
         # The provider is the first sopack artifact that legitimately EXPORTS something, so the
         # expectation inverts: exactly one name, no more and no fewer. Zero means
         # --exclude-libs,ALL or a `{ local: *; };` version script swallowed the entry, which the
-        # thin link would then fail on — loudly, but far from here.
+        # thin link would then fail on - loudly, but far from here.
         if PROVIDER_ENTRY not in exported:
             raise InjectError(
                 f"{kind} skeleton {name} does not export {PROVIDER_ENTRY} (exports "
-                f"{exported[:5] or 'nothing'}) — a `{{ local: *; }};` version script or "
+                f"{exported[:5] or 'nothing'}) - a `{{ local: *; }};` version script or "
                 f"-fvisibility=hidden without an explicit "
                 f"__attribute__((visibility(\"default\"))) swallowed it. No thin helper could "
                 f"then link or load against this provider.")
@@ -667,7 +667,7 @@ def _check_wbaes_skeleton(skeleton: str, kind: str, allow_helper_log: bool) -> N
 def _emit_wbaes_artifact(skeleton: str, region_bytes: bytes, out_path: str,
                          new_soname: str | None, kind: str) -> None:
     """Strip a checked skeleton, optionally rename its DT_SONAME, and append `region_bytes` as a
-    fresh read-only 16 KB-aligned PT_LOAD whose first bytes are the region — which the artifact's
+    fresh read-only 16 KB-aligned PT_LOAD whose first bytes are the region - which the artifact's
     own code finds by magic (stub/sopk_rt.c, stub/sopk_wb.c).
 
     `new_soname=None` means DO NOT RENAME, which is mandatory for the provider: every thin
@@ -678,7 +678,7 @@ def _emit_wbaes_artifact(skeleton: str, region_bytes: bytes, out_path: str,
     # Snapshot before any write. LIEF rebuilds .dynstr with the strings SORTED on write(),
     # rewriting every st_name to match; on the target that desync shipped once and cost a Flutter
     # app its Dart snapshot pointers (§11f). Here it would silently break the undefined/exported
-    # symbol guards above — and, for the provider, the exported name a thin helper resolves by
+    # symbol guards above - and, for the provider, the exported name a thin helper resolves by
     # string.
     dynsyms_before = _dynsym_names(skeleton)
 
@@ -688,7 +688,7 @@ def _emit_wbaes_artifact(skeleton: str, region_bytes: bytes, out_path: str,
     #     regenerate from.
     #   * `_strip_nonalloc` truncates at the last byte any PT_LOAD still needs. LIEF picks the
     #     appended region segment's file offset itself, and if it landed above the debug sections
-    #     that truncation point would jump past them — content still erased, but the file would
+    #     that truncation point would jump past them - content still erased, but the file would
     #     stay multi-megabyte. Stripping before the segment exists removes the dependency on
     #     where LIEF chooses to put it.
     shutil.copyfile(skeleton, out_path)
@@ -697,14 +697,14 @@ def _emit_wbaes_artifact(skeleton: str, region_bytes: bytes, out_path: str,
         total = sum(sz for _, sz in removed)
         shown = ", ".join(n for n, _ in removed[:6])
         _warn(f"{kind} skeleton {name} shipped {len(removed)} non-ALLOC sections "
-              f"({shown}{' …' if len(removed) > 6 else ''}; {total:,} bytes) — stripped them. "
+              f"({shown}{' …' if len(removed) > 6 else ''}; {total:,} bytes) - stripped them. "
               "Build with ./scripts/build_wbaes.sh --release, which passes -g0 and "
               "llvm-strip --strip-all, so the packer does not have to.")
 
     binary = lief.parse(out_path)
     if binary is None:
         raise InjectError(
-            f"LIEF cannot parse {name} after stripping it — the section surgery produced a "
+            f"LIEF cannot parse {name} after stripping it - the section surgery produced a "
             "malformed ELF, which is a bug in _strip_nonalloc, not in the skeleton")
 
     if new_soname is not None:
@@ -725,12 +725,12 @@ def _emit_wbaes_artifact(skeleton: str, region_bytes: bytes, out_path: str,
                  f"count {len(dynsyms_before)} -> {len(dynsyms_after)}"
         raise InjectError(
             f"emitting {kind} {os.path.basename(out_path)} changed its dynamic symbol names "
-            f"({detail}) — DT_STRTAB and the .dynsym offsets are out of sync, so the "
+            f"({detail}) - DT_STRTAB and the .dynsym offsets are out of sync, so the "
             "undefined/exported symbol guards no longer inspect what they claim to, and bionic "
             "may fail to resolve between the helper and the provider")
 
     # Residual host paths. After the strip there should be none; anything left is in a mapped
-    # section, which no amount of post-processing here can fix — it needs the archive rebuilt
+    # section, which no amount of post-processing here can fix - it needs the archive rebuilt
     # with -ffile-prefix-map. Warn rather than refuse, since that is another repo.
     with open(out_path, "rb") as f:
         residual = _host_paths_in(f.read())
@@ -765,7 +765,7 @@ def emit_provider(abi: str, pack: PackKey, out_path: str,
         raise InjectError(
             f"{_KIND_PROVIDER} skeleton {os.path.basename(skeleton)} has DT_SONAME "
             f"{soname!r}, expected {PROVIDER_SONAME!r}. Every thin helper records the provider's "
-            f"DT_SONAME as its DT_NEEDED at LINK time, so this cannot be corrected here — "
+            f"DT_SONAME as its DT_NEEDED at LINK time, so this cannot be corrected here - "
             f"relink with -Wl,-soname,{PROVIDER_SONAME}. Without an explicit -soname, lld "
             f"records the file PATH it was handed and the APK will not load.")
 
@@ -780,7 +780,7 @@ def _inject_wbaes(in_path: str, out_path: str, abi: str,
                   pack_key: PackKey | None = None) -> InjectResult:
     """`--cipher wbaes`: encrypt `.text` with ChaCha20 under a session key that is wrapped
     by a sealed white-box AES-128 key, and inject a per-target DT_NEEDED helper that unwraps
-    and decrypts at load. No stub/decinfo/DT_INIT surgery — the helper's constructor runs
+    and decrypts at load. No stub/decinfo/DT_INIT surgery - the helper's constructor runs
     before the target's init via dependency ordering. See sopack/provision.py for why the
     white-box no longer touches the bulk data."""
     binary = lief.parse(in_path)
@@ -810,11 +810,11 @@ def _inject_wbaes(in_path: str, out_path: str, abi: str,
     #    grows .dynamic + .dynstr and on tight libs (e.g. libapp.so) LIEF spills them into
     #    4 KB-aligned segments that break 16 KB loading (Risk 2). Instead we mirror the stub
     #    path: append a 16 KB-aligned COPY of .dynstr (+ our soname) with the trusted
-    #    add(seg), then raw-repoint DT_STRTAB/DT_STRSZ and add DT_NEEDED in place — keeping
+    #    add(seg), then raw-repoint DT_STRTAB/DT_STRSZ and add DT_NEEDED in place - keeping
     #    .dynamic and PT_DYNAMIC where they are.
     #
     #    The copied table MUST come from _effective_strtab (post-write), not from the section
-    #    read here — see that function's docstring. Hence: reserve a placeholder segment, let
+    #    read here - see that function's docstring. Hence: reserve a placeholder segment, let
     #    LIEF write, then fill the placeholder with the table LIEF actually emitted.
     helper_soname = _helper_soname_for(target_soname)
     dynstr = binary.get_section(".dynstr")
@@ -862,7 +862,7 @@ def _inject_wbaes(in_path: str, out_path: str, abi: str,
     _add_needed_inplace(out_path, name_off, strtab_rva, strtab_foff, len(new_strtab))
 
     # 4. build + emit the THIN helper carrying this target's region. Since v3 the region holds
-    #    no blob and no passphrase — those live once, in the shared provider — so this artifact
+    #    no blob and no passphrase - those live once, in the shared provider - so this artifact
     #    is a few KB rather than ~920 KB.
     region = TargetRegion(
         text_rva=text_rva, text_size=text_size,
@@ -906,19 +906,19 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
         f.seek(int(t.file_offset))
         if f.read(text_size) != ciphertext:
             raise InjectError("target .text is not the provisioned ciphertext")
-    # (b) DT_NEEDED points at the helper — resolved via DT_STRTAB, as the loader does.
+    # (b) DT_NEEDED points at the helper - resolved via DT_STRTAB, as the loader does.
     if helper_soname not in _needed_via_strtab(target_path):
         raise InjectError(f"DT_NEEDED {helper_soname!r} missing from target")
     # (b2) EVERY existing exported symbol name still resolves to the same string. A mismatch
-    # means dlsym() returns the wrong name or NULL — an APK that loads and then crashes far
-    # from the cause. Cheap check; see docs/architecture.md §11f for the incident.
+    # means dlsym() returns the wrong name or NULL - an APK that loads and then crashes far
+    # from the cause. Cheap check; see docs/technical/ARCHITECTURE.md §11f for the incident.
     before, after = _dynsym_names(in_path), _dynsym_names(target_path)
     if before != after:
         bad = next(((x, y) for x, y in zip(before, after) if x != y), None)
         detail = f"e.g. {bad[0]!r} -> {bad[1]!r}" if bad else \
                  f"count {len(before)} -> {len(after)}"
         raise InjectError(
-            f"injection changed the target's dynamic symbol names ({detail}) — DT_STRTAB and "
+            f"injection changed the target's dynamic symbol names ({detail}) - DT_STRTAB and "
             "the .dynsym offsets are out of sync, so dlsym() would fail on device")
     # (c) 16 KB congruence for arm64 (the only 16 KB-page device class) + no text relocs.
     _assert_16k_and_no_textrel(tgt, abi, orig_path=in_path)
@@ -928,7 +928,7 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
         raise InjectError("re-parse of wbaes helper failed")
     if _dynamic_soname(hlp) != helper_soname:
         raise InjectError("helper DT_SONAME not renamed")
-    # Bionic libs plus exactly one more: the shared provider. Not a loosening — the name is a
+    # Bionic libs plus exactly one more: the shared provider. Not a loosening - the name is a
     # single literal, so a leaked libc++_shared.so is still caught.
     stray = [n for n in _needed_names(hlp)
              if n not in _BIONIC_ALLOWED and n != PROVIDER_SONAME]
@@ -942,7 +942,7 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
                       and not s.has(lief.ELF.Section.FLAGS.ALLOC))
     if leftover:
         raise InjectError(
-            f"emitted helper still has non-ALLOC sections {leftover} — the strip did not take "
+            f"emitted helper still has non-ALLOC sections {leftover} - the strip did not take "
             "effect, so the helper would ship its symbol table and debug info")
     # Absence of the sections is not the same as absence of their bytes. Stripping erases and
     # truncates, so once only `.shstrtab` is left the file should be little more than its mapped
@@ -957,21 +957,21 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
     if actual > budget:
         raise InjectError(
             f"emitted helper is {actual:,} bytes but its mapped content plus section table needs "
-            f"only {budget:,} — {actual - budget:,} bytes of stripped-out padding were left "
+            f"only {budget:,} - {actual - budget:,} bytes of stripped-out padding were left "
             "behind, so the APK carries them. _strip_nonalloc did not compact the file")
     # ...and it did NOT turn into the section-header stripping that bionic (Android 14+)
     # refuses to load: e_shnum must stay non-zero and e_shstrndx must point at a real
-    # .shstrtab. See docs/static-analysis-hardening.md §Method 3.
+    # .shstrtab. See docs/technical/HARDENING.md §Method 3.
     if hlp.header.numberof_sections == 0 or hlp.get_section(".shstrtab") is None:
         raise InjectError(
-            "emitted helper lost its section header table (e_shnum=0 or no .shstrtab) — "
+            "emitted helper lost its section header table (e_shnum=0 or no .shstrtab) - "
             "bionic on Android 14+ rejects that outright ('has no section headers')")
     for need in (".dynsym", ".dynstr"):
         if hlp.get_section(need) is None:
             raise InjectError(f"emitted helper lost {need}, so it cannot be linked against")
     # Deliberately NOT asserted here: that the build marker survived into the emitted helper.
-    # Nothing reads it there — the stale-skeleton guard always reads sopack/stubs/, never a
-    # previously emitted helper — so the assertion would only be able to fail spuriously (a
+    # Nothing reads it there - the stale-skeleton guard always reads sopack/stubs/, never a
+    # previously emitted helper - so the assertion would only be able to fail spuriously (a
     # test fixture carrying the marker as trailing bytes rather than in .rodata).
     # (d) the region round-trips and describes THIS target.
     region = _extract_region(helper_path)
@@ -982,23 +982,23 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
         raise InjectError("helper region soname mismatch")
     # (d2) the thin helper must still be wired to the shared provider AFTER the emit. Read both
     # the way bionic does: LIEF re-sorts .dynstr on write(), and if that desynced the st_name
-    # offsets these names would resolve mid-string on device — the failure that shipped once.
+    # offsets these names would resolve mid-string on device - the failure that shipped once.
     # A missing dependency here is a 100% load failure that surfaces inside whatever dlopen'd
     # the target, so it must never leave the host.
     if PROVIDER_SONAME not in _needed_names(hlp):
         raise InjectError(
-            f"emitted helper {helper_soname} does not depend on {PROVIDER_SONAME} — it cannot "
+            f"emitted helper {helper_soname} does not depend on {PROVIDER_SONAME} - it cannot "
             "obtain a session key, and bionic would fail the target's dlopen")
     if PROVIDER_ENTRY not in _undefined_dynsyms(helper_path):
         raise InjectError(
-            f"emitted helper {helper_soname} no longer imports {PROVIDER_ENTRY} — the emit "
+            f"emitted helper {helper_soname} no longer imports {PROVIDER_ENTRY} - the emit "
             "desynced its .dynsym/.dynstr, so the symbol it resolves at load is not the one the "
             "provider exports")
     # (d3) the blob must NOT be here. It lives once, in the provider; a target region carrying it
     # would mean a v2-shaped region slipped through and every helper is ~920 KB again.
     if len(region) > 4096:
         raise InjectError(
-            f"emitted helper {helper_soname} region is {len(region):,} bytes — a target region "
+            f"emitted helper {helper_soname} region is {len(region):,} bytes - a target region "
             "is a 96-byte header plus a soname. This looks like a pre-v3 region still carrying "
             "the sealed blob.")
     # (d4) neither the long-term key nor anything derived from it may reach a thin helper.
@@ -1008,7 +1008,7 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
         for secret, what in ((pack_key.kek, "the long-term key"), (pack_key.blob, "the blob")):
             if secret in helper_bytes:
                 raise InjectError(
-                    f"emitted helper {helper_soname} contains {what} — thin helpers must carry "
+                    f"emitted helper {helper_soname} contains {what} - thin helpers must carry "
                     "neither; only the shared provider does")
 
     # The helper reads these as fixed-size fields, so a wrong length here is a wrong-length
@@ -1036,7 +1036,7 @@ def _16k_violations(binary) -> list[str]:
 
 
 def _assert_16k_and_no_textrel(binary, abi, orig_path: str | None = None):
-    """16 KB page hardware is arm64-only, so this gates arm64-v8a output only — armeabi-v7a and
+    """16 KB page hardware is arm64-only, so this gates arm64-v8a output only - armeabi-v7a and
     x86_64 inputs commonly ship 4 KB LOADs and must not be rejected over a device class that
     cannot run them.
 
@@ -1056,16 +1056,16 @@ def _assert_16k_and_no_textrel(binary, abi, orig_path: str | None = None):
                     "with -Wl,-z,max-page-size=16384, or pack it only for 4 KB device classes.")
             raise InjectError(
                 f"the injection produced a LOAD segment that breaks 16 KB loading "
-                f"({'; '.join(bad)}) — the input was clean, so this one is ours")
+                f"({'; '.join(bad)}) - the input was clean, so this one is ours")
     if binary.get(_tag("TEXTREL")) is not None:
-        raise InjectError("output has DT_TEXTREL (text relocations) — must be absent")
+        raise InjectError("output has DT_TEXTREL (text relocations) - must be absent")
 
 
 def _self_verify_provider(provider_path: str, abi: str, pack: PackKey) -> None:
     """Assert every invariant the thin helpers depend on in the SHARED provider.
 
     Kept separate from `_self_verify_wbaes` because the provider is emitted once per ABI, after
-    the per-target loop — a per-target verifier structurally cannot see it."""
+    the per-target loop - a per-target verifier structurally cannot see it."""
     name = os.path.basename(provider_path)
     b = lief.parse(provider_path)
     if b is None:
@@ -1075,14 +1075,14 @@ def _self_verify_provider(provider_path: str, abi: str, pack: PackKey) -> None:
     soname = _dynamic_soname(b)
     if soname != PROVIDER_SONAME:
         raise InjectError(
-            f"emitted provider {name} has DT_SONAME {soname!r}, expected {PROVIDER_SONAME!r} — "
+            f"emitted provider {name} has DT_SONAME {soname!r}, expected {PROVIDER_SONAME!r} - "
             "the emit must not rename it, or every thin helper's DT_NEEDED dangles")
 
     # (b) it still exports exactly the one entry point, read the way bionic resolves it.
     exported = _exported_dynsyms(provider_path)
     if PROVIDER_ENTRY not in exported:
         raise InjectError(
-            f"emitted provider {name} no longer exports {PROVIDER_ENTRY} — no thin helper could "
+            f"emitted provider {name} no longer exports {PROVIDER_ENTRY} - no thin helper could "
             "resolve against it, and bionic would fail every target's dlopen")
 
     # (c) bionic-only dependencies (the provider is the bottom of the chain).
@@ -1105,7 +1105,7 @@ def _self_verify_provider(provider_path: str, abi: str, pack: PackKey) -> None:
         blob_bytes = f.read()
     if pack.kek in blob_bytes:
         raise InjectError(
-            f"emitted provider {name} CONTAINS THE LONG-TERM KEY in cleartext — the whole point "
+            f"emitted provider {name} CONTAINS THE LONG-TERM KEY in cleartext - the whole point "
             "of the white-box is that this key is never reconstructable from what ships")
 
     _assert_16k_and_no_textrel(b, abi)
@@ -1117,7 +1117,7 @@ def _extract_region(helper_path: str, magic_int: int = REGION_MAGIC) -> bytes:
 
     `magic_int` selects the kind: REGION_MAGIC ('SRTT', a thin helper's target region) or
     WB_REGION_MAGIC ('SRTW', the provider's). They differ so neither can be mistaken for the
-    other — passing the wrong one finds nothing rather than parsing garbage."""
+    other - passing the wrong one finds nothing rather than parsing garbage."""
     magic = magic_int.to_bytes(4, "little")
     b = lief.parse(helper_path)
     F = _seg_flags()
@@ -1149,7 +1149,7 @@ def inject_so(in_path: str, out_path: str, abi: str,
                              allow_helper_log=allow_helper_log, pack_key=pack_key)
     stub: Stub = load_stub(abi)
     cipher_id = CIPHER_IDS[cipher]
-    # Whitening span: the WHITEN_SPAN stub bytes immediately before g_decinfo — real
+    # Whitening span: the WHITEN_SPAN stub bytes immediately before g_decinfo - real
     # code/rodata the injector never rewrites (only g_decinfo, at decinfo_off, is patched).
     # The stub recomputes the same checksum over these bytes at runtime. See cipher.whiten.
     if stub.decinfo_off < WHITEN_SPAN or stub.decinfo_off > len(stub.blob):
@@ -1162,7 +1162,7 @@ def inject_so(in_path: str, out_path: str, abi: str,
     # value. Real stub code/rodata has many distinct bytes.
     if len(set(whiten_span)) < 16:
         raise InjectError(
-            f"whitening span is low-entropy ({len(set(whiten_span))} distinct bytes) — "
+            f"whitening span is low-entropy ({len(set(whiten_span))} distinct bytes) - "
             "the stub layout before g_decinfo changed; the whitening key would be weak")
 
     binary = lief.parse(in_path)
@@ -1180,16 +1180,16 @@ def inject_so(in_path: str, out_path: str, abi: str,
     text.content = list(enc)
 
     # Load-time hook policy. If the library already exposes a usable DT_INIT we repoint it
-    # (chaining the original). Otherwise we ADD a DT_INIT in place — even when the library
+    # (chaining the original). Otherwise we ADD a DT_INIT in place - even when the library
     # has a DT_INIT_ARRAY.
     #
     # We deliberately never hijack DT_INIT_ARRAY. On PIC libraries (every Android .so) each
     # INIT_ARRAY slot is filled at load time by an R_*_RELATIVE relocation, so the file slot
     # reads 0 and any pointer we write there is silently reverted by the loader (the
-    # relocation addend wins) — the stub never runs and the still-encrypted constructor
+    # relocation addend wins) - the stub never runs and the still-encrypted constructor
     # executes as garbage (SIGILL). A DT_INIT entry lives in .dynamic, is NOT relocated
     # (bionic adds load_bias to d_ptr directly), and soinfo::call_constructors invokes
-    # DT_INIT BEFORE DT_INIT_ARRAY — so our stub decrypts .text first and the library's own
+    # DT_INIT BEFORE DT_INIT_ARRAY - so our stub decrypts .text first and the library's own
     # constructors then run on decrypted code. We add it WITHOUT growing .dynamic (which
     # makes LIEF spill it into a 4 KB-aligned segment that breaks 16 KB loading) and without
     # moving .dynamic to a non-writable segment (which bionic/glibc reject): we overwrite the
@@ -1263,7 +1263,7 @@ def _add_needed_inplace(path: str, name_off: int, new_strtab_vaddr: int,
     so every existing string offset still resolves), (2) repoint the .dynstr SECTION header
     to the same copy so section-based tools (readelf -d, LIEF) agree with the loader, and
     (3) overwrite the .dynamic DT_NULL terminator in place with DT_NEEDED, using the
-    following zero word as the new terminator — the same in-place trick as
+    following zero word as the new terminator - the same in-place trick as
     _add_dtinit_inplace (and the same loud refusal when there is no usable terminator slot).
     Class-aware raw ELF little-endian surgery."""
     with open(path, "r+b") as f:
@@ -1374,7 +1374,7 @@ def _add_dtinit_inplace(path: str, entry_rva: int) -> None:
     """Add a DT_INIT to a library that has no init hook, WITHOUT growing/moving
     .dynamic. We overwrite the existing DT_NULL terminator in place with DT_INIT and
     rely on the zero bytes that follow (.bss / padding, which read as DT_NULL at
-    runtime) as the new terminator — then formally extend PT_DYNAMIC/.dynamic to
+    runtime) as the new terminator - then formally extend PT_DYNAMIC/.dynamic to
     include that new terminator so tools agree with the loader. Keeps .dynamic in its
     original (writable, mapped) segment, so no extra or mis-aligned segment is created.
     Class-aware raw ELF little-endian surgery (ELF32 for armeabi-v7a, ELF64 otherwise)."""
@@ -1434,7 +1434,7 @@ def _add_dtinit_inplace(path: str, entry_rva: int) -> None:
 
         # The slot AFTER the (to-be-overwritten) terminator becomes the new terminator.
         # bionic (and glibc) iterate .dynamic until the first entry whose d_tag == DT_NULL
-        # and IGNORE that entry's d_val — so the slot qualifies as a terminator when only
+        # and IGNORE that entry's d_val - so the slot qualifies as a terminator when only
         # its d_tag WORD reads as zero at runtime; the d_val may be anything. We only READ
         # this slot (never overwrite it), so a non-zero d_val there is left intact.
         #
@@ -1492,12 +1492,12 @@ def _self_verify(path, plain, info, cipher_id, key, nonce, text_rva, entry_rva,
         file_bytes = f.read()
 
     # (5a) whitening-span immutability: the WHITEN_SPAN bytes before decinfo IN THE OUTPUT
-    # FILE must equal the pristine blob span the packer whitened with — because that is the
+    # FILE must equal the pristine blob span the packer whitened with - because that is the
     # exact region the stub re-checksums at runtime. If LIEF (or any write) perturbed it,
     # the stub would derive a different key and fail open on-device; catch it here instead.
     file_span = file_bytes[decinfo_off - WHITEN_SPAN:decinfo_off]
     if file_span != whiten_span:
-        raise InjectError("whitening span differs in output — a pack-time write hit the "
+        raise InjectError("whitening span differs in output - a pack-time write hit the "
                           "checksummed region; the stub would derive the wrong key")
 
     # (5b) the whitened record round-trips: de-whitening the shipped 128 bytes with the
@@ -1511,7 +1511,7 @@ def _self_verify(path, plain, info, cipher_id, key, nonce, text_rva, entry_rva,
     # (5c) the plaintext signpost is gone: the magic+version needle must not appear
     # ANYWHERE in the file (the old grep-SOPK-read-the-key attack now finds nothing).
     if _MAGIC_NEEDLE in file_bytes:
-        raise InjectError("decinfo magic still present in output — whitening did not take")
+        raise InjectError("decinfo magic still present in output - whitening did not take")
 
     out = lief.parse(path)
     if out is None:
@@ -1550,11 +1550,11 @@ def _self_verify(path, plain, info, cipher_id, key, nonce, text_rva, entry_rva,
 
     # (4) the hook actually points at the stub, and no text relocations were introduced.
     if out.get(_tag("TEXTREL")) is not None:
-        raise InjectError("output has DT_TEXTREL (text relocations) — must be absent")
+        raise InjectError("output has DT_TEXTREL (text relocations) - must be absent")
     # Loader-aware hook check. The ONLY strategies we emit are DT_INIT-inplace and
     # DT_INIT-hijack; both must leave DT_INIT pointing at the stub entry. DT_INIT is the
     # FIRST thing soinfo::call_constructors runs (before DT_INIT_ARRAY) and is not subject
-    # to relocation, so this is exactly what the loader will call first — unlike a file-slot
+    # to relocation, so this is exactly what the loader will call first - unlike a file-slot
     # INIT_ARRAY value, which a load-time R_*_RELATIVE relocation would overwrite.
     if not strategy.startswith("DT_INIT-"):
         raise InjectError(f"unexpected init strategy {strategy!r}")
@@ -1571,7 +1571,7 @@ def _patch_decinfo(path: str, info: DecInfo, decinfo_off: int, span: bytes) -> N
     then WHITEN it in place. We no longer scan for a magic: the offset is computed from
     LIEF's segment file_offset + the blob's decinfo_off (the same value _self_verify
     trusts). We assert the placeholder magic is present at that offset first (proves we
-    are writing the right spot), then write the whitened record — after which the magic no
+    are writing the right spot), then write the whitened record - after which the magic no
     longer appears in the file (that is the whole point; see stub/decinfo.h)."""
     with open(path, "r+b") as f:
         f.seek(decinfo_off)

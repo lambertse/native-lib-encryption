@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# build_wbaes.sh — get `--cipher wbaes` from a clean checkout to a packable state, running
-# Phases 1-4 of docs/wbaes-verification.md and every one of their PASS checks. It stops before
+# build_wbaes.sh - get `--cipher wbaes` from a clean checkout to a packable state, running
+# Phases 1-4 of docs/technical/WBAES.md and every one of their PASS checks. It stops before
 # packing (that needs YOUR APK and lib names) and prints the Phase-5 command to run next.
 #
 # Why a script: the failure modes of this mode are unforgiving and mostly SILENT. A pre-3.0.0
@@ -23,7 +23,7 @@
 #   --abi ABI       default arm64-v8a
 #   --api N         default 24
 #   --release       build the skeleton WITHOUT -DSOPK_RT_LOG (no logcat tracing, no liblog).
-#                   This is the DEFAULT — a tracing helper logs the target name, .text address
+#                   This is the DEFAULT - a tracing helper logs the target name, .text address
 #                   and size to logcat, and `sopack pack` refuses to pack one.
 #   --trace         opt into the tracing build for on-device Phase 6 verification. The result
 #                   needs `sopack pack --allow-helper-log` and is NOT shippable.
@@ -35,7 +35,7 @@
 #                   (CI, for instance). No skeleton is produced, so you cannot pack afterwards.
 #   --force         redo cached phases (host wb_keygen, Android libwbcrypto.a)
 #
-# SOPACK is this script's own repo — never asked for.
+# SOPACK is this script's own repo - never asked for.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -79,10 +79,10 @@ trap 'rm -rf "$TMP"' EXIT
 valid_wbc() {
     [ -d "$1" ] || { warn "$1 is not a directory"; return 1; }
     [ -f "$1/include/wbcrypto.h" ] || {
-        warn "$1 has no include/wbcrypto.h — that is not a whitebox-cryptography checkout"
+        warn "$1 has no include/wbcrypto.h - that is not a whitebox-cryptography checkout"
         return 1; }
     [ -f "$1/scripts/gen_blob.sh" ] || {
-        warn "$1 has no scripts/gen_blob.sh — too old, or not the right repo"; return 1; }
+        warn "$1 has no scripts/gen_blob.sh - too old, or not the right repo"; return 1; }
     # The version gate that matters. 3.0.0 made the seal's KDF cost a per-blob tier and added
     # wbc_blob_kdf_tier; sopack seals at `light` and the helper ctor reads the tier back, so a
     # pre-3.0.0 header will not compile and a pre-3.0.0 archive fails at link.
@@ -98,7 +98,7 @@ valid_wbc() {
 valid_ndk() {
     [ -d "$1" ] || { warn "$1 is not a directory"; return 1; }
     [ -f "$1/build/cmake/android.toolchain.cmake" ] || {
-        warn "$1 has no build/cmake/android.toolchain.cmake — not an NDK root"; return 1; }
+        warn "$1 has no build/cmake/android.toolchain.cmake - not an NDK root"; return 1; }
     return 0
 }
 
@@ -120,11 +120,11 @@ if [ "$HOST_ONLY" -eq 0 ]; then
     need cmake "scripts/build_android.sh uses CMake (or pass --host-only)"
     need ninja "scripts/build_android.sh configures with -GNinja (or pass --host-only)"
 fi
-have openssl || warn "no openssl on PATH — the pack-side cipher falls back to pure Python
+have openssl || warn "no openssl on PATH - the pack-side cipher falls back to pure Python
       (~0.6 MB/s), so packing a multi-MB .text will be slow but still correct"
 
 ( cd "$SOPACK" && python3 -c 'import sopack' >/dev/null 2>&1 ) \
-    || die "cannot import sopack from $SOPACK — run: pip install -e ."
+    || die "cannot import sopack from $SOPACK - run: pip install -e ."
 
 : "${NDK:=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
 ask_path WBC "whitebox-cryptography checkout (>= 3.0.0): " valid_wbc \
@@ -135,7 +135,7 @@ if [ "$HOST_ONLY" -eq 0 ]; then
     ask_path NDK "Android NDK root: " valid_ndk \
         "Pass --ndk PATH, export NDK / ANDROID_NDK_HOME, or run with --host-only."
     NDKBIN="$NDK/toolchains/llvm/prebuilt/$HOSTTAG/bin"
-    [ -d "$NDKBIN" ] || die "no toolchain at $NDKBIN (host tag $HOSTTAG) — wrong NDK layout?"
+    [ -d "$NDKBIN" ] || die "no toolchain at $NDKBIN (host tag $HOSTTAG) - wrong NDK layout?"
     CXX="$NDKBIN/clang++"
     READELF="$NDKBIN/llvm-readelf"
     [ -x "$CXX" ] || die "no clang++ at $CXX"
@@ -159,10 +159,10 @@ else
 fi
 info "target  $ABI / android-$API"
 if [ "$RELEASE" -eq 1 ]; then info "skeleton RELEASE (no tracing, stripped)"
-else warn "skeleton TRACING (-DSOPK_RT_LOG -llog) — needs 'pack --allow-helper-log'; NOT shippable"; fi
+else warn "skeleton TRACING (-DSOPK_RT_LOG -llog) - needs 'pack --allow-helper-log'; NOT shippable"; fi
 
-# ---- Phase 1 — host wb_keygen, and prove the white-box is standard AES-128 --------------
-step 1 "$TOTAL" "Phase 1 — host wb_keygen + FIPS-197 anchor"
+# ---- Phase 1 - host wb_keygen, and prove the white-box is standard AES-128 --------------
+step 1 "$TOTAL" "Phase 1 - host wb_keygen + FIPS-197 anchor"
 HOST_KEYGEN="$WBC/build-host/wb_keygen"
 if [ -x "$HOST_KEYGEN" ] && [ "$FORCE" -eq 0 ]; then
     info "reusing $HOST_KEYGEN (use --force to rebuild)"
@@ -176,16 +176,16 @@ else
        src/vm/assembler.cpp, so gen_blob.sh cannot build on this host. Update it."
         fi
         tail -30 "$TMP/genblob.log" >&2
-        die "gen_blob.sh failed (full log: $TMP/genblob.log — kept only until this script exits)"
+        die "gen_blob.sh failed (full log: $TMP/genblob.log - kept only until this script exits)"
     fi
     grep -q "$FIPS_VECTOR" "$TMP/genblob.log" \
         || { tail -20 "$TMP/genblob.log" >&2
-             die "gen_blob.sh did not print the FIPS-197 vector $FIPS_VECTOR — the white-box is
+             die "gen_blob.sh did not print the FIPS-197 vector $FIPS_VECTOR - the white-box is
        not behaving as standard AES-128, which the whole key-wrap design relies on"; }
-    ok "FIPS-197 anchor $FIPS_VECTOR — the white-box is bit-exact AES-128"
+    ok "FIPS-197 anchor $FIPS_VECTOR - the white-box is bit-exact AES-128"
 fi
 [ -x "$HOST_KEYGEN" ] || die "expected a host tool at $HOST_KEYGEN after gen_blob.sh"
-# A CAPABILITY probe, not an existence check, and it runs on the CACHED path too — which is the
+# A CAPABILITY probe, not an existence check, and it runs on the CACHED path too - which is the
 # whole point. The branch above reuses $HOST_KEYGEN whenever it exists, so a user who updates
 # $WBC to 3.0.0 and re-runs without --force otherwise keeps a pre-3.0.0 keygen and only finds
 # out on device. It must also run HERE at all: an Android build cannot.
@@ -195,16 +195,16 @@ if ! "$HOST_KEYGEN" --key 000102030405060708090a0b0c0d0e0f --pass p --seed 1 \
     if grep -qE -- '--kdf|unknown arg' "$TMP/probe.log"; then
         die "$HOST_KEYGEN is a STALE PRE-3.0.0 host wb_keygen: it rejects --kdf. sopack seals
        at the light KDF tier and requires >= 3.0.0. It was almost certainly REUSED from an
-       earlier run (this phase caches it) — re-run with --force, or rebuild it by hand:
+       earlier run (this phase caches it) - re-run with --force, or rebuild it by hand:
            cd $WBC && bash scripts/gen_blob.sh --key 000102030405060708090a0b0c0d0e0f \\
                --pass demo --seed 42 --kdf light --out /tmp/sealed.blob"
     fi
     tail -5 "$TMP/probe.log" >&2
-    die "$HOST_KEYGEN does not run on this host (an Android build cannot) — rebuild with
+    die "$HOST_KEYGEN does not run on this host (an Android build cannot) - rebuild with
        $WBC/scripts/gen_blob.sh"
 fi
 # Verify the blob it produced really is v>=4 at tier 0, through the SAME parser the packer
-# uses — two copies of these offsets would drift.
+# uses - two copies of these offsets would drift.
 ( cd "$SOPACK" && python3 -c '
 import sys
 from sopack.provision import assert_light_blob, blob_header
@@ -213,25 +213,25 @@ assert_light_blob(blob, tool=sys.argv[2])
 print("    blob header: magic=%s version=%d tier=%d" % blob_header(blob))
 ' "$TMP/probe.blob" "$HOST_KEYGEN" ) \
     || die "$HOST_KEYGEN accepted --kdf but did not produce a v4 light-tier blob (above).
-       That is a 3.0.0-or-newer tool behaving unexpectedly — do not pack with it."
+       That is a 3.0.0-or-newer tool behaving unexpectedly - do not pack with it."
 export SOPACK_WBKEYGEN="$HOST_KEYGEN"
 ok "host wb_keygen usable and honours --kdf light: $SOPACK_WBKEYGEN"
 
-# ---- Phase 2 — unit tests --------------------------------------------------------------
-step 2 "$TOTAL" "Phase 2 — sopack unit tests"
+# ---- Phase 2 - unit tests --------------------------------------------------------------
+step 2 "$TOTAL" "Phase 2 - sopack unit tests"
 if [ "$SKIP_TESTS" -eq 1 ]; then
     warn "skipped by --skip-tests"
 else
     ( cd "$SOPACK" && python3 -m pytest tests/ -q ) \
-        || die "unit tests failed — fix these before trusting anything below"
+        || die "unit tests failed - fix these before trusting anything below"
     ok "unit tests pass (with SOPACK_WBKEYGEN set, the full-injection tests run too)"
 fi
 
-# ---- Phase 3 — full round-trip through the REAL white-box ------------------------------
-step 3 "$TOTAL" "Phase 3 — host round-trip through the real white-box"
-[ -n "$SODIUM_INC" ] || die "no vendored libsodium headers under $WBC/third_party/libsodium —
+# ---- Phase 3 - full round-trip through the REAL white-box ------------------------------
+step 3 "$TOTAL" "Phase 3 - host round-trip through the real white-box"
+[ -n "$SODIUM_INC" ] || die "no vendored libsodium headers under $WBC/third_party/libsodium -
        run $WBC/third_party/fetch_deps.sh libsodium"
-[ -f "$WBC/build-host/libsodium.a" ] || die "no $WBC/build-host/libsodium.a — Phase 1 builds it;
+[ -f "$WBC/build-host/libsodium.a" ] || die "no $WBC/build-host/libsodium.a - Phase 1 builds it;
        re-run with --force"
 
 info "building the round-trip probe …"
@@ -272,10 +272,10 @@ PY
 ) || die "provisioning failed"
 
 "$TMP/rt_roundtrip" "$TMP/wbregion.bin" "$TMP/region.bin" "$TMP/cipher.bin" "$TMP/plain.bin" \
-    || die "round-trip FAILED — a Python<->C contract has drifted; the probe names which one"
-ok "round-trip PASS — both region layouts, whitening, key wrap and ChaCha20 all agree"
+    || die "round-trip FAILED - a Python<->C contract has drifted; the probe names which one"
+ok "round-trip PASS - both region layouts, whitening, key wrap and ChaCha20 all agree"
 
-# ---- Phase 4 — the Android runtime lib and the helper skeleton --------------------------
+# ---- Phase 4 - the Android runtime lib and the helper skeleton --------------------------
 if [ "$HOST_ONLY" -eq 1 ]; then
     cat <<EOF
 
@@ -288,7 +288,7 @@ EOF
     exit 0
 fi
 
-step 4 "$TOTAL" "Phase 4 — Android libwbcrypto.a + helper skeleton"
+step 4 "$TOTAL" "Phase 4 - Android libwbcrypto.a + helper skeleton"
 ANDROID_LIB="$WBC/build-android/libwbcrypto.a"
 if [ -f "$ANDROID_LIB" ] && [ "$FORCE" -eq 0 ]; then
     info "reusing $ANDROID_LIB (use --force to rebuild)"
@@ -303,7 +303,7 @@ fi
 [ -f "$ANDROID_LIB" ] || die "expected $ANDROID_LIB after build_android.sh"
 
 # BEFORE the copy, not after. The branch above reuses a cached build-android/libwbcrypto.a, but
-# the cp below takes the FRESH $WBC/include/wbcrypto.h — so a stale cache pairs a 3.0.0 header
+# the cp below takes the FRESH $WBC/include/wbcrypto.h - so a stale cache pairs a 3.0.0 header
 # with a pre-3.0.0 archive in assets/wbc/. sopk_rt.c then COMPILES and the link fails, which is
 # a confusing place to discover it. Check the archive itself, here.
 if [ -x "$NDKBIN/llvm-nm" ]; then
@@ -313,7 +313,7 @@ else
 fi
 case "$ARCHIVE_SYMS" in
     *wbc_blob_kdf_tier*) ;;
-    *) die "$ANDROID_LIB defines no wbc_blob_kdf_tier, so it is a PRE-3.0.0 archive — almost
+    *) die "$ANDROID_LIB defines no wbc_blob_kdf_tier, so it is a PRE-3.0.0 archive - almost
        certainly the CACHED one from an earlier run (this phase reuses build-android/). Copying
        it into assets/wbc/ next to a 3.0.0 wbcrypto.h pairs a new header with an old archive:
        stub/sopk_rt.c compiles and the LINK then fails on wbc_blob_kdf_tier. Re-run with
@@ -332,7 +332,7 @@ mkdir -p "$(dirname "$SKEL")"
 TRACE_FLAGS=""
 [ "$RELEASE" -eq 0 ] && TRACE_FLAGS="-DSOPK_RT_LOG -llog"
 
-# TWO artifacts since region v3, and they must be built in this order — 4b links against 4a's
+# TWO artifacts since region v3, and they must be built in this order - 4b links against 4a's
 # output, so no single invocation can produce both:
 #
 #   4a  sopk_wb.c  -> libsopk_wb.so   ONE per ABI. Links libwbcrypto.a; owns every wbc_* call
@@ -340,7 +340,7 @@ TRACE_FLAGS=""
 #   4b  sopk_rt.c  -> sopk_rt_<abi>.so  the THIN per-target helper. Links NO white-box; the
 #                                     packer clones it per target.
 #
-# clang++ (not clang: the archive is C++) and libc++ STATIC for 4a — a libc++_shared.so
+# clang++ (not clang: the archive is C++) and libc++ STATIC for 4a - a libc++_shared.so
 # dependency would be another .so to ship and the packer rejects it. -x c because both sources
 # are C. --no-undefined so a pre-3.0.0 archive fails HERE instead of on device.
 #
@@ -383,7 +383,7 @@ if ! link_provider -static-libstdc++; then
         if grep -q "undefined reference to \`wbc_" "$TMP/link.log"; then
             die "the archive in assets/wbc/ is missing symbols sopk_wb.c needs, i.e. it is
        PRE-3.0.0. Note sopk_wb.c COMPILED, so the header is 3.0.0 and only the archive is
-       stale — the classic cached-build-android/ pairing. --no-undefined caught it here
+       stale - the classic cached-build-android/ pairing. --no-undefined caught it here
        instead of on device. Re-run with --force."
         fi
         die "provider link failed (log above)"
@@ -392,8 +392,8 @@ fi
 "$NDKBIN/llvm-strip" --strip-all "$PROV" 2>/dev/null || true
 ok "provider: $(basename "$PROV") ($(wc -c <"$PROV" | tr -d ' ') bytes)"
 
-# 4b: the thin helper. Simpler than the provider's link — plain clang, no static libc++, no
-# libwbcrypto.a — but it MUST take the provider as a link input so --no-undefined still holds and
+# 4b: the thin helper. Simpler than the provider's link - plain clang, no static libc++, no
+# libwbcrypto.a - but it MUST take the provider as a link input so --no-undefined still holds and
 # the DT_NEEDED comes from the provider's DT_SONAME rather than being invented.
 link_skeleton() {   # link_skeleton <extra flags…>
     # shellcheck disable=SC2086
@@ -412,13 +412,13 @@ info "linking the thin helper skeleton (4b) …"
 if ! link_skeleton; then
     cat "$TMP/link.log" >&2
     if grep -q "undefined reference to \`wbc_" "$TMP/link.log"; then
-        die "sopk_rt.c references white-box symbols, which it must NOT do since the v3 split —
+        die "sopk_rt.c references white-box symbols, which it must NOT do since the v3 split -
        every wbc_* call lives in stub/sopk_wb.c now. Either stub/sopk_rt.c is stale (pre-v3) or
        it is being compiled with the wrong source."
     fi
     if grep -q "undefined reference to \`sopk_wb_k" "$TMP/link.log"; then
         die "the thin helper cannot resolve sopk_wb_k against $PROV. The provider linked but did
-       not EXPORT its entry point — check that stub/sopk_wb.c still marks sopk_wb_k
+       not EXPORT its entry point - check that stub/sopk_wb.c still marks sopk_wb_k
        __attribute__((visibility(\"default\"))), since the link uses -fvisibility=hidden."
     fi
     die "thin helper link failed (log above)"
@@ -427,8 +427,8 @@ ok "skeleton built: $SKEL"
 
 # -g0 stops OUR debug info; the static archive still contributes its own symbols, so strip.
 # --strip-all removes .symtab/.strtab/.comment and any remaining .debug_*, and keeps .dynsym /
-# .dynstr / the section header table — which is what bionic needs. This is NOT the section-header
-# stripping that docs/static-analysis-hardening.md §Method 3 rejected (that zeroed e_shoff).
+# .dynstr / the section header table - which is what bionic needs. This is NOT the section-header
+# stripping that docs/technical/HARDENING.md §Method 3 rejected (that zeroed e_shoff).
 STRIP="$(dirname "$CXX")/llvm-strip"
 if [ -x "$STRIP" ]; then
     before=$(wc -c <"$SKEL")
@@ -456,10 +456,10 @@ for n in $(needed_of "$PROV"); do
 done
 if [ -n "$BAD_NEEDED" ]; then
     case "$BAD_NEEDED" in
-        *libc++_shared.so*) die "provider depends on libc++_shared.so — the static libc++ did not
+        *libc++_shared.so*) die "provider depends on libc++_shared.so - the static libc++ did not
        take effect. It must be statically linked, or the packer will reject the skeleton." ;;
     esac
-    die "provider has non-bionic DT_NEEDED:$BAD_NEEDED — something was not statically linked"
+    die "provider has non-bionic DT_NEEDED:$BAD_NEEDED - something was not statically linked"
 fi
 ok "provider DT_NEEDED is bionic-only:$(printf ' %s' $(needed_of "$PROV"))"
 
@@ -467,7 +467,7 @@ ok "provider DT_NEEDED is bionic-only:$(printf ' %s' $(needed_of "$PROV"))"
 PROV_HAS_SONAME="$("$READELF" -dW "$PROV" | awk '/SONAME/ {gsub(/[][]/,"",$5); print $5}')"
 [ "$PROV_HAS_SONAME" = "$PROV_SONAME" ] || die "provider DT_SONAME is '$PROV_HAS_SONAME',
        expected '$PROV_SONAME'. Without -Wl,-soname the linker records the file PATH, which the
-       thin helper then hard-codes as its DT_NEEDED — an APK that cannot load. The packer refuses
+       thin helper then hard-codes as its DT_NEEDED - an APK that cannot load. The packer refuses
        this rather than renaming it, because renaming would break every helper already linked."
 ok "provider DT_SONAME is $PROV_SONAME"
 
@@ -475,7 +475,7 @@ PROV_EXPORTS="$(exports_of "$PROV")"
 if [ "$PROV_EXPORTS" != "sopk_wb_k" ]; then
     printf '%s\n' "$PROV_EXPORTS" | sed 's/^/      /' >&2
     die "provider must export EXACTLY sopk_wb_k, no more and no fewer (got the above). Nothing
-       means -Wl,--exclude-libs,ALL or a '{ local: *; };' version script swallowed the entry —
+       means -Wl,--exclude-libs,ALL or a '{ local: *; };' version script swallowed the entry -
        it needs __attribute__((visibility(\"default\"))), which stub/sopk_wb.c has. Extra names
        mean --exclude-libs did not take effect; if it will not, use a version script that keeps
        the entry:  printf '{ global: sopk_wb_k; local: *; };\\n' > /tmp/prov.map"
@@ -485,7 +485,7 @@ ok "provider exports exactly sopk_wb_k"
 PROV_IMPORTS="$(undef_of "$PROV" | grep -E '^(wbc_|sodium_)' || true)"
 if [ -n "$PROV_IMPORTS" ]; then
     printf '%s\n' "$PROV_IMPORTS" | sed 's/^/      /' >&2
-    die "provider IMPORTS the symbols above instead of defining them — it linked against a
+    die "provider IMPORTS the symbols above instead of defining them - it linked against a
        PRE-3.0.0 libwbcrypto.a. bionic could not load it, and every thin helper (and their
        targets) would fail to load with it."
 fi
@@ -501,14 +501,14 @@ for n in $(needed_of "$SKEL"); do
 done
 if [ -n "$BAD_NEEDED" ]; then
     case "$BAD_NEEDED" in
-        *libc++_shared.so*) die "thin helper depends on libc++_shared.so — it should not link the
+        *libc++_shared.so*) die "thin helper depends on libc++_shared.so - it should not link the
        C++ white-box at all since the v3 split. Is it being built from stub/sopk_wb.c?" ;;
     esac
     die "thin helper has unexpected DT_NEEDED:$BAD_NEEDED (bionic + $PROV_SONAME only)"
 fi
 # POSITIVE containment: a helper that lost the dependency fails on device as "cannot locate
 # symbol sopk_wb_k", taking the target's dlopen with it, nowhere near the cause.
-needed_of "$SKEL" | grep -qx "$PROV_SONAME" || die "thin helper does not DT_NEEDED $PROV_SONAME —
+needed_of "$SKEL" | grep -qx "$PROV_SONAME" || die "thin helper does not DT_NEEDED $PROV_SONAME -
        it was linked without $PROV as an input, so it cannot obtain a session key."
 ok "thin helper DT_NEEDED is bionic + $PROV_SONAME"
 
@@ -542,7 +542,7 @@ for path, marker, src in ((sys.argv[1], HELPER_BUILD_MARKER, 'stub/sopk_rt.c'),
                           (sys.argv[2], PROVIDER_BUILD_MARKER, 'stub/sopk_wb.c')):
     if marker not in open(path, 'rb').read():
         sys.exit(f"ERROR: {path} lacks the v{REGION_VERSION} build marker "
-                 f"({marker.hex()}) — it was built from an older {src}. sopack would refuse "
+                 f"({marker.hex()}) - it was built from an older {src}. sopack would refuse "
                  "it at pack time.")
 PY
 ) || exit 1
@@ -553,7 +553,7 @@ ok "both artifacts carry the build markers the packer greps for"
 SKEL_SZ=$(wc -c <"$SKEL" | tr -d ' ')
 PROV_SZ=$(wc -c <"$PROV" | tr -d ' ')
 if [ "$SKEL_SZ" -gt 102400 ]; then
-    die "the thin helper is $SKEL_SZ bytes — far too large. Since the v3 split it links no
+    die "the thin helper is $SKEL_SZ bytes - far too large. Since the v3 split it links no
        white-box, so it should be a few KB. It looks like it still statically links
        libwbcrypto.a, which would defeat the whole point (N copies of ~465 KB again)."
 fi
@@ -562,7 +562,7 @@ ok "size split: thin helper $SKEL_SZ B, provider $PROV_SZ B (the provider ships 
 # ---- next step -------------------------------------------------------------------------
 cat <<EOF
 
-==> Host phases 1-4 PASS. Phase 5 is yours to run — it needs your APK and lib names:
+==> Host phases 1-4 PASS. Phase 5 is yours to run - it needs your APK and lib names:
 
   cd "$SOPACK"
   mkdir -p output
@@ -577,7 +577,7 @@ cat <<EOF
   Quote the --lib list: it is ONE argv word, so an unquoted space after a comma makes
   argparse reject the second name.
 
-Then verify the packed APK and go to device, per docs/wbaes-verification.md Phases 5-6.
+Then verify the packed APK and go to device, per docs/technical/WBAES.md Phases 5-6.
 EOF
 if [ "$RELEASE" -eq 0 ]; then
     cat <<EOF
@@ -591,7 +591,7 @@ else
     cat <<EOF
 
   This skeleton is a RELEASE build: no logcat output, so a failure at load is a SIGABRT
-  with no message (by design — see the fail-closed note in stub/sopk_rt.c). If the app
+  with no message (by design - see the fail-closed note in stub/sopk_rt.c). If the app
   crashes on device, rebuild with --trace and pack with --allow-helper-log to find out why.
 EOF
 fi

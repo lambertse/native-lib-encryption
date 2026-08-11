@@ -1,14 +1,14 @@
 /*
- * sopk_wb.c — REFERENCE source for the SHARED white-box provider used by
+ * sopk_wb.c - REFERENCE source for the SHARED white-box provider used by
  * sopack's
  * `--cipher wbaes` mode. Requires whitebox-cryptography >= 3.0.0. One of these
  * ships per ABI (libsopk_wb.so); every thin per-target helper DT_NEEDEDs it.
  * See stub/sopk_wb.h for the split and why it is shaped this way, and
  * stub/sopk_rt.h for the region layouts.
  *
- * THE BUILD COMMAND AND ITS RATIONALE LIVE IN docs/wbaes-verification.md PHASE
+ * THE BUILD COMMAND AND ITS RATIONALE LIVE IN docs/technical/WBAES.md PHASE
  * 4 (step 4a). Not repeated here, because two copies drift. In outline: clang++
- * (not clang — libwbcrypto.a is C++) with a static libc++, `-x c` for this
+ * (not clang - libwbcrypto.a is C++) with a static libc++, `-x c` for this
  * file, --exclude-libs,ALL so the wbc_* symbols are not re-exported,
  * --no-undefined so a pre-3.0.0 archive fails HERE rather than on device, and
  * -Wl,-soname,libsopk_wb.so.
@@ -53,11 +53,11 @@ _Static_assert(SOPK_RT_SESSION_KEY_BYTES == WBC_SESSION_KEY_BYTES,
  * a build error. */
 _Static_assert(
     (int)WBC_KDF_NONE == 0 && (int)WBC_KDF_LOW == 1 && (int)WBC_KDF_HIGH == 2,
-    "wbc_kdf_tier numbering changed — provision.py assumes WBC_KDF_NONE == 0");
+    "wbc_kdf_tier numbering changed - provision.py assumes WBC_KDF_NONE == 0");
 _Static_assert(SOPK_WB_ABI == SOPK_RT_REGION_VERSION,
                "SOPK_WB_ABI must track SOPK_RT_REGION_VERSION");
 
-/* Retained build marker — see the note in sopk_rt.h. Must stay in an SHF_ALLOC
+/* Retained build marker - see the note in sopk_rt.h. Must stay in an SHF_ALLOC
  * section: the packer strips every non-ALLOC section and its guard is a
  * byte-scan for these bytes. */
 #if defined(__has_attribute)
@@ -146,7 +146,7 @@ static int wb_self_cb(struct dl_phdr_info *info, size_t sz, void *data) {
 __attribute__((visibility("default"))) int
 sopk_wb_k(unsigned abi, const uint8_t *wrapped, size_t wrapped_len, uint8_t *sk,
           size_t sk_len) {
-  /* Serialise the whole call. There is no shared state to protect — but
+  /* Serialise the whole call. There is no shared state to protect - but
    * storage::Unseal calls sodium_init(), whose concurrency contract is not
    * "safe to call concurrently", and two targets can be dlopen'd from different
    * threads. bionic's loader lock happens to serialise constructors today; do
@@ -162,7 +162,7 @@ sopk_wb_k(unsigned abi, const uint8_t *wrapped, size_t wrapped_len, uint8_t *sk,
    * by producing a plausible-looking wrong session key and SIGILLing inside the
    * target later. */
   if (abi != SOPK_WB_ABI) {
-    SOPK_WB_LOG("abi mismatch: helper %u, provider %u — rebuild BOTH skeletons",
+    SOPK_WB_LOG("abi mismatch: helper %u, provider %u - rebuild BOTH skeletons",
                 abi, (unsigned)SOPK_WB_ABI);
     return wb_fail(SOPK_WB_ERR_ABI);
   }
@@ -197,7 +197,7 @@ sopk_wb_k(unsigned abi, const uint8_t *wrapped, size_t wrapped_len, uint8_t *sk,
   }
 
   /* De-whiten the passphrase. Key comes from the blob's own first bytes, so
-   * nothing is baked in — and it is why wpass and blob must live in the same
+   * nothing is baked in - and it is why wpass and blob must live in the same
    * artifact (see sopk_rt.h). */
   uint8_t wkey[32];
   char pass[SOPK_WB_MAX_PASS];
@@ -235,9 +235,9 @@ sopk_wb_k(unsigned abi, const uint8_t *wrapped, size_t wrapped_len, uint8_t *sk,
   }
 
   /* The ONLY white-box work: two blocks, independent of .text size. Then close
-   * immediately — the ctx holds a ~400 KB VM data image, and keeping it is a
+   * immediately - the ctx holds a ~400 KB VM data image, and keeping it is a
    * recorded deferred change, not an oversight
-   * (docs/potential-improvements.md). */
+   * (docs/technical/IMPROVEMENTS.md). */
   st = wbc_unwrap_key(ctx, wrapped, sk);
   wbc_close(ctx);
   if (st != WBC_OK) {

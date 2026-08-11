@@ -51,13 +51,13 @@ def test_xor_roundtrip():
 # ---- wbaes: AES-128-CTR must stay bit-exact with the white-box KEY WRAP ---------------
 # Since wbcrypto 2.0.0 the white-box never touches `.text`; it only wraps a 32-byte session
 # key, and wbc_wrap_key is plain CTR under the sealed key. So the pack host builds the wrap
-# itself with cipher.aes128_ctr. These KATs pin that contract — if they drift, the device
+# itself with cipher.aes128_ctr. These KATs pin that contract - if they drift, the device
 # unwraps a garbage session key and the app runs encrypted code.
 _AES_KEY = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
 
 
 def test_aes128_fips197_ecb_block():
-    """AES core vs FIPS-197 — the vector `wb_encrypt` self-checks (proves white-box==AES)."""
+    """AES core vs FIPS-197 - the vector `wb_encrypt` self-checks (proves white-box==AES)."""
     pt = bytes.fromhex("00112233445566778899aabbccddeeff")
     rk = cipher._aes128_key_schedule(_AES_KEY)
     ct = cipher._aes128_encrypt_block(pt, rk)
@@ -69,7 +69,7 @@ def test_aes128_ctr_is_the_whitebox_key_wrap():
 
     A blob was sealed with kek=000102..0f, then wbc_unwrap_key was called on the 48-byte
     input `iv || 00 01 .. 1f`. CTR is its own inverse, so its output is exactly
-    aes128_ctr(00..1f, kek, iv) — i.e. what the pack host must produce for `wrapped`.
+    aes128_ctr(00..1f, kek, iv) - i.e. what the pack host must produce for `wrapped`.
     The first 16 bytes are visibly the FIPS-197 vector XOR'd with the input, which is the
     same fact from the other direction."""
     iv = bytes.fromhex("00112233445566778899aabbccddeeff")
@@ -114,7 +114,7 @@ def test_gen_wbaes_params_shapes():
 # ---- ChaCha20 openssl fast path (the bulk cipher for wbaes and --cipher chacha20) ------
 def test_chacha20_openssl_matches_python_above_and_below_threshold():
     """`.text` is multi-MB on real libs and pure Python runs at ~0.6 MB/s, so apply_cipher
-    shells out to openssl past a size threshold. The two paths MUST agree byte for byte —
+    shells out to openssl past a size threshold. The two paths MUST agree byte for byte -
     a mismatch means every packed lib decrypts to garbage on device."""
     key = os.urandom(32)
     nonce16 = os.urandom(12) + bytes([7, 0, 0, 0])       # non-zero initial counter too

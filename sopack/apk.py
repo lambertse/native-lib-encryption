@@ -150,7 +150,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
         # wbaes: (lib/<abi>/name, bytes, target's ZIP date_time)
         extra_helpers: list[tuple[str, bytes, tuple[int, int, int, int, int, int]]] = []
         # wbaes: ONE long-term key and ONE shared provider per ABI. Sealed lazily on that
-        # ABI's first target, then reused for every later target in it — which is what lets a
+        # ABI's first target, then reused for every later target in it - which is what lets a
         # single ~455 KB blob replace N of them.
         pack_keys: dict[str, object] = {}
         # abi -> ZIP date_time to stamp that ABI's provider with (see the helper note below).
@@ -161,7 +161,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                 zipfile.ZipFile(unsigned, "w") as zout:
             for item in zin.infolist():
                 name = item.filename
-                # Drop the previous signature — we re-sign.
+                # Drop the previous signature - we re-sign.
                 if name.startswith("META-INF/") and re.search(r"\.(RSA|DSA|EC|SF|MF)$|MANIFEST\.MF$", name):
                     continue
                 data = zin.read(name)
@@ -175,7 +175,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                         f.write(data)
                     if cipher == "wbaes" and abi not in pack_keys:
                         # Sealed lazily, on this ABI's first target. That means a stale
-                        # pre-3.0.0 wb_keygen fails mid-loop rather than up front — which is
+                        # pre-3.0.0 wb_keygen fails mid-loop rather than up front - which is
                         # safe here only because every intermediate lives in `tmp` and
                         # `out_apk` is not written until signing, so a raise leaves no partial
                         # output. Do not move the output into the loop without hoisting this.
@@ -215,7 +215,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                     zout.writestr(item, data)
                     seen_names.add(name)
 
-            # Emit ONE shared white-box provider per ABI, after the loop — it carries that
+            # Emit ONE shared white-box provider per ABI, after the loop - it carries that
             # ABI's single sealed blob, so it cannot be produced per target.
             from .elf_inject import emit_provider
             from .rt_meta import PROVIDER_SONAME
@@ -232,7 +232,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
             # add-file path).
             #
             # A collision is handled differently for the two kinds. For a per-target helper it is
-            # benign — the soname is derived from the target and prefixed libsopk_rt_, so a clash
+            # benign - the soname is derived from the target and prefixed libsopk_rt_, so a clash
             # means the APK already had one and skipping keeps the existing bytes. For the
             # PROVIDER it is fatal: silently skipping it would leave every thin helper resolving
             # against a pre-existing libsopk_wb.so carrying a FOREIGN blob, so no session key
@@ -262,7 +262,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                 pname = f"lib/{abi}/{PROVIDER_SONAME}"
                 if pname not in seen_names:
                     raise RuntimeError(
-                        f"{len(thin)} thin helper(s) for {abi} were staged but {pname} was not — "
+                        f"{len(thin)} thin helper(s) for {abi} were staged but {pname} was not - "
                         f"every one of them DT_NEEDEDs it, so the app would fail to load. This "
                         f"is a packer bug, not a bad input.")
 
@@ -273,7 +273,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
             )
 
         # Align uncompressed entries to 16 KB pages (native `zipalign` if present and
-        # runnable, else the built-in Python aligner — needed on hosts without an
+        # runnable, else the built-in Python aligner - needed on hosts without an
         # arch-matching zipalign, e.g. aarch64).
         _align_apk(unsigned, aligned, logger=logger)
 

@@ -1,15 +1,15 @@
 /*
- * sopk_rt.c — REFERENCE source for the white-box runtime helper used by
+ * sopk_rt.c - REFERENCE source for the white-box runtime helper used by
  * sopack's
  * `--cipher wbaes` mode. This is the THIN per-target helper: it triggers on its
  * own target and does the bulk decrypt, but links no white-box (see
  * stub/sopk_wb.c for the shared provider, and stub/sopk_wb.h for why the work
  * is split this way). The USER builds it per ABI with the Android NDK + O-MVLL:
  *
- * THE BUILD COMMAND AND ITS RATIONALE LIVE IN docs/wbaes-verification.md PHASE
+ * THE BUILD COMMAND AND ITS RATIONALE LIVE IN docs/technical/WBAES.md PHASE
  * 4 (step 4b). It is not repeated here, because two copies drift: use that one.
- * Since the v3 split this is the SIMPLER of the two links — plain clang, no
- * static libc++, no `-x c` dance, no libwbcrypto.a — but it must be linked
+ * Since the v3 split this is the SIMPLER of the two links - plain clang, no
+ * static libc++, no `-x c` dance, no libwbcrypto.a - but it must be linked
  * AGAINST the already-built libsopk_wb.so so that
  * --no-undefined still holds and the DT_NEEDED string comes from the provider's
  * DT_SONAME.
@@ -32,12 +32,12 @@
  * abort()s.
  *
  * Why fail closed here, when the freestanding stub deliberately fails open (see
- * docs/architecture.md §4c/§9b): the stub can chain the original DT_INIT and
- * genuinely degrade to an unpacked-but-working library. This helper has no such
- * fallback — its only job is decryption, so a failure leaves the target
- * executing still-encrypted .text, which SIGILLs somewhere inside the target
- * with nothing pointing at the cause. Aborting does not add a crash; it moves
- * the same crash to the real cause with a controlled signature, and
+ * docs/technical/ARCHITECTURE.md §4c/§9b): the stub can chain the original
+ * DT_INIT and genuinely degrade to an unpacked-but-working library. This helper
+ * has no such fallback - its only job is decryption, so a failure leaves the
+ * target executing still-encrypted .text, which SIGILLs somewhere inside the
+ * target with nothing pointing at the cause. Aborting does not add a crash; it
+ * moves the same crash to the real cause with a controlled signature, and
  * sopk_fail_code stays readable in the tombstone even in a stripped,
  * non-logging build.
  *
@@ -56,17 +56,17 @@
 #include <sys/mman.h> /* mmap, mremap, mprotect, munmap  */
 
 #include "sopk_rt.h"     /* region contract                 */
-#include "sopk_wb.h"     /* sopk_wb_k — the shared provider's ONE export */
+#include "sopk_wb.h"     /* sopk_wb_k - the shared provider's ONE export */
 #include "stub_cipher.h" /* sopk_chacha20_apply (the bulk .text cipher) */
 
 /* NOTE: this file links NO white-box. Every wbc_* call, the wbcrypto.h include
  * and the WBC_*_BYTES static assertions live in stub/sopk_wb.c (the shared
  * provider). That is what makes this artifact a few KB instead of ~465 KB, and
- * it is why the packer expects ZERO `wbc_` / `sodium_` references here — any at
+ * it is why the packer expects ZERO `wbc_` / `sodium_` references here - any at
  * all means it was built from the wrong source, or linked libwbcrypto.a by
  * mistake. */
 
-/* Retained build marker — see the SOPK_RT_BUILD_MARKER_BYTES note in sopk_rt.h.
+/* Retained build marker - see the SOPK_RT_BUILD_MARKER_BYTES note in sopk_rt.h.
  * `used` stops the compiler dropping it; `retain` (SHF_GNU_RETAIN) stops
  * --gc-sections doing so. The ctor also touches it, so it survives toolchains
  * that honour neither. */
@@ -128,7 +128,7 @@ static double sopk_now_ms(void) {
  * reason survives into a release build where there is no logging: the code is
  * readable in the tombstone's memory dump. `noreturn` lets the compiler drop
  * the dead code after every call site, so failing closed costs no bytes over
- * failing open. Codes are stable — do not renumber. */
+ * failing open. Codes are stable - do not renumber. */
 enum {
   SOPK_FAIL_NO_REGION = 1,
   SOPK_FAIL_BAD_FIELDS = 2,
@@ -166,7 +166,7 @@ __attribute__((noreturn)) static void sopk_fail(unsigned int code) {
 #endif
 
 /* Local session-key wipe. This file no longer links the white-box, so wbc_wipe
- * is gone — leaving a call to it here would fail the --no-undefined link, which
+ * is gone - leaving a call to it here would fail the --no-undefined link, which
  * is the right outcome but only if the reason is written down. `volatile` stops
  * the compiler eliding the store as a dead write to a soon-dead stack buffer.
  */
@@ -284,7 +284,7 @@ __attribute__((constructor)) static void sopk_rt_ctor(void) {
 
   /* self_cb only proved the 96-byte HEADER fits. The tail is variable-length
    * and its length comes from the region itself, so bound it against the
-   * segment before reading through soname — otherwise a truncated or
+   * segment before reading through soname - otherwise a truncated or
    * hand-edited region walks off the end of the mapping. Computed in the
    * segment's own units to avoid pointer overflow. */
   if ((uint64_t)SOPK_RT_REGION_HDR_SIZE + r->soname_len > (uint64_t)ss.size)
@@ -304,12 +304,12 @@ __attribute__((constructor)) static void sopk_rt_ctor(void) {
    * owns the sealed blob, the passphrase and every wbc_* call. This file links
    * no white-box at all.
    *
-   * The provider never aborts — it returns a reason code and we own failing
+   * The provider never aborts - it returns a reason code and we own failing
    * closed, so the tombstone names the step rather than blaming the shared
    * object. Its codes are folded into the 10..19 band; see sopk_wb.h for the
    * list. A link-time note: if libsopk_wb.so is missing at runtime bionic
    * cannot load THIS helper either, which fails the target's dlopen far from
-   * the cause — the packer therefore asserts the dependency is present and
+   * the cause - the packer therefore asserts the dependency is present and
    * staged. */
   SOPK_TIMER(t_phase);
   uint8_t sk[SOPK_RT_SESSION_KEY_BYTES];
@@ -321,7 +321,7 @@ __attribute__((constructor)) static void sopk_rt_ctor(void) {
               "sopk_wb_k failed (provider reason %d)", wrc);
   }
   /* ONE phase, not two. Since the v3 split this single call covers the
-   * provider's whole job — de-whiten, wbc_open, wbc_unwrap_key, wbc_close — so
+   * provider's whole job - de-whiten, wbc_open, wbc_unwrap_key, wbc_close - so
    * there is nothing left here to time separately. An earlier version reported
    * a bogus `unwrap=0.00ms` next to it, which read as "the white-box unwrap
    * became free" rather than "this number measures nothing". For the per-step
@@ -357,7 +357,7 @@ __attribute__((constructor)) static void sopk_rt_ctor(void) {
   sopk_chacha20_apply(tin, (size_t)text_size, sk, r->nonce16);
   SOPK_MEASURE(ms_decrypt, t_phase);
   sopk_wipe(sk,
-            sizeof(sk)); /* plaintext session key's job is done — drop it now */
+            sizeof(sk)); /* plaintext session key's job is done - drop it now */
 
   /* land the decrypted ANON pages onto the original .text VA -> SELinux execmem
    * path */
@@ -384,14 +384,14 @@ __attribute__((constructor)) static void sopk_rt_ctor(void) {
   }
 
   /* Must be checked: a failed mprotect leaves the decrypted window
-   * RW-and-not-X, so the first call into .text faults — and the old code went
+   * RW-and-not-X, so the first call into .text faults - and the old code went
    * on to log "OK" regardless. */
   if (mprotect((void *)win_lo, win_len, PROT_READ | PROT_EXEC) != 0)
     SOPK_FAIL(SOPK_FAIL_MPROTECT, "mprotect R-X failed");
   __builtin___clear_cache((char *)text, (char *)(text + text_size));
   SOPK_MEASURE(ms_place, t_phase);
 
-  SOPK_LOG("decrypted '%.*s' .text (%llu bytes) at 0x%lx — OK",
+  SOPK_LOG("decrypted '%.*s' .text (%llu bytes) at 0x%lx - OK",
            (int)r->soname_len, soname, (unsigned long long)text_size,
            (long)text);
   /* `total` covers the whole ctor, so it also includes the phdr scans and the

@@ -1,7 +1,7 @@
 /*
- * rt_roundtrip.c — host round-trip of the FULL `--cipher wbaes` contract, no
+ * rt_roundtrip.c - host round-trip of the FULL `--cipher wbaes` contract, no
  * device needed. Driven by scripts/build_wbaes.sh (Phase 3 of
- * docs/wbaes-verification.md).
+ * docs/technical/WBAES.md).
  *
  * Parses the packer's region with the real C struct, de-whitens the passphrase,
  * opens the sealed blob with the real wbcrypto >= 3.0.0, unwraps the session
@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (w->version != SOPK_RT_REGION_VERSION) {
-    printf("FAIL: provider region version %u != %u — packer/build disagree\n",
+    printf("FAIL: provider region version %u != %u - packer/build disagree\n",
            w->version, SOPK_RT_REGION_VERSION);
     return 1;
   }
@@ -88,7 +88,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (r->version != SOPK_RT_REGION_VERSION) {
-    printf("FAIL: target region version %u != %u — the packer and this build "
+    printf("FAIL: target region version %u != %u - the packer and this build "
            "disagree\n",
            r->version, SOPK_RT_REGION_VERSION);
     return 1;
@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
   /* A target region must NOT carry a blob any more. Its whole tail is the
    * soname. */
   if (rn != (size_t)SOPK_RT_REGION_HDR_SIZE + r->soname_len) {
-    printf("FAIL: target region is %zu bytes, expected %u + soname %u — it "
+    printf("FAIL: target region is %zu bytes, expected %u + soname %u - it "
            "still carries "
            "a blob, i.e. a pre-v3 region\n",
            rn, SOPK_RT_REGION_HDR_SIZE, r->soname_len);

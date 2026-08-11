@@ -1,5 +1,5 @@
 /*
- * stub.ld — link the stub into a single R+X image based at vaddr 0 so that, after
+ * stub.ld - link the stub into a single R+X image based at vaddr 0 so that, after
  * `objcopy -O binary`, every symbol's value equals its byte offset in the flat blob.
  * The injector loads that blob verbatim, so all intra-blob references must be
  * PC-relative (no GOT, no dynamic relocations). We DISCARD unwind/dynamic cruft and

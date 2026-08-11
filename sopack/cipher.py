@@ -3,8 +3,8 @@ byte, because the desktop side encrypts and the injected stub decrypts with the 
 keystream.
 
 Pure-Python (no external crypto dependency) so the tool has a small footprint. A `.text`
-section is NOT always small, though — a Flutter `libapp.so` runs to several MB, and the
-pure-Python ChaCha20 manages only ~0.6 MB/s — so both stream ciphers here take a system
+section is NOT always small, though - a Flutter `libapp.so` runs to several MB, and the
+pure-Python ChaCha20 manages only ~0.6 MB/s - so both stream ciphers here take a system
 `openssl` fast path when one is available, falling back to Python when it is not. The
 fast paths are byte-identical by construction and pinned by KATs in tests/test_cipher.py.
 """
@@ -189,7 +189,7 @@ def whiten_key(span: bytes) -> bytes:
 
 
 def whiten(record: bytes, span: bytes) -> bytes:
-    """XOR-mask (or unmask — it is its own inverse) the packed decinfo `record` with the
+    """XOR-mask (or unmask - it is its own inverse) the packed decinfo `record` with the
     ChaCha20 keystream keyed by whiten_key(span)."""
     return apply_cipher(CIPHER_CHACHA20, record, whiten_key(span), WHITEN_NONCE)
 
@@ -209,7 +209,7 @@ def whiten(record: bytes, span: bytes) -> bytes:
 # Counter convention MUST match CtrSessionKey: the full 16-byte IV is the initial counter,
 # incremented as a 128-bit BIG-ENDIAN integer; keystream block = E(counter); a partial final
 # block is truncated. Verified byte-exact against the real 2.0.0 wbc_unwrap_key, and still
-# exact at 3.0.0 (CtrSessionKey is byte-identical; only the seal's KDF tier changed) — see the
+# exact at 3.0.0 (CtrSessionKey is byte-identical; only the seal's KDF tier changed) - see the
 # KAT in tests/test_cipher.py.
 AES_BLOCK = 16
 
@@ -314,17 +314,17 @@ def aes128_ctr(data: bytes, key: bytes, iv: bytes) -> bytes:
 def gen_wbaes_params() -> tuple[bytes, bytes, bytes, bytes]:
     """Fresh per-library key material for `--cipher wbaes` (key wrapping):
 
-        kek      — 16-byte AES-128 long-term key; sealed into the white-box, then discarded
-        sk       — 32-byte session key; drives the ChaCha20 over `.text`, then discarded
-        wrap_iv  — 16-byte CTR IV for the wrap (ships in the clear ahead of the wrapped key)
-        nonce16  — ChaCha20 nonce block: 12-byte nonce + zero counter (see _chacha20_apply)
+        kek      - 16-byte AES-128 long-term key; sealed into the white-box, then discarded
+        sk       - 32-byte session key; drives the ChaCha20 over `.text`, then discarded
+        wrap_iv  - 16-byte CTR IV for the wrap (ships in the clear ahead of the wrapped key)
+        nonce16  - ChaCha20 nonce block: 12-byte nonce + zero counter (see _chacha20_apply)
     """
     return (os.urandom(16), os.urandom(SESSION_KEY_BYTES), os.urandom(16),
             os.urandom(12) + b"\x00\x00\x00\x00")
 
 
 def whiten_pass(passphrase: bytes, blob: bytes) -> bytes:
-    """Obfuscate (or de-obfuscate — self-inverse) the embedded passphrase with a ChaCha20
+    """Obfuscate (or de-obfuscate - self-inverse) the embedded passphrase with a ChaCha20
     keystream keyed off the sealed blob's own first `WHITEN_SPAN` bytes. Both the packer and
     the on-device helper have the blob, so no baked constant or code-span anchor is needed.
     Reuses whiten_key + WHITEN_NONCE; the helper (`stub/sopk_rt.c`) mirrors this exactly."""

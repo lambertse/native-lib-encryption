@@ -9,8 +9,8 @@ on today and the number that would flip it.
 ## 1. One KEK / one blob / one shared white-box provider (`--cipher wbaes`)
 
 **Today.** Each protected library gets its own `libsopk_rt_<target>.so`, carrying its own sealed
-blob. Each ships ~465 KB of white-box code plus a ~455 KB blob — **≈920 KB per library, STORED**
-— and each runs its own `wbc_open`.
+blob. Each ships ~465 KB of white-box code plus a ~455 KB blob - **≈920 KB per library, STORED**
+- and each runs its own `wbc_open`.
 
 **What it would become.** One KEK per (pack, ABI), sealed once. **N thin per-target helpers**
 (a few KB each, keeping today's `DT_NEEDED` trigger untouched) plus **one shared
@@ -25,20 +25,20 @@ entry point the thin helpers call to unwrap their session key.
 
 **Why it is deferred.** The original motivation was startup: `wbc_open` cost 266 ms per library
 on device. Sealing at the `light` KDF tier (wbcrypto 3.0.0) took that to ~1 ms, so the startup
-argument is gone and what remains is **APK size** — which pays only at N ≥ 2 and is a small net
+argument is gone and what remains is **APK size** - which pays only at N ≥ 2 and is a small net
 loss at N = 1. It is worth doing when a real app protects two or more libraries per ABI, and not
 before.
 
 **The shape to avoid.** Earlier drafts of `CLAUDE.md` named the fix as "one helper carrying N
 regions". That **cannot work**: bionic runs a shared object's constructors exactly once, so a
 helper shared by N targets only decrypts the libraries mapped when the *first* target loads. A
-`libapp.so` that Flutter `dlopen`s later would never be decrypted, and the helper fails closed —
+`libapp.so` that Flutter `dlopen`s later would never be decrypted, and the helper fails closed -
 so it is an abort at best and a `SIGILL` inside the target at worst. Keeping the trigger 1:1 with
 the target is the only thing that makes "is my target mapped when my ctor runs?" answerable. The
 multi-library PASS check in `wbaes-verification.md` Phase 6 exists to catch exactly this.
 
 **Cost to weigh against the size win.** A second hand-built artifact per ABI (Phase 4 becomes two
-ordered links — the thin helper links *against* the provider, so its `DT_NEEDED` comes from the
+ordered links - the thin helper links *against* the provider, so its `DT_NEEDED` comes from the
 provider's `DT_SONAME` and `-Wl,-soname` becomes load-bearing); a `REGION_VERSION` bump and a
 second build marker; the first *exported* symbol in this mode's history, i.e. a new
 static-analysis fingerprint; a relaxed (but also strengthened) `DT_NEEDED` guard; and a
@@ -56,7 +56,7 @@ Only relevant once improvement 1 exists. The provider would be **stateless** as 
 call does `wbc_open` → `wbc_unwrap_key` → `wbc_close`. Caching the context instead would save
 `(N-1) × ~1 ms`.
 
-**Why not.** It keeps the ~400 KB white-box table image resident — and dumpable — for the whole
+**Why not.** It keeps the ~400 KB white-box table image resident - and dumpable - for the whole
 process lifetime instead of a few milliseconds, widening the dynamic-analysis window that is
 already this design's ceiling. It makes the provider stateful, and it needs explicit
 serialisation, because upstream documents `wbc_ctx` as **not thread-safe** ("use one context per
@@ -65,7 +65,7 @@ construction.
 
 Worth recording honestly: caching violates **no** documented invariant. `sopk_rt.c`'s "close the
 context immediately" comment is a footprint rationale, and `CLAUDE.md`'s bounded-exposure claim is
-about the *session* key, not the context. It is a legitimate ~5-line change later — just not one
+about the *session* key, not the context. It is a legitimate ~5-line change later - just not one
 to make speculatively, and not for 1 ms per library.
 
 A refcounted "close after the last expected target" variant does **not** survive its own
@@ -83,8 +83,8 @@ cleartext `.text`, so an analyst after the *algorithm* reads the x86_64 build an
 the encryption. This is the single largest gap between what the tool does and what "the code is
 encrypted" sounds like, and it is worth stating in any threat-model conversation.
 
-Note `--cipher wbaes` on x86_64 would also need a provider built for that ABI, which — if
-improvement 1 lands with one KEK per ABI — must **not** share arm64's long-term key.
+Note `--cipher wbaes` on x86_64 would also need a provider built for that ABI, which - if
+improvement 1 lands with one KEK per ABI - must **not** share arm64's long-term key.
 
 **Measurement that would justify it.** Not a measurement: a decision about whether the emulator
 and x86_64-device install base matters for the app being packed.
