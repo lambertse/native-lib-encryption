@@ -33,8 +33,9 @@ stub, or the white-box integration; you do not need them to use the tool.
   why section-header stripping was rejected), with the code and the tests that lock each one.
 - **[technical/IMPROVEMENTS.md](./technical/IMPROVEMENTS.md)** - changes that are understood
   and deliberately **not** done, each with the trade-off it loses on today and the measurement
-  that would justify revisiting it. Read it before proposing an optimisation - the shapes that
-  look obvious and do not work are recorded here.
+  that would justify revisiting it - plus the ones that have since **shipped**, kept for their
+  measured result. Read it before proposing an optimisation - the shapes that look obvious and
+  do not work are recorded here.
 
 For a one-page overview, see the top-level [`README.md`](../README.md). For the terse
 invariant list, see `CLAUDE.md` in the repo root.

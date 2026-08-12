@@ -221,7 +221,7 @@ What remains per-library is one `wbc_open` per protected library, because the pr
 **stateless** (open → unwrap → close per call, no cached `wbc_ctx` - which also sidesteps
 `wbc_ctx` not being thread-safe). `Unseal` AEAD-decrypts the ~455 KB blob and builds the VM
 image on each call, ~1 ms on a host. Caching it is the open optimisation - see
-[`IMPROVEMENTS.md`](./IMPROVEMENTS.md) §1.
+[`IMPROVEMENTS.md`](./IMPROVEMENTS.md) §2.
 
 The APK-size argument that used to sit here is **closed**: before v3 each per-target helper
 carried its own ~465 KB of white-box code plus its own ~455 KB blob, ≈920 KB duplicated N
@@ -853,7 +853,7 @@ adb shell dumpsys meminfo <pkg> | head -20           # peak RSS around startup
 
 Record both, and compare peak RSS against the pre-3.0.0 baseline (which carried N × 64 MiB of
 transient Argon2id arena). What these numbers decide is whether caching the provider's
-`wbc_ctx` is worth doing - see [`IMPROVEMENTS.md`](./IMPROVEMENTS.md) §1. The APK-size question
+`wbc_ctx` is worth doing - see [`IMPROVEMENTS.md`](./IMPROVEMENTS.md) §2. The APK-size question
 that used to live here is already answered: since v3 the ~465 KB of white-box code and the
 ~455 KB blob ship **once per ABI**, not once per library.
 
