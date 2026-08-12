@@ -358,3 +358,12 @@ target and only the *provider* is shared. See `docs/technical/ARCHITECTURE.md` Â
 
 Toolchain (NDK/LLVM, JDK, Android SDK build-tools) is **not** bundled. Per standing user
 preference, **ask before installing any package or toolchain, even in auto mode.**
+
+**LIEF >= 1.0 is a hard floor** (`pyproject.toml`), because LIEF - not sopack - chooses where the
+appended segments land. A macOS host on LIEF `0.17.0` emitted a 4 KB-aligned LOAD injecting a
+1.66 MB arm64 library, which `_assert_16k_and_no_textrel` then (correctly) refused; `1.0.0` on
+Linux is verified clean on all three wbaes artifacts for that same library - version and host
+both varied, so treat the version as the leading suspect, not a proven sole cause. If a 16 KB
+error appears, check
+`lief.__version__` before looking for a packer bug - the error prints it. Three different
+artifacts reach that check (target / thin helper / shared provider) and the message names which.

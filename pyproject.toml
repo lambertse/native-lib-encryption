@@ -8,7 +8,12 @@ version = "0.1.0"
 description = "Black-box Android .so encryptor / APK repackager (obfuscation)"
 requires-python = ">=3.9"
 dependencies = [
-    "lief>=0.15",
+    # >=1.0 is a hard floor, not tidiness. LIEF places the appended segments, and 0.17.0 was
+    # observed emitting a 4 KB-aligned LOAD when injecting a 1.7 MB arm64 library - output that
+    # cannot load on 16 KB-page hardware, which the packer then refuses (_assert_16k_and_no_textrel).
+    # 1.0.0 is verified clean on all three wbaes artifacts (target, thin helper, shared provider)
+    # for that same library. See docs/TROUBLESHOOTING.md §16 KB.
+    "lief>=1.0",
 ]
 
 [project.scripts]

@@ -82,29 +82,56 @@ per-library limitation of the in-place method; report the library.
 
 ---
 
-## `the injection produced a LOAD segment that breaks 16 KB loading` (arm64)
+## `has a LOAD segment that breaks 16 KB loading` (arm64)
+
+**First: upgrade LIEF.** `pip install -U 'lief>=1.0'`, then re-pack. This is almost always the
+whole fix, and the packer now prints the LIEF version in the error for exactly that reason.
 
 **Cause:** sopack's own output, not your library. The check re-reads the input first and would
-have said *"is not 16 KB-page compatible to begin with"* if the input were at fault - so this
-wording means the input was clean and the injection introduced the bad segment.
+have said *"is not 16 KB-page compatible to begin with"* if the input were at fault.
 
-**Known trigger: the LIEF version.** Some LIEF builds relocate or add a 4 KB-aligned segment
-when the appended segment does not fit the existing layout. It is layout- and size-dependent, so
-it shows up on larger libraries while smaller ones pack cleanly. This is the same hazard that
-makes `_inject_wbaes` avoid LIEF's `add_library` entirely (see `docs/technical/ARCHITECTURE.md` §11f);
+**Which artifact?** The message names it, and it can be any of three - they are emitted at
+different points and only the first has an input to compare against:
+
+| Artifact | Emitted by | Note |
+|---|---|---|
+| `the packed target <soname>` | `_inject_wbaes` steps 2-3 | the only one with an `orig_path`, hence *"its input … is clean"* |
+| `the emitted thin helper libsopk_rt_<t>.so` | `_emit_helper`, per target | *"emitted from a skeleton, so there is no input to blame"* |
+| `the emitted shared provider libsopk_wb.so` | `emit_provider`, once per ABI **after** the per-target loop | a target failure aborts before this one is even reached |
+
+Older builds printed *"the input was clean, so this one is ours"* for all three, including the
+two that have no input - so a log from those cannot be attributed. Upgrade sopack, re-run, and
+read which artifact it names.
+
+**Known trigger: the LIEF version.** sopack asks for 16 KB (`seg.alignment = SEGMENT_ALIGN`), but
+some LIEF builds relocate the program headers or invent an extra 4 KB-aligned LOAD when the
+append does not fit the existing layout. It is layout- and size-dependent, so it shows up on
+larger libraries while smaller ones pack cleanly. This is the same hazard that makes
+`_inject_wbaes` avoid LIEF's `add_library` entirely (see `docs/technical/ARCHITECTURE.md` §11f);
 `add(seg)` is normally safe, but not on every LIEF version.
 
-Observed once on a macOS host packing a 1.7 MB arm64 library that another host - same file, same
-sopack commit, LIEF `1.0.0` - packed to clean 16 KB output. So when reporting it, include:
+Observed on a macOS host with LIEF **`0.17.0`** packing a 1.66 MB arm64 library
+(`libvosWrapperEx.so`, `--cipher wbaes`). On LIEF **`1.0.0`**, same file and same sopack commit,
+all three artifacts come out clean - target (2 LOADs in, 3 out, all `0x4000`), thin helper
+(6 LOADs), and provider (4 LOADs), every one `0x4000`-aligned and congruent. The provider was
+checked with a *synthetic* region of representative size (~455 KB blob) rather than a real seal,
+since the layout question does not need a host `wb_keygen`; the alignment result is what stands,
+not the exact byte count. Hence the `lief>=1.0` floor in `pyproject.toml` (1.0.0 is on PyPI with
+macOS arm64 wheels, so the upgrade resolves on an Apple Silicon host). When reporting a
+recurrence, include:
 
 ```bash
 python3 -c "import lief; print(lief.__version__)"
-readelf -lW <input.so>  | awk '/LOAD/{print $NF}'      # the input's alignments
-readelf -lW <packed.so> | awk '/LOAD/{print $NF}'      # and the output's
+readelf -lW <input.so>  | awk '/LOAD/{print $2, $3, $NF}'   # the input's offsets/vaddrs/alignments
+readelf -lW <packed.so> | awk '/LOAD/{print $2, $3, $NF}'   # and the output's
 ```
 
-**Workarounds, in order:** pin a LIEF version that produces clean output; leave that library out
-of `--lib`; or pack it only for a device class that does not require 16 KB pages.
+Note `awk '/LOAD/{print $NF}'` on two files is easy to misread: this library has **2** LOAD
+segments, so four printed lines means you ran it on the same file twice, not that you saw the
+output.
+
+**Workarounds if `>=1.0` still fails:** report it with the table row it named, leave that library
+out of `--lib`, or pack it only for a device class that does not require 16 KB pages.
 
 **Do not disable the check.** It is refusing to emit an APK that would fail to load on 16 KB-page
 hardware, which Play requires 64-bit apps to support - the failure is the guard working.

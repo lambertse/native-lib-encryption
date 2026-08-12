@@ -921,7 +921,8 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
             f"injection changed the target's dynamic symbol names ({detail}) - DT_STRTAB and "
             "the .dynsym offsets are out of sync, so dlsym() would fail on device")
     # (c) 16 KB congruence for arm64 (the only 16 KB-page device class) + no text relocs.
-    _assert_16k_and_no_textrel(tgt, abi, orig_path=in_path)
+    _assert_16k_and_no_textrel(tgt, abi, orig_path=in_path,
+                               what=f"the packed target {target_soname}")
 
     hlp = lief.parse(helper_path)
     if hlp is None:
@@ -934,7 +935,7 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
              if n not in _BIONIC_ALLOWED and n != PROVIDER_SONAME]
     if stray:
         raise InjectError(f"emitted helper has unexpected DT_NEEDED {stray}")
-    _assert_16k_and_no_textrel(hlp, abi)
+    _assert_16k_and_no_textrel(hlp, abi, what=f"the emitted thin helper {helper_soname}")
     # The strip actually happened. A silently-skipped strip ships 2.7 MB of DWARF and the full
     # symbol table, which is the single largest analysis shortcut in the whole design.
     leftover = sorted(s.name for s in hlp.sections
@@ -1021,21 +1022,28 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
 
 
 def _16k_violations(binary) -> list[str]:
-    """LOAD segments that would stop this `.so` loading on a 16 KB-page device."""
+    """LOAD segments that would stop this `.so` loading on a 16 KB-page device.
+
+    Each entry names the offending segment by phdr INDEX and prints its whole placement, not
+    just the failing field: the cause is almost always a LIEF version that placed or invented a
+    segment we did not ask for, and "align 4096" alone does not say which one of six LOADs that
+    was. See docs/TROUBLESHOOTING.md §16 KB."""
     load_t = _seg_type_load()
     bad = []
-    for s in binary.segments:
+    for i, s in enumerate(binary.segments):
         if s.type != load_t:
             continue
+        where = (f"LOAD[phdr {i}] off=0x{int(s.file_offset):x} "
+                 f"vaddr=0x{int(s.virtual_address):x} align=0x{int(s.alignment):x}")
         if int(s.alignment) % SEGMENT_ALIGN != 0:
-            bad.append(f"align {int(s.alignment)}")
+            bad.append(f"{where}: align {int(s.alignment)} is not a multiple of {SEGMENT_ALIGN}")
         elif (int(s.virtual_address) - int(s.file_offset)) % SEGMENT_ALIGN != 0:
-            bad.append(f"vaddr 0x{int(s.virtual_address):x} not congruent with "
-                       f"offset 0x{int(s.file_offset):x}")
+            bad.append(f"{where}: vaddr not congruent with offset mod {SEGMENT_ALIGN}")
     return bad
 
 
-def _assert_16k_and_no_textrel(binary, abi, orig_path: str | None = None):
+def _assert_16k_and_no_textrel(binary, abi, orig_path: str | None = None,
+                               what: str = "the output"):
     """16 KB page hardware is arm64-only, so this gates arm64-v8a output only - armeabi-v7a and
     x86_64 inputs commonly ship 4 KB LOADs and must not be rejected over a device class that
     cannot run them.
@@ -1043,7 +1051,13 @@ def _assert_16k_and_no_textrel(binary, abi, orig_path: str | None = None):
     `orig_path` lets the failure distinguish the two very different causes. If the INPUT already
     violates the rule, that is a property of the library we were handed: no amount of packer
     correctness can fix it, and saying "LOAD seg align 4096" without that context sends the
-    reader looking for a bug in the injection."""
+    reader looking for a bug in the injection.
+
+    `what` names the artifact. Three different artifacts reach this check - the packed target,
+    the thin helper, the shared provider - and only the target has an `orig_path`, so without a
+    label the other two used to report "the input was clean, so this one is ours" about a file
+    that has no input at all. That wording is what pinned an entire troubleshooting entry to the
+    target-side story and left a real failure log un-attributable."""
     if abi == "arm64-v8a":
         bad = _16k_violations(binary)
         if bad:
@@ -1054,9 +1068,19 @@ def _assert_16k_and_no_textrel(binary, abi, orig_path: str | None = None):
                     f"its own LOAD segments already violate the rule ({'; '.join(pre)}) before "
                     "any injection, so the packed output cannot either. Rebuild that library "
                     "with -Wl,-z,max-page-size=16384, or pack it only for 4 KB device classes.")
+            checked = (f"Its input {os.path.basename(orig_path)} is clean, so this one is ours."
+                       if orig_path else
+                       "It is emitted from a skeleton, so there is no input to blame - "
+                       "this one is ours.")
             raise InjectError(
-                f"the injection produced a LOAD segment that breaks 16 KB loading "
-                f"({'; '.join(bad)}) - the input was clean, so this one is ours")
+                f"{what} has a LOAD segment that breaks 16 KB loading. {checked}\n  "
+                + "\n  ".join(bad) +
+                f"\nLIEF {lief.__version__} placed those segments. This is a known "
+                "LIEF-version-dependent failure: sopack appends its segments with a 16 KB "
+                "alignment, but some LIEF builds relocate the program headers or invent an extra "
+                "4 KB-aligned LOAD when the append does not fit the existing layout. LIEF 1.0.0 "
+                "is verified clean on all three artifacts - upgrade with "
+                "`pip install -U 'lief>=1.0'` and re-pack. See docs/TROUBLESHOOTING.md §16 KB.")
     if binary.get(_tag("TEXTREL")) is not None:
         raise InjectError("output has DT_TEXTREL (text relocations) - must be absent")
 
@@ -1108,7 +1132,7 @@ def _self_verify_provider(provider_path: str, abi: str, pack: PackKey) -> None:
             f"emitted provider {name} CONTAINS THE LONG-TERM KEY in cleartext - the whole point "
             "of the white-box is that this key is never reconstructable from what ships")
 
-    _assert_16k_and_no_textrel(b, abi)
+    _assert_16k_and_no_textrel(b, abi, what=f"the emitted shared provider {name}")
 
 
 def _extract_region(helper_path: str, magic_int: int = REGION_MAGIC) -> bytes:
