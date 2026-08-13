@@ -15,6 +15,11 @@ _STUB_DIR = Path(__file__).resolve().parent / "stubs"
 # Map APK lib/<abi> directory names to our stub ABI keys (identical here, but explicit).
 SUPPORTED_ABIS = ("arm64-v8a", "armeabi-v7a", "x86_64")
 
+# Packed when --abi is omitted. arm64-v8a is the only ABI protected in practice (see
+# CLAUDE.md "Only arm64-v8a is protected in practice, by deliberate scope choice"), so the
+# others must be opted into explicitly. `--abi all` spells out SUPPORTED_ABIS.
+DEFAULT_ABIS = ("arm64-v8a",)
+
 
 @dataclass(frozen=True)
 class Stub:

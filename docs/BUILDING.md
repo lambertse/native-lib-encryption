@@ -94,21 +94,32 @@ export SOPACK_APKSIGNER_JAR="$ANDROID_SDK_ROOT/build-tools/34.0.0/lib/apksigner.
 
 ```bash
 sopack pack in.apk \
-    --lib libapp.so,libother.so \
     -o out.apk \
-    --abi arm64-v8a,armeabi-v7a,x86_64 \
+    --exclude-lib 'libc++_shared,libmy*' \
     --cipher chacha20 \
     --log \
     --keystore "$HOME/.sopack/debug.keystore" \
     --verify
 ```
 
-- `--lib` names the libraries to encrypt. It is **repeatable and/or comma-separated**
-  (`--lib a.so,b.so`, `--lib a.so --lib b.so`, or a mix). A bare basename (`libapp.so`)
-  matches that library in **every** selected ABI; a full path
+- **Library selection is optional.** Omit `--lib`/`--libs` and every `lib/<abi>/*.so` in
+  the APK is encrypted, for the ABIs `--abi` selects.
+- `--lib` names the libraries to encrypt explicitly. It is **repeatable and/or
+  comma-separated** (`--lib a.so,b.so`, `--lib a.so --lib b.so`, or a mix). A bare basename
+  (`libapp.so`) matches that library in **every** selected ABI; a full path
   (`lib/arm64-v8a/libapp.so`) targets one ABI. For many libraries you can instead use
   `--libs libs.txt` (one entry per line; `#` comments allowed).
-- `--abi` - omit to encrypt all three ABIs by default.
+- **Failure semantics differ between the two.** A library that cannot be injected aborts
+  the pack when you named it explicitly, but is **skipped with a warning** under
+  auto-select (it then ships in cleartext). Either way the run prints a per-ABI summary of
+  what was injected, skipped, and not selected - check it before shipping.
+- `--exclude-lib` - fnmatch globs against the basename, `.so` suffix optional; repeatable
+  and/or comma-separated. **Exclusion always wins**, including over an explicit `--lib`.
+  Applied on top of two built-in sets: `libsopk_*` (sopack's own injected provider and thin
+  helpers - **never** removable, they are what performs the decryption) and `libflutter`
+  (excluded by policy; `--no-default-exclude` turns that one off).
+- `--abi` - defaults to **`arm64-v8a` alone**, the only ABI protected in practice. Pass
+  `--abi all` for all three, or a comma list such as `--abi arm64-v8a,x86_64`.
 - `--cipher` - `chacha20` (default), `xor`, or `wbaes`. The first two use the freestanding
   stub. `wbaes` is white-box AES-128 key wrapping via injected helpers: it ships no
   portable key, but it has prerequisites the other modes do not -

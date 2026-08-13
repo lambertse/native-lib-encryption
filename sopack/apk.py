@@ -1,14 +1,19 @@
 """APK repackaging + self-signing.
 
-Flow: for each requested lib/<abi>/*.so inside the APK, inject (encrypt + stub),
+Flow: for each selected lib/<abi>/*.so inside the APK, inject (encrypt + stub),
 write it back STORED (uncompressed) so it stays page-mappable, strip the old
 signature, then `zipalign -P 16` and `apksigner` with a generated keystore.
+
+Selection is either an explicit list (--lib/--libs) or, when that list is omitted,
+every lib/<abi>/*.so in the input APK for the selected ABIs. Exclusion patterns always
+win over selection; see DEFAULT_EXCLUDE_PATTERNS / ALWAYS_EXCLUDE_PATTERNS below.
 
 Re-signing changes the signing identity: the output is effectively a new app and
 cannot be installed as an update over the original.
 """
 from __future__ import annotations
 
+import fnmatch
 import glob
 import os
 import re
@@ -19,10 +24,24 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .elf_inject import InjectResult, inject_so
-from .stubs import SUPPORTED_ABIS
+from .elf_inject import InjectError, InjectResult, inject_so
+from .stubs import DEFAULT_ABIS, SUPPORTED_ABIS
 
 _LIB_RE = re.compile(r"^lib/([^/]+)/([^/]+\.so)$")
+
+# Excluded by default from BOTH auto-select and an explicit --lib. --no-default-exclude
+# turns this list off. Patterns are fnmatch globs on the basename; a trailing ".so" is
+# optional, so "libflutter" matches "libflutter.so".
+DEFAULT_EXCLUDE_PATTERNS = (
+    "libflutter",       # excluded by user preference; no known technical failure
+)
+
+# Excluded UNCONDITIONALLY - not affected by --no-default-exclude, and not overridable by
+# naming one in --lib. These are sopack's own injected artifacts: the shared provider
+# (rt_meta.PROVIDER_SONAME) and the per-target thin helpers, emitted as
+# libsopk_rt_<target>.so. Auto-selecting them on an already-packed APK would encrypt the
+# very code that does the decrypting.
+ALWAYS_EXCLUDE_PATTERNS = ("libsopk_*", "libvosWrapperEx")
 
 
 # ---- external tool discovery ------------------------------------------------------
@@ -110,27 +129,71 @@ def ensure_keystore(ks: KeystoreInfo) -> KeystoreInfo:
 @dataclass
 class RepackResult:
     injected: list[InjectResult] = field(default_factory=list)
-    skipped: list[str] = field(default_factory=list)   # entry names not matched
+    # (entry, reason) for every lib/<abi>/*.so we deliberately did not select.
+    untouched: list[tuple[str, str]] = field(default_factory=list)
+    # (entry, InjectError message) for libraries that were selected but could not be
+    # injected. Only ever populated in auto-select mode - an explicitly named library
+    # still aborts the whole pack.
+    failed: list[tuple[str, str]] = field(default_factory=list)
     output: str = ""
 
 
-def _is_target(entry: str, abi: str, so: str, wanted: set[str], abis: set[str]) -> bool:
+def build_excludes(exclude_libs=None, no_default_exclude: bool = False) -> tuple[str, ...]:
+    """Assemble the effective exclusion pattern list, most-authoritative first."""
+    pats = list(ALWAYS_EXCLUDE_PATTERNS)
+    if not no_default_exclude:
+        pats.extend(DEFAULT_EXCLUDE_PATTERNS)
+    pats.extend(exclude_libs or ())
+    return tuple(pats)
+
+
+def _match_lib_pattern(entry: str, so: str, pat: str) -> bool:
+    """fnmatch on the basename with an optional .so suffix; full APK paths also match."""
+    return (fnmatch.fnmatch(so, pat)
+            or fnmatch.fnmatch(so, pat + ".so")
+            or fnmatch.fnmatch(entry, pat))
+
+
+def _classify(entry: str, abi: str, so: str, wanted: set[str] | None,
+              abis: set[str], excludes: tuple[str, ...]) -> tuple[bool, str]:
+    """(select?, reason-if-not). `wanted is None` means auto-select everything.
+
+    Exclusion is checked before selection, so an excluded name is never packed even when
+    it was named explicitly in --lib.
+    """
     if abi not in abis:
-        return False
+        # Distinguish "you could pass --abi for this" from "sopack has no stub for it":
+        # _LIB_RE matches any <abi> directory name, including lib/x86/ and lib/mips/ that
+        # --abi would reject outright.
+        return False, ("abi not selected" if abi in SUPPORTED_ABIS
+                       else "abi not supported by sopack")
+    for pat in excludes:
+        if _match_lib_pattern(entry, so, pat):
+            return False, f"excluded by {pat!r}"
+    if wanted is None:
+        return True, ""
     # Match by full lib path or by bare basename (which then applies to every ABI).
-    return entry in wanted or so in wanted
+    if entry in wanted or so in wanted:
+        return True, ""
+    return False, "not requested"
 
 
-def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
+def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
               cipher: str = "chacha20",
-              abis: tuple[str, ...] = SUPPORTED_ABIS,
+              abis: tuple[str, ...] = DEFAULT_ABIS,
               keystore: KeystoreInfo | None = None,
               min_sdk: int | None = None,
               log: bool = False,
               wb_keygen: str | None = None,
               allow_helper_log: bool = False,
+              exclude_libs: list[str] | None = None,
+              no_default_exclude: bool = False,
               logger=print) -> RepackResult:
-    wanted = set(wanted_libs)
+    # `None` means auto-select every lib/<abi>/*.so; an empty list is NOT the same thing
+    # (the CLI rejects an empty --libs file rather than silently widening the scope).
+    auto = wanted_libs is None
+    wanted = None if auto else set(wanted_libs)
+    excludes = build_excludes(exclude_libs, no_default_exclude)
     abis_set = set(abis)
     result = RepackResult(output=out_apk)
 
@@ -146,6 +209,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
         aligned = os.path.join(tmp, "aligned.apk")
 
         matched_any = False
+        candidates = 0                        # lib/<abi>/*.so entries seen, any ABI
         seen_names: set[str] = set()          # every entry written (collision guard)
         # wbaes: (lib/<abi>/name, bytes, target's ZIP date_time)
         extra_helpers: list[tuple[str, bytes, tuple[int, int, int, int, int, int]]] = []
@@ -166,7 +230,12 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                     continue
                 data = zin.read(name)
                 m = _LIB_RE.match(name)
-                if m and _is_target(name, m.group(1), m.group(2), wanted, abis_set):
+                select, why = (False, "")
+                if m:
+                    candidates += 1
+                    select, why = _classify(name, m.group(1), m.group(2),
+                                            wanted, abis_set, excludes)
+                if select:
                     abi = m.group(1)
                     logger(f"  injecting {name} [{abi}] …")
                     src = os.path.join(tmp, "in.so")
@@ -182,10 +251,32 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                         from .provision import provision_pack
                         logger(f"  sealing the shared white-box key for {abi} …")
                         pack_keys[abi] = provision_pack(wb_keygen=wb_keygen)
-                    ir = inject_so(src, dst, abi, cipher=cipher, log=log,
-                                   wb_keygen=wb_keygen, target_name=m.group(2),
-                                   allow_helper_log=allow_helper_log,
-                                   pack_key=pack_keys.get(abi))
+                    try:
+                        ir = inject_so(src, dst, abi, cipher=cipher, log=log,
+                                       wb_keygen=wb_keygen, target_name=m.group(2),
+                                       allow_helper_log=allow_helper_log,
+                                       pack_key=pack_keys.get(abi))
+                    except InjectError as e:
+                        # An explicitly named library still aborts the pack - the user
+                        # asked for THAT library and a silent downgrade to cleartext would
+                        # be a lie. Under auto-select the list contains libraries the user
+                        # never individually considered (prebuilts with no .text, no
+                        # .dynamic slack, 4 KB-aligned arm64 …), so one of them must not
+                        # kill the run; it is skipped and reported instead.
+                        if not auto:
+                            # inject_so reports the temp copy's path, not the APK entry -
+                            # fine when one library was named, useless once selection is
+                            # implicit. Prefix the entry either way.
+                            raise InjectError(f"{name}: {e}") from e
+                        logger(f"  warning: skipping {name}: {e}")
+                        result.failed.append((name, str(e)))
+                        # `data` is still the pristine zin.read(name) here - it is only
+                        # reassigned below, after a successful inject. A raise also stages
+                        # nothing: extra_helpers/thin_by_abi are fed from `ir`, which does
+                        # not exist on this path.
+                        zout.writestr(item, data)
+                        seen_names.add(name)
+                        continue
                     with open(dst, "rb") as f:
                         data = f.read()
                     result.injected.append(ir)
@@ -210,7 +301,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                     seen_names.add(name)
                 else:
                     if m:
-                        result.skipped.append(name)
+                        result.untouched.append((name, why))
                     # Preserve original entry (compression and all).
                     zout.writestr(item, data)
                     seen_names.add(name)
@@ -219,7 +310,12 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
             # ABI's single sealed blob, so it cannot be produced per target.
             from .elf_inject import emit_provider
             from .rt_meta import PROVIDER_SONAME
-            for abi, pk in pack_keys.items():
+            # Keyed on thin_by_abi, NOT pack_keys: the key is sealed lazily *before*
+            # inject_so, so an ABI whose every target was skipped (auto-select fail-soft
+            # above) has a pack_keys entry but no thin helper. Emitting its provider would
+            # add ~936 KB of white-box to the APK with nothing depending on it.
+            for abi in thin_by_abi:
+                pk = pack_keys[abi]
                 pname = f"lib/{abi}/{PROVIDER_SONAME}"
                 ppath = os.path.join(tmp, f"provider-{abi}.so")
                 logger(f"  emitting shared white-box provider for {abi} …")
@@ -237,7 +333,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
             # PROVIDER it is fatal: silently skipping it would leave every thin helper resolving
             # against a pre-existing libsopk_wb.so carrying a FOREIGN blob, so no session key
             # would unwrap and every target would abort on device.
-            provider_names = {f"lib/{abi}/{PROVIDER_SONAME}" for abi in pack_keys}
+            provider_names = {f"lib/{abi}/{PROVIDER_SONAME}" for abi in thin_by_abi}
             for hname, hdata, hdate in extra_helpers:
                 if hname in seen_names:
                     if hname in provider_names:
@@ -267,10 +363,18 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str],
                         f"is a packer bug, not a bad input.")
 
         if not matched_any:
+            if not auto:
+                raise RuntimeError(
+                    "no .so entries matched the requested list; nothing to encrypt. "
+                    f"requested={sorted(wanted)}")
+            if candidates == 0:
+                raise RuntimeError(
+                    "this APK has no lib/<abi>/*.so entries at all; nothing to encrypt.")
             raise RuntimeError(
-                "no .so entries matched the requested list; nothing to encrypt. "
-                f"requested={sorted(wanted)}"
-            )
+                f"none of the {candidates} lib/<abi>/*.so entries in this APK were packed: "
+                f"{len(result.untouched)} excluded or outside --abi "
+                f"{','.join(sorted(abis_set))}, {len(result.failed)} could not be injected. "
+                "See the per-library reasons above.")
 
         # Align uncompressed entries to 16 KB pages (native `zipalign` if present and
         # runnable, else the built-in Python aligner - needed on hosts without an

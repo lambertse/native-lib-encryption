@@ -10,10 +10,11 @@ something crashes, read [`troubleshooting.md`](./troubleshooting.md).
 
 ## 1. The goal, and why it forces a "black-box packer"
 
-sopack takes an **already-built APK** plus a list of native libraries, and produces a
-**self-signed APK** in which each listed `.so` has its code section (`.text`)
-encrypted at rest and transparently decrypted at load time - **with no access to the
-library's source**.
+sopack takes an **already-built APK**, optionally narrowed to a list of native libraries,
+and produces a **self-signed APK** in which each selected `.so` has its code section
+(`.text`) encrypted at rest and transparently decrypted at load time - **with no access to
+the library's source**. Omitting the list selects every `lib/<abi>/*.so` in the APK; see §6
+for the selection and exclusion rules.
 
 The "no source" requirement is the whole story. If we had the source we would compile
 a decryption stub *into* each library at build time (the classic model). We don't, so
@@ -297,8 +298,18 @@ instead of on the device; it is deliberately loader-aware now.
 
 Source: `sopack/apk.py`, driven by `sopack/cli.py`.
 
-1. Unzip the APK; for each `lib/<abi>/<name>.so` matching the requested list (by full
-   path or bare basename → all ABIs), run Component 2.
+1. Unzip the APK; for each **selected** `lib/<abi>/<name>.so`, run Component 2. Selection
+   is either the explicit `--lib`/`--libs` list (by full path or bare basename → all ABIs)
+   or, when that list is omitted, **every** `lib/<abi>/*.so` in the input APK. Exclusion
+   patterns (`--exclude-lib` plus the built-in `libsopk_*` / `libflutter`) are checked
+   *before* selection, so they override an explicit `--lib` too. `libsopk_*` is
+   unconditional: those are sopack's own injected provider and thin helpers, and
+   auto-select on an already-packed APK would otherwise encrypt the decryptor.
+   Enumeration reads only the **input** zip's entry list, so helpers added later in the
+   same run can never be fed back through Component 2.
+   Under auto-select an `InjectError` on one library is demoted to a **skip** (the original
+   entry is written back verbatim and reported); an explicitly named library still aborts
+   the pack. Zero packed libraries is always an error.
 2. Write the injected `.so` back **STORED (uncompressed)** so it stays page-mappable;
    drop the old `META-INF` signature.
 3. **16 KB-align**: `zipalign -P 16` if a runnable one is found, else a **built-in

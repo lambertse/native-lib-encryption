@@ -5,7 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `sopack` is a **black-box Android `.so` encryptor / APK repackager**. Input: an existing
-APK + a list of native library names. Output: a self-signed APK in which each listed
+APK, optionally narrowed to a list of native library names (omit it and every
+`lib/<abi>/*.so` is selected). Output: a self-signed APK in which each selected
 library's `.text` is encrypted at rest and transparently decrypted at load by an injected
 freestanding stub - **with no access to the library source**. It is an ELF-injection
 packer (same class as Tencent Legu). Security value is obfuscation only: the key ships in
@@ -41,11 +42,18 @@ pip install -e .                            # install the CLI (pulls in LIEF)
 bash stub/build_stubs.sh [API_LEVEL]        # default API 24 -> sopack/stubs/*.bin + *.json
 
 # Pack an APK
-sopack pack in.apk --lib libfoo.so,libbar.so -o out.apk \
-    [--abi arm64-v8a,...] [--cipher chacha20|xor|wbaes] [--min-sdk N] [--log] \
+sopack pack in.apk -o out.apk \
+    [--lib libfoo.so,libbar.so] [--libs libs.txt] \
+    [--exclude-lib GLOB,...] [--no-default-exclude] \
+    [--abi arm64-v8a,... | all] [--cipher chacha20|xor|wbaes] [--min-sdk N] [--log] \
     [--allow-helper-log] \
     [--wb-keygen PATH] [--keystore PATH --ks-alias A --ks-pass P --key-pass P] [--verify]
-sopack pack in.apk --libs libs.txt -o out.apk        # or a file, one .so per line
+# LIBRARY SELECTION IS OPTIONAL. Omit --lib/--libs -> every lib/<abi>/*.so in the input APK,
+# for the ABIs --abi selects. --lib is repeatable and/or comma-separated; --libs is a file,
+# one .so per line. See "Library selection" below for the exclusion rules and for why
+# auto-select SKIPS an un-injectable library where an explicitly named one ABORTS.
+# --abi DEFAULTS TO arm64-v8a ALONE (stubs.DEFAULT_ABIS) - the only ABI protected in
+# practice. `--abi all` = SUPPORTED_ABIS. This changed: it used to default to all three.
 # --cipher wbaes = white-box AES-128 KEY-WRAP mode (see "wbaes mode" below): the long-term key
 # is sealed into a white-box blob and never reconstructed at runtime, so no portable key ships.
 # Needs whitebox-cryptography >= 3.0.0, a HOST wb_keygen (--wb-keygen / $SOPACK_WBKEYGEN) and a
@@ -61,6 +69,7 @@ python -m pytest tests/test_cipher.py       # ChaCha20/XOR + the wbaes key-wrap 
 python -m pytest tests/test_metadata.py     # decinfo layout vs decinfo.h
 python -m pytest tests/test_rt_meta.py      # both region layouts vs stub/sopk_rt.h (wbaes)
 python -m pytest tests/test_provision.py    # the blob-header gate: v>=4 + light KDF tier
+python -m pytest tests/test_lib_select.py   # auto-select, exclusions, --abi default, fail-soft
 python -m pytest tests/test_wbaes.py        # wbaes guards, the strip, and real injection
                                            #   (2 tests skip w/o a host wb_keygen)
 python -m pytest tests/test_integration.py -k init_array   # a single test by name
@@ -86,13 +95,44 @@ Three components + a thin CLI (`sopack/cli.py`):
 2. **ELF injection engine** - `sopack/elf_inject.py` (LIEF). Encrypts `.text`, appends the
    stub as a new R+X `PT_LOAD`, hijacks load-time init, and patches the metadata record.
 
-3. **APK repackager** - `sopack/apk.py`. unzip → inject each matched `lib/<abi>/*.so` →
+3. **APK repackager** - `sopack/apk.py`. unzip → inject each **selected** `lib/<abi>/*.so` →
    libs written STORED + 16 KB-aligned → `apksigner` self-sign with a generated keystore.
    For `--cipher wbaes` it also **adds** files into `lib/<abi>/` (STORED + 16 KB) - the only
    add-file path in the tool: one thin helper per protected library, plus **one**
    `libsopk_wb.so` per ABI. It also seals ONE white-box key per ABI before the entry loop and
    asserts pack-level closure afterwards (every staged thin helper's provider is present) -
    a per-target verifier structurally cannot see that.
+
+### Library selection (`apk.py:_classify` / `build_excludes`)
+
+`repackage(..., wanted_libs)` takes `None` to mean **auto-select every `lib/<abi>/*.so`**, or a
+list for explicit selection. `None` and `[]` are NOT interchangeable - `cli.py` rejects an empty
+`--libs` file rather than silently widening the scope to the whole APK.
+
+- **Exclusion is checked before selection**, so `--exclude-lib` overrides an explicit `--lib`.
+  Patterns are fnmatch globs on the basename with an **optional `.so`** (`libflutter` matches
+  `libflutter.so` but not `libflutterx.so`); full APK paths also match.
+- `ALWAYS_EXCLUDE_PATTERNS = ("libsopk_*",)` is **unconditional** - not removable by
+  `--no-default-exclude` and not overridable by naming one in `--lib`. Those are the tool's own
+  injected artifacts (`rt_meta.PROVIDER_SONAME` + the `libsopk_rt_<target>.so` thin helpers), and
+  auto-select on an already-packed APK would otherwise feed the *decryptor* through `inject_so`.
+  The `apk.py` collision guard does not cover this: it guards the *add-entry* path, not inject.
+- `DEFAULT_EXCLUDE_PATTERNS = ("libflutter",)` is **user preference, not a technical
+  workaround.** Do not annotate it with the old `DT_INIT_ARRAY`-hijack SIGILL - that root cause
+  is fixed (`DT_INIT-hijack`/`DT_INIT-inplace` are the only strategies `master` emits).
+  `--no-default-exclude` drops this list only.
+- **Fail-soft is scoped to auto-select.** An `InjectError` is demoted to a skip (original entry
+  written back verbatim, recorded in `RepackResult.failed`) *only* when `wanted_libs is None`; an
+  explicitly named library re-raises, prefixed with the APK entry name. The rationale is
+  asymmetric intent - the user vouched for a library they named, but auto-select contains
+  libraries they never considered, and one stripped prebuilt must not kill the run. Zero packed
+  libraries is always an error. Every cleartext library must appear in the CLI summary
+  (`cli._print_summary`); silent skipping is worse than aborting.
+- **The wbaes provider loop is keyed on `thin_by_abi`, not `pack_keys`.** The white-box key is
+  sealed lazily *before* `inject_so`, so an ABI whose every target was skipped has a `pack_keys`
+  entry and no consumer - emitting its provider would add ~936 KB of dead white-box to the APK.
+- Enumeration reads only `zin.infolist()` of the **input** APK, so helpers added after the entry
+  loop can never be re-selected within a run.
 
 ### `--cipher wbaes` mode (white-box AES-128 key wrapping) - the alternative to the stub
 
@@ -189,10 +229,12 @@ Pieces:
   entry loop, since it cannot be produced per target). No stub / decinfo / DT_INIT surgery - so
   this mode also handles `INIT_ARRAY`-only libs for free.
 
-Only `arm64-v8a` is protected in practice, by deliberate scope choice. The other ABIs ship
-cleartext `.text`, so an analyst after the *algorithm* reads the x86_64 build and never touches the
-encryption. State the value accordingly: this raises device-level attack cost on arm64; it does not
-keep algorithms secret.
+Only `arm64-v8a` is protected in practice, by deliberate scope choice - and since the `--abi`
+default is now `stubs.DEFAULT_ABIS = ("arm64-v8a",)`, that is also what the tool does unless the
+user passes `--abi all`. The other ABIs ship cleartext `.text`, so an analyst after the *algorithm*
+reads the x86_64 build and never touches the encryption. State the value accordingly: this raises
+device-level attack cost on arm64; it does not keep algorithms secret. The CLI's per-ABI summary
+exists to keep that visible rather than letting a bare "Injected N libraries" imply full coverage.
 
 Security ceiling is unchanged (obfuscation, not a key vault): the white-box is Chow-style AES
 (academically broken by BGE-class attacks - protects against *static* analysis, not dynamic;
@@ -352,7 +394,10 @@ target and only the *provider* is shared. See `docs/technical/ARCHITECTURE.md` �
   `_self_verify_wbaes` / `_self_verify_provider`. The stub path's `_self_verify` takes **no
   `abi` argument** and checks every `PT_LOAD` unconditionally on every ABI. Treat the gating
   as an intent the stub path does not yet implement, not as a mode difference by design - and
-  check this before touching either, rather than assuming which one is right.
+  check this before touching either, rather than assuming which one is right. The
+  `DEFAULT_ABIS` change shrank the blast radius (non-arm64 libs are no longer packed by
+  default) and auto-select's fail-soft turns a hit into a per-library skip rather than a dead
+  pack, but neither is a fix - `--abi all` still runs the unconditional check.
 
 ## Environment note
 

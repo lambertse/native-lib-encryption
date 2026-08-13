@@ -130,8 +130,10 @@ Note `awk '/LOAD/{print $NF}'` on two files is easy to misread: this library has
 segments, so four printed lines means you ran it on the same file twice, not that you saw the
 output.
 
-**Workarounds if `>=1.0` still fails:** report it with the table row it named, leave that library
-out of `--lib`, or pack it only for a device class that does not require 16 KB pages.
+**Workarounds if `>=1.0` still fails:** report it with the table row it named, exclude that library
+(`--exclude-lib libfoo`, or leave it out of `--lib`), or pack it only for a device class that does
+not require 16 KB pages. Under auto-select this failure is already demoted to a per-library skip -
+the library then ships in cleartext, which the run summary calls out.
 
 **Do not disable the check.** It is refusing to emit an APK that would fail to load on 16 KB-page
 hardware, which Play requires 64-bit apps to support - the failure is the guard working.
@@ -192,7 +194,7 @@ the re-sign."
 
 ## `error: no .so entries matched the requested list; nothing to encrypt`
 
-The requested names didn't match any `lib/<abi>/<name>.so` in the APK.
+The names you passed to `--lib`/`--libs` didn't match any `lib/<abi>/<name>.so` in the APK.
 
 - If your `requested=[...]` shows a single element containing commas, you passed a
   comma list to a build without comma support - either update sopack (current `--lib`
@@ -203,7 +205,46 @@ The requested names didn't match any `lib/<abi>/<name>.so` in the APK.
   python3 -c "import zipfile;[print(n) for n in zipfile.ZipFile('in.apk').namelist() if n.startswith('lib/') and n.endswith('.so')]"
   ```
 - A bare basename matches every selected ABI; make sure the library actually ships for
-  the ABI you passed to `--abi` (some libs are arm64-only).
+  the ABI you passed to `--abi`. **`--abi` defaults to `arm64-v8a` alone** - if the library
+  is only present for another ABI, pass `--abi all` or name that ABI.
+- Dropping `--lib`/`--libs` entirely encrypts every `lib/<abi>/*.so` and sidesteps the
+  question.
+
+---
+
+## `error: none of the N lib/<abi>/*.so entries in this APK were packed`
+
+Auto-select found libraries but every one was excluded or failed to inject. The per-library
+reasons are printed above the error.
+
+- `excluded by 'libsopk_*'` on **every** entry means you are re-packing an already-packed
+  APK. Pack the original.
+- `abi not selected` on every entry means the APK ships no `arm64-v8a` libraries; pass
+  `--abi all` or the ABI it does ship.
+- `excluded by '...'` from your own `--exclude-lib` - loosen the glob. Note it also
+  overrides an explicit `--lib`.
+- Everything failing to inject points at a shared cause; read the individual messages and
+  see the per-library sections above.
+
+---
+
+## A library I expected to be encrypted shipped in cleartext
+
+Under auto-select (no `--lib`/`--libs`) an injection failure is a **warning, not an error** -
+the original library is written back unchanged so the pack still produces a working APK.
+Check the run's summary:
+
+```
+Skipped (selected but could not be injected - these ship in CLEARTEXT):
+  lib/arm64-v8a/libfoo.so: <reason>
+```
+
+Look the reason up in this document. To make that failure fatal instead, name the library
+explicitly with `--lib libfoo.so` - explicit selection never degrades to a skip.
+
+Also check the `Not selected:` block - `libflutter` and `libsopk_*` are excluded by default
+(`--no-default-exclude` drops the former; the latter is unconditional), and anything outside
+`--abi` is listed as `abi not selected`.
 
 ---
 

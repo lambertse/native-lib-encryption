@@ -1,10 +1,11 @@
 # sopack - black-box Android `.so` encryptor / APK repackager
 
-`sopack` takes an **existing APK** plus a list of native libraries and produces a
-**self-signed APK** in which each listed `.so` has its code (`.text`) encrypted at
-rest and transparently decrypted at load time - **without any access to the library
-source**. It is a black-box ELF-injection packer; see [`docs/`](./docs/) for the full
-design and reasoning.
+`sopack` takes an **existing APK** and produces a **self-signed APK** in which each
+selected `.so` has its code (`.text`) encrypted at rest and transparently decrypted at
+load time - **without any access to the library source**. By default every
+`lib/<abi>/*.so` in the APK is encrypted; pass `--lib`/`--libs` to narrow that to a
+specific list. It is a black-box ELF-injection packer; see [`docs/`](./docs/) for the
+full design and reasoning.
 
 > ⚠️ **This is obfuscation, not security.** The decryption key ships inside the
 > binary, and plaintext exists in a readable `R-X` mapping at runtime. Any Frida hook
@@ -14,8 +15,13 @@ design and reasoning.
 > new certificate. Full threat model: [`docs/SECURITY.md`](./docs/SECURITY.md).
 
 ```
-sopack pack in.apk --lib libfoo.so,libbar.so -o out.apk [--cipher chacha20|xor|wbaes] [--abi ...]
+sopack pack in.apk -o out.apk [--lib libfoo.so,libbar.so] [--exclude-lib GLOB]
+                              [--cipher chacha20|xor|wbaes] [--abi ...]
 ```
+
+Omit `--lib`/`--libs` and every `lib/<abi>/*.so` in the APK is encrypted. `--abi` defaults
+to **`arm64-v8a` alone** - the only ABI protected in practice; pass `--abi all` for every
+supported ABI.
 
 ## Two modes
 
@@ -32,7 +38,7 @@ procedure. The rest of this page describes the stub mode.
 
 ## How it works
 
-For each requested `lib/<abi>/*.so` inside the APK:
+For each selected `lib/<abi>/*.so` inside the APK:
 
 1. **Encrypt `.text`** in place with a stream cipher (ChaCha20 or XOR) - same length,
    same file offsets, so ELF layout is untouched. Random per-library key + nonce.
@@ -107,17 +113,44 @@ pip install -e .                                           # pulls in LIEF
 # 3. Point at your SDK (for zipalign/apksigner) if not on PATH
 export ANDROID_SDK_ROOT=/path/to/android/sdk
 
-# 4. Pack
+# 4. Pack - every lib/arm64-v8a/*.so, minus the exclusions
+sopack pack app.apk -o app-packed.apk --verify
+
+#    ... or name the libraries yourself
 sopack pack app.apk --lib libnative-lib.so -o app-packed.apk --verify
 
 # 5. Sanity-check the result
 python -m pytest tests/
 ```
 
+### Choosing libraries
+
+**Omit `--lib`/`--libs` and every `lib/<abi>/*.so` in the APK is encrypted**, for the ABIs
+`--abi` selects. In this mode a library that cannot be injected (section-stripped, no
+`.dynamic` slack, not 16 KB-compatible …) is **skipped with a warning** and ships in
+cleartext rather than aborting the pack - the run ends with a per-ABI summary naming
+every library that was skipped and why. Read it: a skipped library is unprotected.
+
 `--lib` is repeatable and/or comma-separated; entries may be bare basenames
 (`libfoo.so` → matches every selected ABI) or full APK paths
 (`lib/arm64-v8a/libfoo.so`). `--libs libs.txt` reads the same entries from a file, one per
-line. For `--cipher wbaes`, use `./scripts/build_wbaes.sh` in step 1 instead - it builds the
+line. Naming a library explicitly restores the strict behaviour: if it cannot be injected,
+the pack **fails** instead of quietly shipping it in cleartext.
+
+`--exclude-lib` takes fnmatch globs against the basename, with the `.so` suffix optional
+(`--exclude-lib 'libflutter,libmy*'`). **Exclusion always wins**, including over an
+explicit `--lib`. Two sets are applied on top of whatever you pass:
+
+| Pattern | Removable? | Why |
+| --- | --- | --- |
+| `libsopk_*` | **no** | sopack's own injected artifacts (the shared white-box provider and the thin per-target helpers). Encrypting them would encrypt the code that does the decrypting. |
+| `libflutter` | `--no-default-exclude` | excluded by default as a matter of policy. |
+
+`--abi` defaults to `arm64-v8a` alone, since that is the only ABI protected in practice
+(the others ship cleartext by deliberate scope choice - see
+[`docs/SECURITY.md`](./docs/SECURITY.md)). Pass `--abi all` for all three, or a comma list.
+
+For `--cipher wbaes`, use `./scripts/build_wbaes.sh` in step 1 instead - it builds the
 two extra per-ABI skeletons that mode needs.
 
 ## Verification checklist
