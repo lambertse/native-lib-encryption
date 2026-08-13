@@ -28,6 +28,11 @@ stub, or the white-box integration; you do not need them to use the tool.
   sopack consumes and refuses, the artifact flow, and what an upstream change breaks. Part II
   is the six-phase build-and-verify procedure. Read it before using or upgrading that mode -
   it has prerequisites the other modes do not.
+- **[technical/PAGE-ALIGNMENT.md](./technical/PAGE-ALIGNMENT.md)** - 16 KB pages, end to end:
+  why a 4 KB-aligned input library is unpackable, every mapping step from the APK entry offset
+  to the decryptor's `mremap` window, which step crashes and how far from the cause, why the
+  packer cannot repair the library, and which parts of the refusal are sopack's own limitation.
+  Read it when a pack fails with a `16 KB` error.
 - **[technical/HARDENING.md](./technical/HARDENING.md)** - the implementation of every
   anti-static-analysis technique (metadata whitening, string hygiene, the pack-time strip, and
   why section-header stripping was rejected), with the code and the tests that lock each one.

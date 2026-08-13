@@ -82,6 +82,40 @@ per-library limitation of the in-place method; report the library.
 
 ---
 
+## `<lib>.so is not 16 KB-page compatible to begin with` (arm64)
+
+**Cause: the input library, not the packer.** It was linked without
+`-Wl,-z,max-page-size=16384`, so its own `PT_LOAD` segments are 4 KB-aligned and it cannot load
+on a 16 KB-page device *unpacked either*. The error lists each offending segment with its
+offset, vaddr and alignment - `align 0x1000` on all of them is the signature.
+
+**Fix:** rebuild that library with 16 KB alignment (one link flag, or NDK r27+, which does it by
+default):
+
+```bash
+-Wl,-z,max-page-size=16384                              # plain link
+-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON                # Gradle + CMake
+APP_SUPPORT_FLEXIBLE_PAGE_SIZES=true                    # ndk-build
+readelf -lW libfoo.so | awk '/LOAD/{print $3,$NF}'      # verify: every align 0x4000
+```
+
+Often only *one* module in an app is missing the flag - check the app's other `.so` files before
+assuming it is a whole-project setting. The same rebuild is what Play's 16 KB requirement needs,
+so it is not work spent only on sopack.
+
+**Meanwhile,** the library ships in cleartext (auto-select demotes this to a per-library skip and
+the run summary lists it). There is currently no flag to pack it anyway for 4 KB-only devices,
+though such a build would be correct - see the gaps in
+[`technical/PAGE-ALIGNMENT.md`](./technical/PAGE-ALIGNMENT.md) §7. That document also explains,
+step by step, what the decryptor's page window does to a 4 KB-aligned library and why the
+resulting crash lands far from the cause.
+
+**Note the default cipher reports this differently.** Only `--cipher wbaes` names the input;
+`chacha20`/`xor` raise a bare `LOAD seg align 4096 not multiple of 16384` for the identical
+cause. If you see that, check the input's `readelf -lW` before suspecting the packer.
+
+---
+
 ## `has a LOAD segment that breaks 16 KB loading` (arm64)
 
 **First: upgrade LIEF.** `pip install -U 'lief>=1.0'`, then re-pack. This is almost always the

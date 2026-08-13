@@ -83,6 +83,12 @@ and every `mmap`/`mprotect`/`mremap` length must be page-aligned to the **runtim
 page size - which we read from the kernel, never hardcode. The injected executable
 segment is aligned to 16 KB so the library still loads on 16 KB devices.
 
+An input library that is itself 4 KB-aligned cannot be packed, and cannot be repaired by
+the packer either - only re-linked. [`PAGE-ALIGNMENT.md`](./PAGE-ALIGNMENT.md) works that
+through end to end: every mapping step from the APK entry offset to the decryptor's
+`mremap` window, which of them would crash and how far from the cause, why file padding
+is not a fix, and which parts of the refusal are sopack's own limitation.
+
 ---
 
 ## 3. The three components
