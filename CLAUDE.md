@@ -33,15 +33,31 @@ pip install -e .                            # install the CLI (pulls in LIEF)
 ./scripts/build_wbaes.sh --trace            #   opt into -DSOPK_RT_LOG tracing (NOT shippable:
                                             #   needs `pack --allow-helper-log`). Release,
                                             #   stripped, is the DEFAULT.
-# Takes WBC/NDK from the environment, else --wbc/--ndk, else prompts. SOPACK is always the
-# repo the script lives in. --force redoes cached phases; --help lists everything.
+./scripts/build_wbaes.sh --no-omvll         #   unobfuscated Android lib. REQUIRED on Linux (the
+                                            #   O-MVLL plugin is a Mach-O dylib and only loads
+                                            #   on macOS); --omvll is otherwise the DEFAULT.
+# WBC comes from the PINNED SUBMODULE at third_party/whitebox-cryptography, which this script
+# initialises on demand - so a clean clone needs no arguments and no out-of-band drop. Override
+# with --wbc/$WBC for a dev working copy (a sibling ../whitebox-cryptography is also honoured).
+# It drives WBC's OWN build scripts and deposits both artifacts where sopack finds them unaided:
+#   scripts/gen_blob.sh    -> build-host/wb_keygen -> copied to vendor/wbc/bin/wb_keygen
+#   scripts/build_android.sh -> build-android/libwbcrypto.a -> copied to vendor/wbc/
+# gen_blob.sh, NOT the similarly-named build_host.sh: upstream ships both, and only gen_blob.sh
+# refuses $ZIG_BIN/$EXTRA_CXXFLAGS so no cross toolchain or O-MVLL plugin can leak into a
+# PROVISIONING tool. Upstream's own header calls build-host/wb_keygen "part of the consumer
+# contract" with this repo, by name. Do not switch it to build_host.sh.
+# NEEDS NETWORK on the first run: WBC's third_party/fetch_deps.sh downloads libsodium (and the
+# O-MVLL release) as SHA256-pinned tarballs. They are not submodules - WBC has no nested ones,
+# so `git submodule update --init` takes no --recursive.
+# NDK from the environment, else --ndk, else prompts. SOPACK is always the repo the script
+# lives in. --force redoes cached phases; --help lists everything.
 
 # The raw stub build the chacha20 script wraps (needed after ANY change to stub/*.c/*.h).
 # Uses the NDK if ANDROID_NDK_HOME/ANDROID_NDK_ROOT is set, else clang+lld+llvm-* on PATH.
 # Hard-fails if the blob has any relocation, undefined symbol, or (arm64) adrp.
 bash stub/build_stubs.sh [API_LEVEL]        # default API 24 -> sopack/stubs/*.bin + *.json
 
-# Harness scripts (see "Directory layout" below for the three gitignored directories)
+# Harness scripts (see "Directory layout" below for how these four directories differ)
 ./scripts/device_test.sh [--only PAT]       # pack every test_apks/*.apk with wbaes, install and
                                             #   launch each on a device, and assert
                                             #   decrypted-library COUNT == injected COUNT. Builds
@@ -55,19 +71,30 @@ bash stub/build_stubs.sh [API_LEVEL]        # default API 24 -> sopack/stubs/*.b
 sopack pack in.apk -o out.apk \
     [--lib libfoo.so,libbar.so] [--libs libs.txt] \
     [--exclude-lib GLOB,...] [--no-default-exclude] \
-    [--abi arm64-v8a,... | all] [--cipher chacha20|xor|wbaes] [--min-sdk N] [--log] \
+    [--abi arm64-v8a,... | all] [--cipher wbaes|chacha20|xor] [--min-sdk N] [--log] \
     [--allow-helper-log] \
-    [--wb-keygen PATH] [--keystore PATH --ks-alias A --ks-pass P --key-pass P] [--verify]
+    [--keystore PATH --ks-alias A --ks-pass P --key-pass P] [--no-verify]
 # LIBRARY SELECTION IS OPTIONAL. Omit --lib/--libs -> every lib/<abi>/*.so in the input APK,
 # for the ABIs --abi selects. --lib is repeatable and/or comma-separated; --libs is a file,
 # one .so per line. See "Library selection" below for the exclusion rules and for why
 # auto-select SKIPS an un-injectable library where an explicitly named one ABORTS.
 # --abi DEFAULTS TO arm64-v8a ALONE (stubs.DEFAULT_ABIS) - the only ABI protected in
 # practice. `--abi all` = SUPPORTED_ABIS. This changed: it used to default to all three.
-# --cipher wbaes = white-box AES-128 KEY-WRAP mode (see "wbaes mode" below): the long-term key
-# is sealed into a white-box blob and never reconstructed at runtime, so no portable key ships.
-# Needs whitebox-cryptography >= 3.0.0, a HOST wb_keygen (--wb-keygen / $SOPACK_WBKEYGEN) and a
-# per-ABI helper skeleton in sopack/stubs/ built from the CURRENT stub/sopk_rt.c.
+# --cipher DEFAULTS TO wbaes, the white-box AES-128 KEY-WRAP mode (see "wbaes mode" below): the
+# long-term key is sealed into a white-box blob and never reconstructed at runtime, so no
+# portable key ships. chacha20/xor are the opt-out (stub cipher, raw key whitened in the
+# binary). This changed: chacha20 used to be the default, because wbaes was unreachable from a
+# clean clone - the WBC submodule is what fixed that.
+# --verify DEFAULTS ON; pass --no-verify to skip the post-signing apksigner dump.
+# THERE IS NO --wb-keygen. provision.find_wb_keygen probes, in order: vendor/wbc/bin/wb_keygen
+# (what build_wbaes.sh installs), the portable bundle beside an installed venv, $SOPACK_WBKEYGEN,
+# then PATH. Note the env var ranks BELOW the local build on purpose - a stale export must not
+# beat the keygen build_wbaes.sh just gated.
+# wbaes still needs whitebox-cryptography >= 3.0.0 and a per-ABI helper skeleton in
+# sopack/stubs/ built from the CURRENT stub/sopk_rt.c. Both come from ./scripts/build_wbaes.sh
+# or from a portable bundle; a plain `pip install .` from a checkout carries NEITHER (the
+# skeletons are gitignored and not package data), so use `pip install -e .` + build_wbaes.sh,
+# install a bundle, or pass --cipher chacha20.
 # Note: section-header stripping was researched and REMOVED - modern Android bionic
 # (Android 14+) requires a section table to exist and rejects a stripped lib at load
 # (confirmed on-device). Whitening (below) is the load-safe hardening. See
@@ -88,20 +115,30 @@ python -m pytest tests/test_integration.py -k init_array   # a single test by na
 `tests/test_integration.py` builds real `.so` fixtures, injects, and `dlopen`s them - the
 arm64 decrypt-and-run assertions only exercise fully on an aarch64 host.
 
-## Directory layout (the three gitignored ones)
+## Directory layout (one tracked dependency + three gitignored)
 
-They look interchangeable and are not - one is input, one is a build input, one is an output.
-They were a single `assets/` until they were split, and that name is now retired: `assets/` is
-a *real Android APK directory*, so it read as "files bundled into the APK" in a tool whose whole
-job is unpacking APKs. Do not merge them back, and do not reintroduce `assets/`.
+They look interchangeable and are not - one is the dependency SOURCE, one is test input, one
+holds build OUTPUTS of that source, one is the shippable output. Three of them were a single
+`assets/` until they were split, and that name is now retired: `assets/` is a *real Android APK
+directory*, so it read as "files bundled into the APK" in a tool whose whole job is unpacking
+APKs. Do not merge them back, and do not reintroduce `assets/`.
 
+- **`third_party/whitebox-cryptography/`** - the WBC dependency, a **tracked git submodule**
+  pinned to a commit (`8a3c941` at time of writing) on `lambertse/whitebox-cryptography`. The
+  only one of the four that is **source**, and the only one committed. It used to arrive out of
+  band, which meant three scripts each guessed a different path and `MANIFEST.txt` recorded
+  `wbc-rev: unknown` whenever the guess was not a readable git repo. Its *own* `third_party/`
+  (libsodium, O-MVLL, a CPython stdlib) is a SHA256-pinned tarball fetch run by its
+  `fetch_deps.sh`, **not** nested submodules - which is why nothing here passes `--recursive`,
+  and why the first build needs network.
 - **`test_apks/`** - the local APK corpus `scripts/device_test.sh` globs (`*.apk`, non-recursive).
   Pure test **input**. Nothing in `sopack/` reads it.
-- **`vendor/wbc/`** - `libwbcrypto.a` + `wbcrypto.h`, a third-party **build input** that
-  `scripts/build_wbaes.sh` copies out of your whitebox-cryptography checkout on **every** run
-  and links the provider against. Because it is untracked, the archive is whatever you last
-  built there - which is why `build_wbaes.sh` symbol-checks it for `wbc_blob_kdf_tier` before
-  the copy rather than trusting it.
+- **`vendor/wbc/`** - the **build outputs** of that submodule: `libwbcrypto.a` + `wbcrypto.h`,
+  plus `bin/wb_keygen`. `scripts/build_wbaes.sh` refreshes all three on **every** run. Host- and
+  ABI-specific, so it is generated per machine and never committed - which is exactly why
+  `build_wbaes.sh` symbol-checks the archive for `wbc_blob_kdf_tier` before the copy rather than
+  trusting whatever is there. `bin/wb_keygen` is the **first** thing `provision.find_wb_keygen`
+  probes, and that is what removed the need for a `--wb-keygen` flag.
 - **`artifacts/`** - the portable pack bundle, an **output** of `scripts/artifact_generation.sh`.
   Regenerate it; never edit it in place. It carries the Android artifacts (host-neutral),
   `bin/wb_keygen` (the only host-specific file), and **the tool itself** as a `py3-none-any`
@@ -196,10 +233,11 @@ rather than size (and why the `light` KDF tier made it cheap), is in `docs/techn
 Pieces:
 
 - **Host provisioning** (`sopack/provision.py`): per target, generate a long-term key `kek`
-  and seal it with a **host** `wb_keygen` at the **`light`** KDF tier (`vendor/wbc/` holds only
-  `libwbcrypto.a` + `wbcrypto.h`; any `wb_keygen` delivered out of band is an *Android* build and
-  does NOT run on the pack host - build one from the whitebox-cryptography repo
-  `scripts/gen_blob.sh`; point `--wb-keygen`/`$SOPACK_WBKEYGEN` at it). Then generate a 32-byte
+  and seal it with a **host** `wb_keygen` at the **`light`** KDF tier (`./scripts/build_wbaes.sh`
+  builds one via the submodule's `scripts/gen_blob.sh` and installs it at
+  `vendor/wbc/bin/wb_keygen`, where `find_wb_keygen` looks first - nothing to configure. Any
+  `wb_keygen` delivered out of band is an *Android* build and does NOT run on the pack host;
+  `_host_incompatible_reason` detects that by file magic and skips it). Then generate a 32-byte
   session key `sk` and **compute the wrap in pure Python**:
   `wrapped = wrap_iv + cipher.aes128_ctr(sk, kek, wrap_iv)`. That is byte-identical to what
   the device's `wbc_wrap_key` emits, because the white-box IS standard AES-128 and the wrap is

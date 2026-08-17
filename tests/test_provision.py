@@ -9,10 +9,13 @@ here. wb_keygen DEFAULTS to `heavy`, which means a dropped `--kdf` flag is *sile
 rather than an error - 266 ms and a transient 64 MiB per library at app startup. These tests
 are what make that unshippable.
 """
+import os
 import struct
+import sys
 
 import pytest
 
+from sopack import provision
 from sopack.provision import (BLOB_HDR_MIN, BLOB_MAGIC, BLOB_MIN_VERSION, BLOB_TIER_OFF,
                               KDF_TIER_HIGH, KDF_TIER_LOW, KDF_TIER_NONE, ProvisionError,
                               assert_light_blob, blob_header)
@@ -79,10 +82,22 @@ def test_truncated_blob_is_refused():
 
 # ---- the v3 pack key: one KEK per (pack, ABI), one session key per target ---------------
 
+def _have_wb_keygen() -> bool:
+    """Ask find_wb_keygen itself rather than re-deriving its rules. This used to duplicate the
+    old "PATH or $SOPACK_WBKEYGEN" logic, which silently stopped matching the moment the probe
+    list grew a vendor/ and a bundle entry - these tests would then skip on a machine that has
+    a perfectly good keygen."""
+    from sopack.provision import find_wb_keygen
+    try:
+        find_wb_keygen()
+        return True
+    except FileNotFoundError:
+        return False
+
+
 _needs_wb_keygen = pytest.mark.skipif(
-    __import__("shutil").which("wb_keygen") is None
-    and not __import__("os").environ.get("SOPACK_WBKEYGEN"),
-    reason="needs a host wb_keygen (SOPACK_WBKEYGEN or on PATH)")
+    not _have_wb_keygen(),
+    reason="needs a host wb_keygen (run ./scripts/build_wbaes.sh)")
 
 
 @_needs_wb_keygen
@@ -124,3 +139,104 @@ def test_pack_key_never_exposes_the_long_term_key():
     pack = provision_pack()
     assert pack.kek not in pack.blob
     assert pack.kek not in pack.wpass
+
+
+# ---- find_wb_keygen: discovery, not configuration ---------------------------------------
+#
+# `sopack pack` has no --wb-keygen flag and --cipher wbaes is the default, so the probe order
+# below IS the user interface. If it regresses, the tool stops working with no flag to fall
+# back on, which is why these are pinned rather than left to integration.
+
+
+def _exe(path, body=b"#!/bin/sh\nexit 0\n"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    path.chmod(0o755)
+    return str(path)
+
+
+@pytest.fixture
+def isolated_probes(monkeypatch, tmp_path):
+    """Neutralise every probe, so each test opts exactly one back in. Without this the real
+    vendor/wbc/bin/wb_keygen on a built checkout would win and mask the case under test."""
+    monkeypatch.setattr(provision, "_repo_wb_keygen", lambda: str(tmp_path / "absent-repo"))
+    monkeypatch.setattr(provision, "_bundle_wb_keygen", lambda: None)
+    monkeypatch.delenv("SOPACK_WBKEYGEN", raising=False)
+    monkeypatch.setattr(provision.shutil, "which", lambda _n: None)
+    # Every candidate this module produces is a host-native shell script in tmp_path, so the
+    # ELF/Mach-O sniffing must not reject them; tests that WANT a rejection re-patch this.
+    monkeypatch.setattr(provision, "_host_incompatible_reason", lambda _p: None)
+    return tmp_path
+
+
+def test_probe_order_prefers_the_local_build_over_everything(isolated_probes, monkeypatch):
+    """vendor/wbc/bin/ wins. It is the copy build_wbaes.sh just built and gated, and a stale
+    $SOPACK_WBKEYGEN export outliving a rebuild is this mode's classic silent failure."""
+    repo = _exe(isolated_probes / "vendor" / "wbc" / "bin" / "wb_keygen")
+    bundle = _exe(isolated_probes / "bundle" / "bin" / "wb_keygen")
+    env = _exe(isolated_probes / "env" / "wb_keygen")
+    monkeypatch.setattr(provision, "_repo_wb_keygen", lambda: repo)
+    monkeypatch.setattr(provision, "_bundle_wb_keygen", lambda: bundle)
+    monkeypatch.setenv("SOPACK_WBKEYGEN", env)
+    assert provision.find_wb_keygen() == repo
+
+
+def test_explicit_path_still_outranks_every_probe(isolated_probes, monkeypatch):
+    """The kwarg survives for library callers even though the CLI flag is gone."""
+    explicit = _exe(isolated_probes / "explicit" / "wb_keygen")
+    monkeypatch.setattr(provision, "_repo_wb_keygen",
+                        lambda: _exe(isolated_probes / "vendor" / "wb_keygen"))
+    assert provision.find_wb_keygen(explicit) == explicit
+
+
+def test_bundle_probe_is_used_when_there_is_no_local_build(isolated_probes, monkeypatch):
+    """The wheel case: `vendor/` resolves into site-packages and is absent, so the bundle
+    beside the venv is what makes an installed sopack work with no configuration."""
+    bundle = _exe(isolated_probes / "bundle" / "bin" / "wb_keygen")
+    monkeypatch.setattr(provision, "_bundle_wb_keygen", lambda: bundle)
+    assert provision.find_wb_keygen() == bundle
+
+
+def test_env_var_is_still_honoured_when_nothing_else_exists(isolated_probes, monkeypatch):
+    env = _exe(isolated_probes / "env" / "wb_keygen")
+    monkeypatch.setenv("SOPACK_WBKEYGEN", env)
+    assert provision.find_wb_keygen() == env
+
+
+def test_an_unrunnable_candidate_is_skipped_not_fatal(isolated_probes, monkeypatch):
+    """The Android-wb_keygen mistake must not mask a good keygen further down the list. A
+    probe that returned the first EXISTING path would hand the packer a binary that dies with
+    'Exec format error' partway through a pack."""
+    android = _exe(isolated_probes / "vendor" / "wbc" / "bin" / "wb_keygen")
+    good = _exe(isolated_probes / "bundle" / "bin" / "wb_keygen")
+    monkeypatch.setattr(provision, "_repo_wb_keygen", lambda: android)
+    monkeypatch.setattr(provision, "_bundle_wb_keygen", lambda: good)
+    monkeypatch.setattr(provision, "_host_incompatible_reason",
+                        lambda p: "it is an ANDROID ELF" if p == android else None)
+    assert provision.find_wb_keygen() == good
+
+
+def test_not_found_names_the_build_script_and_never_the_removed_flag(isolated_probes):
+    """The message is the whole recovery path now, so it must point at something that exists.
+    `--wb-keygen` is gone; telling anyone to pass it would be a dead end."""
+    with pytest.raises(FileNotFoundError) as e:
+        provision.find_wb_keygen()
+    msg = str(e.value)
+    assert "--wb-keygen" not in msg
+    assert "build_wbaes.sh" in msg
+    assert "--cipher chacha20" in msg          # the no-white-box escape hatch
+
+
+def test_bundle_probe_requires_a_sibling_manifest(monkeypatch, tmp_path):
+    """Without the MANIFEST.txt guard, `--no-venv` installs make <sys.prefix>/../bin match
+    /usr/bin and the probe would adopt any unrelated binary called wb_keygen."""
+    prefix = tmp_path / "usr" / "local"
+    _exe(tmp_path / "usr" / "bin" / "wb_keygen")
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    prefix.mkdir(parents=True, exist_ok=True)
+    assert provision._bundle_wb_keygen() is None
+
+    (tmp_path / "usr" / "MANIFEST.txt").write_text("bundle-format: 2\n")
+    found = provision._bundle_wb_keygen()
+    assert found is not None
+    assert os.path.realpath(found) == os.path.realpath(tmp_path / "usr" / "bin" / "wb_keygen")

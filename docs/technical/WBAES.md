@@ -292,9 +292,18 @@ Set these once if you prefer to run the phases by hand:
 
 ```bash
 export SOPACK=/path/to/sopack             # this repo
-export WBC=/path/to/whitebox-cryptography # the SDK repo (master, >= 3.0.0)
 export NDK=/path/to/android-ndk           # your NDK (for Phase 4)
+
+# WBC is the PINNED SUBMODULE and needs no variable - build_wbaes.sh initialises it:
+git -C "$SOPACK" submodule update --init   # no --recursive; WBC has no nested submodules
+export WBC="$SOPACK/third_party/whitebox-cryptography"
 ```
+
+Set `WBC` to somewhere else only to build against a working copy of the SDK; the submodule is
+the pinned revision every artifact and every `MANIFEST.txt` is expected to name. WBC's *own*
+`third_party/` (libsodium, the O-MVLL plugin, a CPython stdlib) is fetched by its
+`third_party/fetch_deps.sh` as SHA256-pinned tarballs, which its build scripts run for you -
+so the first build needs **network**, and there is nothing to `git submodule` recursively.
 
 ---
 
@@ -316,9 +325,20 @@ That hex is the FIPS-197 AES-128 vector - proof the white-box is bit-exact AES-1
 what lets sopack compute the key wrap in Python (Phase 3). It also leaves a runnable host
 tool at `$WBC/build-host/wb_keygen`.
 
+Note this is `gen_blob.sh`, **not** the similarly-named `scripts/build_host.sh`. Upstream ships
+both; only `gen_blob.sh` refuses `$ZIG_BIN`/`$EXTRA_CXXFLAGS`, so only it guarantees a native,
+un-obfuscated provisioning tool. Its `build-host/` output path is documented upstream as part of
+the consumer contract with this repo.
+
+Copy it where sopack looks (this is what `build_wbaes.sh` does for you):
+
 ```bash
-export SOPACK_WBKEYGEN="$WBC/build-host/wb_keygen"
+install -m 0755 "$WBC/build-host/wb_keygen" "$SOPACK/vendor/wbc/bin/wb_keygen"
 ```
+
+`provision.find_wb_keygen` probes that path first, so no environment variable and no flag are
+needed afterwards. `$SOPACK_WBKEYGEN` still works as an override, but ranks *below* the local
+build on purpose - a stale export must not beat a freshly verified keygen.
 
 ---
 
@@ -332,7 +352,7 @@ python3 -m pytest tests/ -q
 **PASS:** all tests pass. **Four** SKIP by design rather than fail (two in `test_provision.py`,
 two in `test_wbaes.py`), and the reason says why: they need a host `wb_keygen`, because they seal
 a real white-box blob and there is nothing meaningful to fake - the run reports
-`needs a host wb_keygen (SOPACK_WBKEYGEN or on PATH)`. Everything else - including the guards
+`needs a host wb_keygen (run ./scripts/build_wbaes.sh)`. Everything else - including the guards
 and the `.dynstr` re-sort
 behaviour the mode depends on - runs off the committed `tests/fixtures/mini_arm64.so` with no
 setup at all. What this covers:
@@ -678,12 +698,13 @@ TGT=libso1.so                   # the lib you check below
 
 python3 -m sopack.cli pack "$APK" \
   --lib "libso1.so,libso2.so" \
-  --cipher wbaes \
   --abi arm64-v8a \
-  --wb-keygen "$SOPACK_WBKEYGEN" \
-  -o "$OUT" \
-  --verify
+  -o "$OUT"
 ```
+
+`--cipher wbaes` and `--verify` are the **defaults**, so neither appears above, and there is no
+`--wb-keygen`: Phase 1 installed the keygen at `vendor/wbc/bin/wb_keygen`, which
+`provision.find_wb_keygen` probes first.
 
 **Quote the `--lib` list.** It is comma-separated but must be ONE argv word: unquoted
 `--lib libso1.so, libso2.so` shell-splits, and argparse rejects the second name with

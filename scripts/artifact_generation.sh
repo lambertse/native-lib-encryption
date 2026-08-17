@@ -26,11 +26,13 @@
 #   --abi ABI            default arm64-v8a. Selects which skeleton PAIR is built and bundled;
 #                        all three stub blobs ship regardless (they are 6-8 KB and committed).
 #   --api N              default 24
-#   --wbc PATH           whitebox-cryptography checkout. Else $WBC, else <repo>/../whitebox-cryptography
+#   --wbc PATH           whitebox-cryptography checkout. Else $WBC, else the pinned submodule
+#                        at third_party/whitebox-cryptography (initialised on demand), else a
+#                        sibling <repo>/../whitebox-cryptography.
 #   --ndk PATH           Android NDK root.  Else $NDK / $ANDROID_NDK_HOME / $ANDROID_NDK_ROOT
-#   --wb-keygen PATH     host wb_keygen. Else $SOPACK_WBKEYGEN, else $WBC/build-host/wb_keygen.
-#                        Under --skip-build this is the ONLY way it gets found, since nothing
-#                        builds it.
+#   --wb-keygen PATH     host wb_keygen. Else $SOPACK_WBKEYGEN, else <repo>/vendor/wbc/bin/
+#                        wb_keygen - which is where build_wbaes.sh installs the one it builds,
+#                        so --skip-build finds a previous run's keygen without being told.
 #   --out DIR            default <repo>/artifacts
 #   --skip-build         do not run build_wbaes.sh; bundle what is in sopack/stubs/ already.
 #   --rebuild-stubs      also re-run stub/build_stubs.sh. OFF by default because stub_*.bin/.json
@@ -85,10 +87,10 @@ while [ "$#" -gt 0 ]; do
         --force)              FORCE=1; shift ;;
         --allow-foreign-host) ALLOW_FOREIGN=1; shift ;;
         --tar)                MAKE_TAR=1; shift ;;
-        # 2..45 is the header comment block; it ends at the "SOPACK is this script's own repo"
+        # 2..47 is the header comment block; it ends at the "SOPACK is this script's own repo"
         # line, immediately before `set -euo pipefail`. Widen this if the header grows, or
         # --help starts printing shell code.
-        -h|--help)            sed -n '2,45p' "$0"; exit 0 ;;
+        -h|--help)            sed -n '2,47p' "$0"; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
@@ -155,9 +157,17 @@ need python3
     || die "cannot import sopack from $SOPACK - run: pip install -e ."
 need tar "the bundle is written as a directory tree, and --tar archives it"
 
-WBC="${WBC_ARG:-${WBC:-$SOPACK/../whitebox-cryptography}}"
 NDK="${NDK_ARG:-${NDK:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}}"
-WBKEYGEN="${WBKEYGEN_ARG:-${SOPACK_WBKEYGEN:-$WBC/build-host/wb_keygen}}"
+# --no-prompt: this script is meant to run unattended in a release step, so resolve_wbc dies
+# with the `git submodule update --init` command rather than blocking on a read. It also
+# initialises the submodule itself, which is what keeps the old `[ -d "$WBC" ]` trap below from
+# firing: an UNINITIALISED submodule is an empty DIRECTORY, so a -d test passes and the failure
+# only surfaced 30 lines later as a truncated build log.
+[ -n "$WBC_ARG" ] && WBC="$WBC_ARG"
+resolve_wbc "$SOPACK" --no-prompt
+# vendor/wbc/bin/ is where build_wbaes.sh installs it, and where sopack's own find_wb_keygen
+# looks first - so the bundle and the packer agree on one location by construction.
+WBKEYGEN="${WBKEYGEN_ARG:-${SOPACK_WBKEYGEN:-$SOPACK/vendor/wbc/bin/wb_keygen}}"
 
 # ---- build (unless --skip-build) -------------------------------------------------------
 if [ "$REBUILD_STUBS" -eq 1 ]; then
@@ -173,11 +183,15 @@ if [ "$SKIP_BUILD" -eq 1 ]; then
     [ -f "$SKEL" ] || die "no $SKEL - drop --skip-build, or build it first"
     [ -f "$PROV" ] || die "no $PROV - drop --skip-build, or build it first"
 else
-    [ -d "$WBC" ] || die "no whitebox-cryptography checkout at $WBC - pass --wbc PATH or export
-       WBC. (This script never prompts: it is meant to run unattended in a release step.)"
+    # resolve_wbc already proved this is a usable >= 3.0.0 checkout, header and all - a bare
+    # `-d` here would pass on an empty (uninitialised) submodule directory.
+    [ -f "$WBC/include/wbcrypto.h" ] || die "no usable whitebox-cryptography at $WBC"
     [ -n "$NDK" ] || die "no Android NDK - pass --ndk PATH or export NDK/ANDROID_NDK_HOME."
-    say "building the wbaes artifacts via build_wbaes.sh (release, $ABI)"
-    BUILD_ARGS="--release --abi $ABI --api $API"
+    say "building the wbaes artifacts via build_wbaes.sh (release, obfuscated, $ABI)"
+    # --omvll is EXPLICIT even though it is build_wbaes.sh's default. A release bundle is the
+    # one artifact that must never accidentally ship an unobfuscated provider, and an explicit
+    # flag keeps that true if that default ever moves again.
+    BUILD_ARGS="--release --omvll --abi $ABI --api $API"
     [ "$FORCE" -eq 1 ] && BUILD_ARGS="$BUILD_ARGS --force"
     # shellcheck disable=SC2086
     if ! ( cd "$SOPACK" && ./scripts/build_wbaes.sh $BUILD_ARGS --wbc "$WBC" --ndk "$NDK" ) \
@@ -214,9 +228,8 @@ ok "both skeletons are release builds (no __android_log_print)"
 # 4+5. wb_keygen: the one host-specific file, so both its checks are about the RECEIVING Mac.
 KEYGEN_DESC="omitted (--allow-foreign-host; chacha20/xor only)"
 if [ "$WITH_KEYGEN" -eq 1 ]; then
-    [ -x "$WBKEYGEN" ] || die "no runnable host wb_keygen at $WBKEYGEN. Pass --wb-keygen PATH,
-       export SOPACK_WBKEYGEN, or (without --skip-build) let build_wbaes.sh produce
-       \$WBC/build-host/wb_keygen."
+    [ -x "$WBKEYGEN" ] || die "no runnable host wb_keygen at $WBKEYGEN. Run
+       ./scripts/build_wbaes.sh (it installs one there), or pass --wb-keygen PATH."
 
     # 4. Self-containment. A Homebrew libsodium/libomp picked up at link time resolves fine
     #    HERE and fails with a dyld error on a Mac that does not have it - at first pack, long
@@ -227,7 +240,8 @@ if [ "$WITH_KEYGEN" -eq 1 ]; then
         [ -z "$FOREIGN" ] || die "$WBKEYGEN links libraries outside /usr/lib and /System:
 $(printf '       %s\n' $FOREIGN)
        Those will not exist on the receiving Mac and dyld fails at first pack. Rebuild it
-       statically (whitebox-cryptography scripts/gen_blob.sh vendors libsodium)."
+       statically (the submodule's scripts/gen_blob.sh vendors libsodium; ./scripts/
+       build_wbaes.sh --force drives it)."
         ok "wb_keygen links only system libraries"
     else
         warn "no otool on PATH - cannot check wb_keygen for non-system dylib dependencies"
@@ -246,7 +260,7 @@ $(printf '       %s\n' $FOREIGN)
         fi
         tail -5 "$TMP/probe.log" >&2
         die "$WBKEYGEN does not run on this host (an Android build cannot) - so it would not run
-       on the receiving Mac either. Rebuild it with \$WBC/scripts/gen_blob.sh."
+       on the receiving Mac either. Rebuild it with ./scripts/build_wbaes.sh --force."
     fi
     ( cd "$SOPACK" && python3 -c '
 import sys
@@ -283,7 +297,32 @@ ok "both skeletons carry the v$(cd "$SOPACK" && python3 -c 'from sopack.rt_meta 
 # is derived from SOPACK_REV, so `pip show sopack` on the receiving machine names the bundle.
 SOPACK_REV="$(git -C "$SOPACK" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 [ -n "$(git -C "$SOPACK" status --porcelain 2>/dev/null)" ] && SOPACK_REV="$SOPACK_REV-dirty"
-WBC_REV="$(git -C "$WBC" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# Not `|| echo unknown`. A bundle whose MANIFEST cannot say which white-box built it is a
+# provenance hole, and it used to open silently whenever $WBC was not a readable git repo.
+WBC_REV="$(git -C "$WBC" rev-parse --short HEAD 2>/dev/null || true)"
+[ -n "$WBC_REV" ] || die "cannot read a git revision from $WBC, so MANIFEST.txt could not
+       record which whitebox-cryptography built this bundle. Use the pinned submodule
+       (git submodule update --init $WBC_SUBMODULE) rather than an unpacked copy."
+# A bundle cut from an experimental WBC must not look identical to a pinned build. TWO ways to
+# be off-pin, and only the first is what `git submodule status` reports:
+#   1. the submodule itself is checked out somewhere else  -> status prefixes '+'
+#   2. --wbc/$WBC points at a DIFFERENT tree entirely      -> status says nothing, because the
+#      untouched submodule is still at its pin. Checking only (1) would miss the commoner case.
+# Compare resolved paths, not strings: --wbc can name the submodule by a relative or
+# symlinked path, and a spurious "-external" on a pinned build is a false alarm nobody would
+# trust twice.
+WBC_REAL="$(cd "$WBC" 2>/dev/null && pwd -P || echo "$WBC")"
+SUB_REAL="$(cd "$SOPACK/$WBC_SUBMODULE" 2>/dev/null && pwd -P || echo "$SOPACK/$WBC_SUBMODULE")"
+if [ "$WBC_REAL" != "$SUB_REAL" ]; then
+    WBC_REV="$WBC_REV-external"
+    warn "building against $WBC, not the pinned submodule; recording wbc-rev: $WBC_REV"
+else
+    case "$(git -C "$SOPACK" submodule status "$WBC_SUBMODULE" 2>/dev/null)" in
+        "+"*) WBC_REV="$WBC_REV-unpinned"
+              warn "the whitebox-cryptography submodule is NOT at its pinned commit; recording
+      wbc-rev: $WBC_REV" ;;
+    esac
+fi
 LIEF_VER="$(cd "$SOPACK" && python3 -c 'import lief; print(lief.__version__)' 2>/dev/null \
             || echo unknown)"
 eval "$(cd "$SOPACK" && python3 -c 'from sopack import rt_meta as m; print(
@@ -512,8 +551,8 @@ elif [ "$WANT_OS/$WANT_ARCH" != "$HAVE_OS/$HAVE_ARCH" ] && [ "$NO_KEYGEN" -eq 0 
     die "this bundle's bin/wb_keygen was built on $WANT_OS/$WANT_ARCH and this host is
        $HAVE_OS/$HAVE_ARCH, so it will not execute here. Everything else in the bundle is either
        pure Python or an Android target ELF and is host-neutral: re-run with --no-keygen to
-       install those, then build a host wb_keygen from the whitebox-cryptography repo
-       (scripts/gen_blob.sh)."
+       install those, then pack with --cipher chacha20 (or build a host wb_keygen from a sopack
+       checkout with ./scripts/build_wbaes.sh)."
 fi
 
 # 2. Checksums. BEFORE anything is installed - the wheel is inside the bundle, and installing an
@@ -585,11 +624,14 @@ fi
 #    so they cannot drift from each other; what can still go wrong is that the install is not
 #    what gets imported, or that the wheel did not carry what we think. Both are silent until an
 #    APK is packed on a machine with no toolchain to debug it.
+WANT_KEYGEN=0
+if [ "$NO_KEYGEN" -eq 0 ] && [ -f "$HERE/bin/wb_keygen" ]; then WANT_KEYGEN=1; fi
 "$RUNPY" - "$(man abi)" "$(man region-version)" "$(man helper-build-marker)" \
-             "$(man provider-build-marker)" "$(man lief-version)" <<'PY'
+             "$(man provider-build-marker)" "$(man lief-version)" \
+             "$WANT_KEYGEN" "$HERE" <<'PY'
 import os, sys
 
-abi, want_ver, want_h, want_p, want_lief = sys.argv[1:6]
+abi, want_ver, want_h, want_p, want_lief, want_keygen, bundle = sys.argv[1:8]
 
 try:
     import sopack
@@ -616,6 +658,25 @@ try:
         s.load_stub(a)
 except Exception as e:
     sys.exit("ERROR: the installed sopack cannot reach its own artifacts: %s" % e)
+
+# The keygen is DISCOVERED, not configured: --cipher wbaes is the default and there is no
+# --wb-keygen flag any more, so provision.find_wb_keygen has to resolve this bundle's
+# bin/wb_keygen on its own (via sys.prefix's parent, guarded by the sibling MANIFEST.txt).
+# If that probe misses, the install still looks perfect and the FIRST PACK fails - on the
+# machine least equipped to debug it. So resolve it here, while the bundle is still in hand.
+if want_keygen == '1':
+    from sopack.provision import find_wb_keygen
+    try:
+        found = find_wb_keygen()
+    except Exception as e:
+        sys.exit("ERROR: sopack cannot find this bundle's bin/wb_keygen, so --cipher wbaes\n"
+                 "       (the default) would fail at pack time: %s" % e)
+    if os.path.realpath(found) != os.path.realpath(os.path.join(bundle, 'bin', 'wb_keygen')):
+        sys.exit("ERROR: sopack resolved wb_keygen to %s, not this bundle's %s.\n"
+                 "       Something else on this machine is winning the probe; packing would\n"
+                 "       seal with an unknown tool. Unset SOPACK_WBKEYGEN and re-run."
+                 % (found, os.path.join(bundle, 'bin', 'wb_keygen')))
+    print("    OK: wb_keygen discovered at %s" % found)
 
 have = (want_ver, want_h, want_p) == (str(m.REGION_VERSION), m.HELPER_BUILD_MARKER.hex(),
                                       m.PROVIDER_BUILD_MARKER.hex())
@@ -652,10 +713,12 @@ PY
 if [ "$NO_KEYGEN" -eq 1 ] || [ ! -f "$HERE/bin/wb_keygen" ]; then
     cat <<EOF
 
-==> Installed. This bundle has no usable wb_keygen here, so pack with a stub cipher:
+==> Installed. This bundle has no usable wb_keygen here, so --cipher is REQUIRED: the default
+    (wbaes) cannot seal a blob without one. Pack with a stub cipher instead:
 
-  $SOPACK_CMD pack <your.apk> --cipher chacha20 --abi $(man abi) \\
-      -o packed.apk --verify
+  $SOPACK_CMD pack <your.apk> --cipher chacha20 --abi $(man abi) -o packed.apk
+
+  The raw key then ships in the binary (whitened), not sealed in a white-box.
 
 EOF
     exit 0
@@ -664,26 +727,39 @@ fi
 chmod +x "$HERE/bin/wb_keygen"
 cat <<EOF
 
-==> Installed. Point sopack at the bundled provisioning tool and pack:
+==> Installed. Pack - wbaes and --verify are the defaults, and sopack finds this bundle's
+    bin/wb_keygen on its own (the probe above just confirmed it):
 
-  export SOPACK_WBKEYGEN="$HERE/bin/wb_keygen"
-  $SOPACK_CMD pack <your.apk> \\
-    --cipher wbaes \\
-    --abi $(man abi) \\
-    -o packed.apk \\
-    --verify
+  $SOPACK_CMD pack <your.apk> --abi $(man abi) -o packed.apk
 
-  Omit --lib to pack every lib/$(man abi)/*.so in the APK.
+  Omit --abi too if $(man abi) is what you want; it is the default. Omit --lib (as here) to
+  pack every lib/$(man abi)/*.so in the APK. Add --no-verify to skip the signature dump.
 
   This bundle carries wbaes skeletons for $(man abi) ONLY. The stub blobs cover all three
-  ABIs, so --cipher chacha20 --abi all works, but 'wbaes --abi all' would fail with a
-  StubMissingError at pack time - regenerate the bundle per ABI if you need another.
+  ABIs, so --cipher chacha20 --abi all works, but '--abi all' on the DEFAULT cipher would
+  fail with a StubMissingError at pack time - regenerate the bundle per ABI if you need
+  another.
   See README.md in this bundle for the tools you still need on this machine (JDK, apksigner).
 EOF
 INSTALL_SH
 chmod +x "$OUT/install.sh"
 
 # ---- README.md -------------------------------------------------------------------------
+# The quick-start used to print a wbaes recipe unconditionally, including in an
+# --allow-foreign-host bundle that carries no wb_keygen and therefore cannot run the default
+# cipher at all. Now that wbaes IS the default, that would be a recipe that fails on the first
+# try, so the two cases diverge here.
+if [ "$WITH_KEYGEN" -eq 1 ]; then
+    KEYGEN_RECIPE_SUFFIX=""
+    KEYGEN_RECIPE_NOTE="\`--cipher wbaes\` and \`--verify\` are the defaults, and sopack locates
+this bundle's \`bin/wb_keygen\` itself - nothing to export, no flag to pass."
+else
+    KEYGEN_RECIPE_SUFFIX=" --cipher chacha20"
+    KEYGEN_RECIPE_NOTE="**\`--cipher chacha20\` is required here.** This bundle was generated with
+\`--allow-foreign-host\`, so it carries no \`bin/wb_keygen\` and the default cipher (\`wbaes\`)
+cannot seal a blob. Regenerate the bundle on macOS for white-box support."
+fi
+
 # Unquoted heredoc so $ABI etc. interpolate; every literal dollar below is escaped.
 cat >"$OUT/README.md" <<EOF
 # sopack portable pack bundle
@@ -699,8 +775,10 @@ Generated from sopack \`$SOPACK_REV\` for \`$ABI\` / android-$API.
 
 \`\`\`bash
 cd /path/to/this/bundle && ./install.sh
-./venv/bin/sopack pack <your.apk> --cipher wbaes -o packed.apk --verify
+./venv/bin/sopack pack <your.apk> -o packed.apk${KEYGEN_RECIPE_SUFFIX}
 \`\`\`
+
+${KEYGEN_RECIPE_NOTE}
 
 \`install.sh\` verifies the checksums, checks that this host can run \`bin/wb_keygen\`, creates a
 virtualenv at \`./venv\`, installs the wheel into it, and then verifies that the installed sopack
@@ -720,7 +798,7 @@ cannot run it - you still get \`--cipher chacha20\`).
 | **Network, once** | \`pip\` fetches \`lief\` while installing the wheel. Nothing else is downloaded | **yes**, at install time only |
 | A **JDK** (\`keytool\`, \`java\`) | \`keytool\` runs on your **first pack even without \`--keystore\`** - sopack generates \`~/.sopack/debug.keystore\`. \`java\` is needed when apksigner resolves to a \`.jar\` | **yes**, every cipher |
 | \`apksigner\` | signs the repackaged APK, and backs \`--verify\` | **yes**. Found on PATH, under \`\$ANDROID_SDK_ROOT\`/\`\$ANDROID_HOME\` \`build-tools/*\`, or via \`\$SOPACK_APKSIGNER_JAR\` |
-| \`bin/wb_keygen\` (in this bundle) | seals the white-box blob at pack time | \`--cipher wbaes\` only. Export \`\$SOPACK_WBKEYGEN\` or pass \`--wb-keygen\` |
+| \`bin/wb_keygen\` (in this bundle) | seals the white-box blob at pack time | \`--cipher wbaes\` (the DEFAULT) only. Found automatically - it sits beside the venv \`install.sh\` creates, and sopack probes there |
 | \`zipalign\` | 16 KB alignment of the output APK | optional - sopack falls back to a pure-Python aligner |
 | \`openssl\` | fast ChaCha20 / AES-CTR | optional - pure-Python fallback runs at ~0.6 MB/s, so a multi-MB \`.text\` is slow but correct |
 
@@ -789,14 +867,14 @@ if [ -n "$TARBALL" ]; then
 
   mkdir -p ~/sopack-bundle && tar xzf $(basename "$TARBALL") -C ~/sopack-bundle
   ~/sopack-bundle/install.sh
-  ~/sopack-bundle/venv/bin/sopack pack <your.apk> --cipher wbaes -o packed.apk --verify
+  ~/sopack-bundle/venv/bin/sopack pack <your.apk> -o packed.apk${KEYGEN_RECIPE_SUFFIX}
 EOF
 else
     cat <<EOF
 
   # copy $(basename "$OUT")/ across, then:
   ./$(basename "$OUT")/install.sh
-  ./$(basename "$OUT")/venv/bin/sopack pack <your.apk> --cipher wbaes -o packed.apk --verify
+  ./$(basename "$OUT")/venv/bin/sopack pack <your.apk> -o packed.apk${KEYGEN_RECIPE_SUFFIX}
 EOF
 fi
 cat <<EOF

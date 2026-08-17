@@ -30,9 +30,9 @@
 #   --apks DIR        default <repo>/test_apks (the local APK corpus)
 #   --out DIR         default <repo>/output/testrun
 #   --abi ABI         default arm64-v8a (the only ABI sopack protects in practice)
-#   --wbc PATH        whitebox-cryptography checkout.  Else $WBC, else <repo>/../whitebox-cryptography
+#   --wbc PATH        whitebox-cryptography checkout.  Else $WBC, else the pinned submodule
 #   --ndk PATH        Android NDK root.                Else $NDK/$ANDROID_NDK_HOME/$ANDROID_NDK_ROOT
-#   --wb-keygen PATH  host wb_keygen.                  Else $SOPACK_WBKEYGEN, else $WBC/build-host/wb_keygen
+#   --wb-keygen PATH  host wb_keygen.                  Else $SOPACK_WBKEYGEN, else <repo>/vendor/wbc/bin/wb_keygen
 #
 # The APKs this produces are packed against a --trace (-DSOPK_RT_LOG) skeleton and need
 # `pack --allow-helper-log`. They log the target name, .text address and size at load.
@@ -109,22 +109,26 @@ SOPACK_VER="$( cd "$SOPACK" && python3 -c 'import sopack; print(sopack.__version
 [ -d "$APK_DIR" ] || die "--apks $APK_DIR is not a directory"
 
 # ---- toolchain paths -----------------------------------------------------------------------
-# $SOPACK_WBKEYGEN is exported INSIDE build_wbaes.sh (scripts/build_wbaes.sh:217) and so never
-# reaches a caller. Resolve it here, or every pack in the loop fails identically on an empty
-# --wb-keygen.
+# The keygen is resolved here as a PRECONDITION, not to pass down: sopack has no --wb-keygen
+# flag any more, and provision.find_wb_keygen probes vendor/wbc/bin/ itself. Checking it up
+# front still beats letting every pack in the loop fail identically at the same preflight.
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
-WBC="${WBC_ARG:-${WBC:-$SOPACK/../whitebox-cryptography}}"
 NDK="${NDK_ARG:-${NDK:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-$SDK/ndk/29.0.14206865}}}}"
-WBKEYGEN="${WBKEYGEN_ARG:-${SOPACK_WBKEYGEN:-$WBC/build-host/wb_keygen}}"
-
-[ -d "$WBC" ] || die "WBC=$WBC does not exist - pass --wbc or export WBC"
+[ -n "$WBC_ARG" ] && WBC="$WBC_ARG"
+resolve_wbc "$SOPACK" --no-prompt
 WBC="$(cd "$WBC" && pwd)"
+WBKEYGEN="${WBKEYGEN_ARG:-${SOPACK_WBKEYGEN:-$SOPACK/vendor/wbc/bin/wb_keygen}}"
+
 if [ ! -x "$WBKEYGEN" ]; then
     die "no host wb_keygen at $WBKEYGEN.
-       Build one in the whitebox-cryptography repo (scripts/gen_blob.sh builds build-host/),
-       or pass --wb-keygen. NOTE: a wb_keygen delivered out of band is an ANDROID build and
-       does not run on this host."
+       Run ./scripts/build_wbaes.sh - it builds one from the pinned submodule and installs it
+       at vendor/wbc/bin/wb_keygen, where sopack finds it unaided. NOTE: a wb_keygen delivered
+       out of band is an ANDROID build and does not run on this host."
 fi
+# A --wb-keygen passed to THIS script can no longer be forwarded on the sopack command line, so
+# hand it over the one channel that still exists. Unset, sopack's own probe wins - which is the
+# normal path and points at the same file.
+[ -n "$WBKEYGEN_ARG" ] && export SOPACK_WBKEYGEN="$WBKEYGEN"
 if [ "$SKIP_BUILD" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
     if [ ! -d "$NDK" ]; then
         warn "NDK=$NDK does not exist. Installed NDKs under $SDK/ndk:"
@@ -325,12 +329,14 @@ for APK in "${APK_LIST[@]}"; do
 
     # ---- 2. pack ---------------------------------------------------------------------------
     if [ -z "$STATUS" ]; then
+        # --cipher wbaes stays EXPLICIT even though it is the default: this harness exists to
+        # exercise the white-box path, and it must keep doing that if the default ever moves.
+        # --verify is likewise the default now, so it is gone from here.
         PACK_CMD=(python3 -m sopack.cli pack "$APK"
                   --cipher wbaes
                   --abi "$ABI"
-                  --wb-keygen "$WBKEYGEN"
                   -o "$OUT_APK"
-                  --verify --allow-helper-log)
+                  --allow-helper-log)
         if [ "$DRY_RUN" -eq 1 ]; then
             printf '    would run: '; printf '%q ' "${PACK_CMD[@]}"; printf '\n'
             printf '    would run: adb uninstall %q\n' "$PKG"

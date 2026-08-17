@@ -127,6 +127,39 @@ def test_abi_default_is_arm64_only():
     assert _abis(["--abi", "arm64-v8a,x86_64"]) == ("arm64-v8a", "x86_64")
 
 
+def _parse(argv):
+    return cli.build_parser().parse_args(["pack", "in.apk", "-o", "out.apk"] + argv)
+
+
+def test_cipher_defaults_to_wbaes():
+    """The protected mode is the one you get by default. chacha20/xor ship the raw key
+    (whitened) in the binary, so leaving them as the default meant the tool's whole point was
+    opt-in. Reachable from a clean clone only because build_wbaes.sh builds the pinned
+    whitebox-cryptography submodule - see scripts/build_wbaes.sh."""
+    assert _parse([]).cipher == "wbaes"
+    assert _parse(["--cipher", "chacha20"]).cipher == "chacha20"
+
+
+def test_verify_defaults_on_and_no_verify_turns_it_off():
+    """--verify costs one apksigner call and catches a broken signature before the APK leaves
+    the machine. store_false rather than BooleanOptionalAction: the latter needs 3.9, which is
+    exactly this project's floor."""
+    assert _parse([]).verify is True
+    assert _parse(["--no-verify"]).verify is False
+    assert _parse(["--verify"]).verify is True
+    # Last flag wins, so an explicit --verify after --no-verify is not silently ignored.
+    assert _parse(["--no-verify", "--verify"]).verify is True
+
+
+def test_wb_keygen_flag_is_gone():
+    """Removed, not deprecated: provision.find_wb_keygen probes vendor/wbc/bin/ and the
+    portable bundle itself, so there is nothing left to point at. A stale --wb-keygen in a
+    script must fail loudly rather than being silently accepted and ignored."""
+    with pytest.raises(SystemExit):
+        _parse(["--wb-keygen", "/some/wb_keygen"])
+    assert not hasattr(_parse([]), "wb_keygen")
+
+
 def test_unsupported_abi_still_rejected():
     args = cli.build_parser().parse_args(
         ["pack", "in.apk", "-o", "out.apk", "--abi", "mips"])

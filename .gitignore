@@ -25,12 +25,18 @@ libvosWrapperEx-arm64.so
 # Local binary/APK fixtures and third-party white-box artifacts — large, and not ours to
 # redistribute. Tests that need them skip; tests/fixtures/ below is the committed substitute.
 #
-# Three separate things, deliberately three directories (see CLAUDE.md "Directory layout"):
+# FOUR separate things, deliberately four directories (see CLAUDE.md "Directory layout"). Only
+# the first is tracked, and it is the only one that is a SOURCE:
+#   third_party/whitebox-cryptography/
+#               the pinned WBC dependency, a TRACKED git submodule. NOT ignored — it is the
+#               source vendor/wbc/ is built FROM. Its own third_party/ (libsodium, O-MVLL) is
+#               fetched by its fetch_deps.sh and ignored by its own .gitignore, not ours.
 #   test_apks/  the local APK corpus scripts/device_test.sh runs. *.apk below already covers
 #               what is in there today, but keep the directory rule so an unpacked APK tree
 #               dropped in it does not turn `git status` into 1900 lines.
-#   vendor/     third-party BUILD INPUTS - vendor/wbc/ is the libwbcrypto.a + wbcrypto.h that
-#               scripts/build_wbaes.sh copies out of your whitebox-cryptography checkout.
+#   vendor/     third-party BUILD OUTPUTS of that submodule - vendor/wbc/ is the libwbcrypto.a +
+#               wbcrypto.h + bin/wb_keygen that scripts/build_wbaes.sh builds and copies out.
+#               Host- and ABI-specific, so it is generated per machine, never committed.
 #   artifacts/  the GENERATED portable pack bundle from scripts/artifact_generation.sh. It is an
 #               output, not a source: regenerate it, never edit it in place. (This was `assets/`
 #               until the split - retired because assets/ is a real Android APK directory.)

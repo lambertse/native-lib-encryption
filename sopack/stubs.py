@@ -65,10 +65,15 @@ def helper_skeleton_path(abi: str) -> Path:
     p = _STUB_DIR / f"sopk_rt_{abi}.so"
     if not p.exists():
         raise StubMissingError(
-            f"wbaes helper skeleton for {abi} not found ({p.name} in {_STUB_DIR}). Build "
-            "it from stub/sopk_rt.c with the NDK + O-MVLL and drop it there "
-            "(docs/technical/WBAES.md Phase 4 step 4b - it links against the provider, so "
-            "build that first).")
+            f"wbaes helper skeleton for {abi} not found ({p.name} in {_STUB_DIR}).\n"
+            f"  --cipher wbaes is the default, and it needs per-ABI artifacts that are built, "
+            f"not committed. Either:\n"
+            f"    * run ./scripts/build_wbaes.sh --abi {abi}   (needs the NDK; builds the "
+            f"pinned whitebox-cryptography submodule), or\n"
+            f"    * install from a portable bundle (artifacts/install.sh), which carries them, "
+            f"or\n"
+            f"    * pass --cipher chacha20 to pack without a white-box.\n"
+            f"  Note a bundle carries ONE ABI's skeletons, so --abi all needs a build per ABI.")
     return p
 
 
@@ -86,8 +91,14 @@ def provider_skeleton_path(abi: str) -> Path:
     p = _STUB_DIR / f"sopk_wb_{abi}.so"
     if not p.exists():
         raise StubMissingError(
-            f"wbaes white-box provider skeleton for {abi} not found ({p.name} in {_STUB_DIR}). "
-            "Build it from stub/sopk_wb.c with the NDK + O-MVLL, statically linking "
-            "libwbcrypto.a and passing -Wl,-soname,libsopk_wb.so "
-            "(docs/technical/WBAES.md Phase 4 step 4a).")
+            f"wbaes white-box provider skeleton for {abi} not found ({p.name} in "
+            f"{_STUB_DIR}).\n"
+            f"  --cipher wbaes is the default, and it needs per-ABI artifacts that are built, "
+            f"not committed. Either:\n"
+            f"    * run ./scripts/build_wbaes.sh --abi {abi}   (needs the NDK; builds the "
+            f"pinned whitebox-cryptography submodule), or\n"
+            f"    * install from a portable bundle (artifacts/install.sh), which carries them, "
+            f"or\n"
+            f"    * pass --cipher chacha20 to pack without a white-box.\n"
+            f"  Note a bundle carries ONE ABI's skeletons, so --abi all needs a build per ABI.")
     return p

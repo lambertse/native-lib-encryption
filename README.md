@@ -16,22 +16,36 @@ full design and reasoning.
 
 ```
 sopack pack in.apk -o out.apk [--lib libfoo.so,libbar.so] [--exclude-lib GLOB]
-                              [--cipher chacha20|xor|wbaes] [--abi ...]
+                              [--cipher wbaes|chacha20|xor] [--abi ...] [--no-verify]
 ```
 
 Omit `--lib`/`--libs` and every `lib/<abi>/*.so` in the APK is encrypted. `--abi` defaults
 to **`arm64-v8a` alone** - the only ABI protected in practice; pass `--abi all` for every
-supported ABI.
+supported ABI. The output is verified with `apksigner` by default; `--no-verify` skips it.
+
+Before the first `wbaes` pack, build the per-ABI artifacts once:
+
+```
+git submodule update --init      # the pinned whitebox-cryptography dependency
+pip install -e .
+./scripts/build_wbaes.sh         # needs the Android NDK, macOS for O-MVLL, and network once
+```
+
+That builds the white-box library and a host `wb_keygen` from the submodule and leaves them
+where sopack finds them on its own - there is no keygen path to configure. If you would rather
+not build anything, `--cipher chacha20` works from a bare checkout.
 
 ## Two modes
 
-`--cipher chacha20` (default) and `xor` use the **freestanding stub** described below: the
-key ships inside the library, whitened at rest.
+`--cipher wbaes` is the **default**. `chacha20` and `xor` use the **freestanding stub**
+described below: the key ships inside the library, whitened at rest.
 
 `--cipher wbaes` instead protects the key with a **white-box AES-128**, so no portable key
 ships at all. It needs a different delivery mechanism (normal-linkage helpers injected as a
-`DT_NEEDED`, because the white-box runtime needs libc) and **two** per-ABI skeletons you build
-yourself - a thin per-target helper plus one shared white-box provider. See
+`DT_NEEDED`, because the white-box runtime needs libc) and **two** per-ABI skeletons built from
+the pinned whitebox-cryptography submodule - a thin per-target helper plus one shared white-box
+provider. `./scripts/build_wbaes.sh` produces both; they are host- and ABI-specific, so they are
+not committed and a plain `pip install .` from a checkout will not carry them. See
 [`docs/technical/ARCHITECTURE.md`](./docs/technical/ARCHITECTURE.md) §11 for how it works and
 [`docs/technical/WBAES.md`](./docs/technical/WBAES.md) for the setup and verification
 procedure. The rest of this page describes the stub mode.

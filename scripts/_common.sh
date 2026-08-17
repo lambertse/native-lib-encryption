@@ -53,3 +53,83 @@ ask_path() {
         read -r cur || die "$var not provided"
     done
 }
+
+# ---- the whitebox-cryptography dependency ------------------------------------------------
+# WBC is a PINNED GIT SUBMODULE at third_party/whitebox-cryptography. It used to arrive out of
+# band, which meant three scripts each guessed a different default and none of them recorded
+# which revision built the artifacts. One resolver, one precedence list, one place to change.
+
+WBC_SUBMODULE="third_party/whitebox-cryptography"
+
+# resolve_wbc SOPACK [--no-prompt]
+#
+# Sets WBC. Precedence, highest first:
+#   1. $WBC          - already assigned by a --wbc flag or exported by the user
+#   2. the submodule - $SOPACK/third_party/whitebox-cryptography, initialised on demand
+#   3. the sibling   - $SOPACK/../whitebox-cryptography, the pre-submodule dev layout
+#   4. a prompt      - unless --no-prompt (artifact_generation.sh runs unattended)
+#
+# 2 sits ahead of 3 so a clean clone works with no arguments; 3 survives so an existing
+# side-by-side checkout keeps working. The caller still runs valid_wbc afterwards: this decides
+# WHICH tree, not whether that tree is usable.
+resolve_wbc() {
+    local sopack="$1" no_prompt="${2:-}"
+    local sub="$sopack/$WBC_SUBMODULE"
+
+    if [ -z "${WBC:-}" ]; then
+        # An UNINITIALISED submodule is an empty directory, so `-d` is not a usable test here -
+        # it passes, and the failure surfaces much later as "not a whitebox-cryptography
+        # checkout". Test for the header, and initialise when it is missing.
+        if [ ! -f "$sub/include/wbcrypto.h" ] && [ -f "$sopack/.gitmodules" ]; then
+            say "initialising the whitebox-cryptography submodule (pinned)"
+            # No --recursive: WBC has no nested submodules. Its own third_party/ (libsodium,
+            # O-MVLL) is a SHA256-pinned tarball fetch that its build scripts run themselves.
+            ( cd "$sopack" && git submodule update --init "$WBC_SUBMODULE" ) \
+                || die "git submodule update --init $WBC_SUBMODULE failed. It needs network the
+       first time. To use a checkout you already have, pass --wbc PATH or export WBC."
+        fi
+        if [ -f "$sub/include/wbcrypto.h" ]; then
+            WBC="$sub"
+        elif [ -f "$sopack/../whitebox-cryptography/include/wbcrypto.h" ]; then
+            WBC="$(cd "$sopack/../whitebox-cryptography" && pwd)"
+            info "using the sibling checkout $WBC (the submodule at $WBC_SUBMODULE is empty)"
+        fi
+    fi
+
+    if [ "$no_prompt" = "--no-prompt" ]; then
+        [ -n "${WBC:-}" ] || die "no whitebox-cryptography checkout. Expected the submodule at
+       $sub - run: git submodule update --init $WBC_SUBMODULE
+       (or pass --wbc PATH / export WBC). This script never prompts."
+        valid_wbc "$WBC" || die "WBC=$WBC is not usable (see above)."
+        return 0
+    fi
+    ask_path WBC "whitebox-cryptography checkout (>= 3.0.0): " valid_wbc \
+        "Pass --wbc PATH, export WBC, or run: git submodule update --init $WBC_SUBMODULE"
+}
+
+# valid_wbc PATH - the >= 3.0.0 gate, shared so the three callers cannot drift.
+valid_wbc() {
+    [ -d "$1" ] || { warn "$1 is not a directory"; return 1; }
+    [ -f "$1/include/wbcrypto.h" ] || {
+        warn "$1 has no include/wbcrypto.h - that is not a whitebox-cryptography checkout"
+        warn "(an UNINITIALISED submodule looks exactly like this: git submodule update --init)"
+        return 1; }
+    # gen_blob.sh, NOT build_host.sh. Both exist upstream and they are different tools:
+    # build_host.sh builds the tests and tools into build/ and honours ZIG_BIN/EXTRA_CXXFLAGS,
+    # while gen_blob.sh deliberately REFUSES both so no cross toolchain or O-MVLL plugin can
+    # leak into a provisioning tool, and writes build-host/wb_keygen. Upstream calls that path
+    # "part of the consumer contract" with this repo by name. Do not "modernise" this to
+    # build_host.sh - it would hand us an obfuscated or cross-built keygen that cannot run here.
+    [ -f "$1/scripts/gen_blob.sh" ] || {
+        warn "$1 has no scripts/gen_blob.sh - too old, or not the right repo"; return 1; }
+    # The version gate that matters. 3.0.0 made the seal's KDF cost a per-blob tier and added
+    # wbc_blob_kdf_tier; sopack seals at `light` and the helper ctor reads the tier back, so a
+    # pre-3.0.0 header will not compile and a pre-3.0.0 archive fails at link.
+    grep -q 'wbc_blob_kdf_tier' "$1/include/wbcrypto.h" || {
+        warn "$1/include/wbcrypto.h does not declare wbc_blob_kdf_tier, so this checkout is"
+        warn "pre-3.0.0. sopack requires >= 3.0.0 (the light KDF tier); update it and retry."
+        grep -q 'wbc_unwrap_key' "$1/include/wbcrypto.h" \
+            || warn "(it does not even have wbc_unwrap_key, so it is pre-2.0.0)"
+        return 1; }
+    return 0
+}

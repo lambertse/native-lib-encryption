@@ -19,7 +19,9 @@ unwrap and the wipe.
 
 `wb_keygen` is host-only and un-obfuscated (see the whitebox-cryptography repo
 scripts/gen_blob.sh). It must be a *host* build - an Android one does NOT run on the pack
-host; provide it via `--wb-keygen`, `SOPACK_WBKEYGEN` or on `PATH`.
+host. `./scripts/build_wbaes.sh` builds one from the pinned submodule and installs it at
+`vendor/wbc/bin/wb_keygen`, which `find_wb_keygen` below probes first; nothing needs to be
+pointed at it by hand.
 
 THE KDF TIER (wbcrypto 3.0.0). 3.0.0 moved the seal's key-derivation cost out of a
 compile-time constant and into the blob header, selectable at seal time with
@@ -48,6 +50,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 from .cipher import (CIPHER_CHACHA20, aes128_ctr, apply_cipher, gen_wbaes_params,
                      whiten_pass)
@@ -115,8 +118,8 @@ def assert_light_blob(blob: bytes, *, tool: str) -> None:
             f"(whitebox-cryptography >= 3.0.0). Almost certainly a STALE HOST wb_keygen: "
             f"{tool} was built from a pre-3.0.0 checkout. A v{version} blob cannot be opened "
             f"by a 3.0.0 helper at all, so this would fail on device with no useful signal. "
-            f"Rebuild it (cd $WBC && bash scripts/gen_blob.sh …, or "
-            f"./scripts/build_wbaes.sh --force) and re-point --wb-keygen / $SOPACK_WBKEYGEN.")
+            f"Rebuild it with ./scripts/build_wbaes.sh --force, which re-runs the submodule's "
+            f"scripts/gen_blob.sh and refreshes vendor/wbc/bin/wb_keygen.")
     if tier != KDF_TIER_NONE:
         raise ProvisionError(
             f"sealed blob was sealed at KDF tier {tier} "
@@ -128,7 +131,8 @@ def assert_light_blob(blob: bytes, *, tool: str) -> None:
 
 def _host_incompatible_reason(path: str) -> str | None:
     """Return a human reason if `path` is an executable the PACK HOST cannot run (the classic
-    mistake: pointing --wb-keygen at an out-of-band *Android* wb_keygen build), else None."""
+    mistake: an out-of-band *Android* wb_keygen build left on PATH or in $SOPACK_WBKEYGEN),
+    else None."""
     try:
         with open(path, "rb") as f:
             head = f.read(4096)
@@ -177,24 +181,60 @@ class Provisioned:
     nonce16: bytes         # 16-byte ChaCha20 nonce block (12-byte nonce + LE counter)
 
 
+def _repo_wb_keygen() -> str:
+    """Where `scripts/build_wbaes.sh` installs the keygen it builds, in a checkout or an
+    editable install. Resolves into site-packages for a wheel, where `vendor/` does not exist -
+    that miss is correct, and _bundle_wb_keygen below is the wheel's answer."""
+    return str(Path(__file__).resolve().parents[1] / "vendor" / "wbc" / "bin" / "wb_keygen")
+
+
+def _bundle_wb_keygen() -> str | None:
+    """Where the portable bundle keeps it, when sopack was installed from one.
+
+    `artifacts/install.sh` creates the venv at <bundle>/venv and writes the keygen to
+    <bundle>/bin/wb_keygen, so sys.prefix's parent IS the bundle root. The sibling MANIFEST.txt
+    is the guard, and it is not decoration: under `install.sh --no-venv` sys.prefix is the
+    SYSTEM prefix, and <prefix>/../bin/wb_keygen would then match some unrelated binary in
+    /usr/bin. Every bundle has a MANIFEST.txt; no system prefix does."""
+    root = Path(sys.prefix).resolve().parent
+    if not (root / "MANIFEST.txt").is_file():
+        return None
+    return str(root / "bin" / "wb_keygen")
+
+
 def find_wb_keygen(explicit: str | None = None) -> str:
-    """Locate a RUNNABLE host wb_keygen: explicit path, else SOPACK_WBKEYGEN, else PATH.
-    Skips a binary the host can't execute (e.g. the shipped Android wb_keygen) and reports
-    why, so the failure is clear instead of a mid-pack 'Exec format error'."""
-    bad = None
-    for cand in (explicit, os.environ.get("SOPACK_WBKEYGEN"), shutil.which("wb_keygen")):
+    """Locate a RUNNABLE host wb_keygen, without needing to be told where it is.
+
+    Probe order: an explicit path, then the local build (`vendor/wbc/bin/`), then the portable
+    bundle, then $SOPACK_WBKEYGEN, then PATH. The two repo-relative probes are what let
+    `sopack pack` run with no flag and no environment variable - `--wb-keygen` used to be the
+    only reliable route and no longer exists.
+
+    Note $SOPACK_WBKEYGEN ranks BELOW the local build on purpose. `build_wbaes.sh` refreshes
+    and gates vendor/wbc/bin/wb_keygen on every run, and a stale keygen sealing a v3 or heavy
+    blob is this mode's classic silent failure; a leftover export should not be able to win
+    over the one that was just verified.
+
+    Each candidate is checked for host-executability rather than mere existence, so a shipped
+    *Android* wb_keygen in one location does not mask a usable one in the next, and the failure
+    is a clear message instead of a mid-pack 'Exec format error'."""
+    bad = []
+    for cand in (explicit, _repo_wb_keygen(), _bundle_wb_keygen(),
+                 os.environ.get("SOPACK_WBKEYGEN"), shutil.which("wb_keygen")):
         if not cand or not os.path.exists(cand):
             continue
         reason = _host_incompatible_reason(cand)
         if reason:
-            bad = f"{cand}: {reason}"
+            bad.append(f"{cand}: {reason}")
             continue
         return cand
-    msg = ("could not find a host wb_keygen. Build one from the whitebox-cryptography repo "
-           "(scripts/gen_blob.sh -> build-host/wb_keygen) and pass --wb-keygen / set "
-           "SOPACK_WBKEYGEN, or put it on PATH.")
+    msg = ("could not find a host wb_keygen, which --cipher wbaes needs to seal the white-box "
+           "blob. Run ./scripts/build_wbaes.sh - it builds one from the pinned "
+           "whitebox-cryptography submodule and installs it at vendor/wbc/bin/wb_keygen. If "
+           "you installed from a portable bundle, run its install.sh instead. To pack without "
+           "a white-box at all, pass --cipher chacha20.")
     if bad:
-        msg += f" (the one found is not runnable here - {bad})"
+        msg += "\n  Candidates found but not runnable here:\n    " + "\n    ".join(bad)
     raise FileNotFoundError(msg)
 
 
@@ -221,9 +261,8 @@ def _seal(key: bytes, passphrase: str, seed: int, wb_keygen: str) -> bytes:
             if "--kdf" in err or "unknown arg" in err:
                 msg += (f"\n  This is a STALE PRE-3.0.0 host wb_keygen: it does not know "
                         f"--kdf. sopack requires whitebox-cryptography >= 3.0.0. Rebuild it "
-                        f"(cd $WBC && bash scripts/gen_blob.sh …, or "
-                        f"./scripts/build_wbaes.sh --force) and re-point --wb-keygen / "
-                        f"$SOPACK_WBKEYGEN at $WBC/build-host/wb_keygen.")
+                        f"with ./scripts/build_wbaes.sh --force, which updates the pinned "
+                        f"submodule's build and refreshes vendor/wbc/bin/wb_keygen.")
             raise ProvisionError(msg) from e
         except OSError as e:
             raise ProvisionError(

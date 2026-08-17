@@ -11,13 +11,18 @@
 # runtime unresolved.
 # Each of those has cost a debugging session here, so each is a hard gate below.
 #
+# WBC is a PINNED SUBMODULE at third_party/whitebox-cryptography - this script initialises it
+# on demand, so a clean clone needs no arguments and no out-of-band drop. It needs network the
+# first time: WBC's own third_party/fetch_deps.sh downloads libsodium and the O-MVLL plugin.
+#
 # Usage:
-#   ./scripts/build_wbaes.sh                          # prompts for WBC/NDK if unset
-#   WBC=~/src/whitebox-cryptography NDK=~/ndk/29 ./scripts/build_wbaes.sh
-#   ./scripts/build_wbaes.sh --wbc ~/src/wbc --ndk ~/ndk/29 --release
+#   ./scripts/build_wbaes.sh                          # submodule + NDK from the environment
+#   NDK=~/ndk/29 ./scripts/build_wbaes.sh
+#   ./scripts/build_wbaes.sh --wbc ~/src/wbc --ndk ~/ndk/29     # an external WBC working copy
 #
 # Options:
-#   --wbc PATH      whitebox-cryptography checkout (>= 3.0.0). Else $WBC, else prompt.
+#   --wbc PATH      whitebox-cryptography checkout (>= 3.0.0). Else $WBC, else the pinned
+#                   submodule, else a sibling ../whitebox-cryptography, else prompt.
 #   --ndk PATH      Android NDK root.               Else $NDK/$ANDROID_NDK_HOME/
 #                   $ANDROID_NDK_ROOT, else prompt.
 #   --abi ABI       default arm64-v8a
@@ -27,8 +32,11 @@
 #                   and size to logcat, and `sopack pack` refuses to pack one.
 #   --trace         opt into the tracing build for on-device Phase 6 verification. The result
 #                   needs `sopack pack --allow-helper-log` and is NOT shippable.
-#   --omvll         configure the Android build WITH the O-MVLL obfuscation plugin. Default is
-#                   --no-omvll: fewer moving parts while proving the pipeline works.
+#   --omvll         configure the Android build WITH the O-MVLL obfuscation plugin. This is the
+#                   DEFAULT - the provider is the artifact whose static analysis matters most.
+#                   WBC fetches and configures the plugin itself; it only loads on macOS.
+#   --no-omvll      build the Android library unobfuscated. Required on Linux (the plugin is a
+#                   Mach-O dylib), and the resulting provider is NOT what you should ship.
 #   --skip-tests    skip Phase 2 (the unit tests)
 #   --host-only     run Phases 1-3 only and stop. Needs no NDK, no cmake and no ninja, so the
 #                   Python<->C contracts can be verified on a machine that cannot cross-compile
@@ -46,7 +54,7 @@ SOPACK="$(cd "$HERE/.." && pwd)"
 ABI="arm64-v8a"
 API=24
 RELEASE=1
-OMVLL=0
+OMVLL=1
 SKIP_TESTS=0
 HOST_ONLY=0
 FORCE=0
@@ -60,14 +68,15 @@ while [ "$#" -gt 0 ]; do
         --api)        API="$2"; shift 2 ;;
         --release)    RELEASE=1; shift ;;          # now the default; kept for explicitness
         --trace)      RELEASE=0; shift ;;
-        --omvll)      OMVLL=1; shift ;;
+        --omvll)      OMVLL=1; shift ;;          # now the default; kept for explicitness
+        --no-omvll)   OMVLL=0; shift ;;
         --skip-tests) SKIP_TESTS=1; shift ;;
         --host-only)  HOST_ONLY=1; shift ;;
         --force)      FORCE=1; shift ;;
-        # 2..38 is the header comment block; it ends at the "SOPACK is this script's own
+        # 2..46 is the header comment block; it ends at the "SOPACK is this script's own
         # repo" line, immediately before `set -euo pipefail`. Widen this if the header grows,
         # or --help starts printing shell code.
-        -h|--help)    sed -n '2,38p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,46p' "$0"; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
@@ -76,24 +85,8 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/sopack-wbaes.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 # ---- validators ------------------------------------------------------------------------
-valid_wbc() {
-    [ -d "$1" ] || { warn "$1 is not a directory"; return 1; }
-    [ -f "$1/include/wbcrypto.h" ] || {
-        warn "$1 has no include/wbcrypto.h - that is not a whitebox-cryptography checkout"
-        return 1; }
-    [ -f "$1/scripts/gen_blob.sh" ] || {
-        warn "$1 has no scripts/gen_blob.sh - too old, or not the right repo"; return 1; }
-    # The version gate that matters. 3.0.0 made the seal's KDF cost a per-blob tier and added
-    # wbc_blob_kdf_tier; sopack seals at `light` and the helper ctor reads the tier back, so a
-    # pre-3.0.0 header will not compile and a pre-3.0.0 archive fails at link.
-    grep -q 'wbc_blob_kdf_tier' "$1/include/wbcrypto.h" || {
-        warn "$1/include/wbcrypto.h does not declare wbc_blob_kdf_tier, so this checkout is"
-        warn "pre-3.0.0. sopack requires >= 3.0.0 (the light KDF tier); update it and retry."
-        grep -q 'wbc_unwrap_key' "$1/include/wbcrypto.h" \
-            || warn "(it does not even have wbc_unwrap_key, so it is pre-2.0.0)"
-        return 1; }
-    return 0
-}
+# valid_wbc lives in _common.sh - device_test.sh and artifact_generation.sh gate on it too, and
+# three copies of a version check is exactly the drift the submodule exists to remove.
 
 valid_ndk() {
     [ -d "$1" ] || { warn "$1 is not a directory"; return 1; }
@@ -114,8 +107,13 @@ case "$ABI" in
 esac
 
 need python3
+need git "the whitebox-cryptography dependency is a pinned submodule"
 need cc  "the Phase 3 round-trip probe is C"
 need c++ "libwbcrypto is C++"
+# WBC's third_party/fetch_deps.sh downloads libsodium (and the O-MVLL plugin) on first build.
+# Fail here rather than 200 lines into a CMake configure.
+need curl "WBC's third_party/fetch_deps.sh downloads libsodium on the first build"
+need tar  "WBC's third_party/fetch_deps.sh unpacks the dependency tarballs"
 if [ "$HOST_ONLY" -eq 0 ]; then
     need cmake "scripts/build_android.sh uses CMake (or pass --host-only)"
     need ninja "scripts/build_android.sh configures with -GNinja (or pass --host-only)"
@@ -127,8 +125,10 @@ have openssl || warn "no openssl on PATH - the pack-side cipher falls back to pu
     || die "cannot import sopack from $SOPACK - run: pip install -e ."
 
 : "${NDK:=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
-ask_path WBC "whitebox-cryptography checkout (>= 3.0.0): " valid_wbc \
-    "Pass --wbc PATH or export WBC."
+# Initialises the pinned submodule when WBC was not supplied. Not a numbered phase on purpose:
+# TOTAL stays 4 so the epilogue's "Host phases 1-4 PASS" sentinel - which device_test.sh and
+# artifact_generation.sh both grep for - keeps its wording.
+resolve_wbc "$SOPACK"
 
 HOSTTAG="$(uname | tr '[:upper:]' '[:lower:]')-x86_64"
 if [ "$HOST_ONLY" -eq 0 ]; then
@@ -140,12 +140,21 @@ if [ "$HOST_ONLY" -eq 0 ]; then
     READELF="$NDKBIN/llvm-readelf"
     [ -x "$CXX" ] || die "no clang++ at $CXX"
     [ -x "$READELF" ] || die "no llvm-readelf at $READELF"
-fi
 
-SODIUM_INC=""
-for d in "$WBC"/third_party/libsodium/libsodium-*/src/libsodium/include; do
-    [ -f "$d/sodium.h" ] && SODIUM_INC="$d"
-done
+    # O-MVLL is fetched and configured by WBC's build_android.sh (it defaults OMVLL_CONFIG and
+    # OMVLL_PYTHONPATH to in-repo paths), so do NOT duplicate those checks here. The one thing
+    # it cannot fix is the host: the plugin ships as a Mach-O dylib and only LOADS on macOS.
+    if [ "$OMVLL" -eq 1 ] && [ "$(uname -s)" != "Darwin" ]; then
+        die "--omvll (the default) needs macOS: WBC vendors O-MVLL as a Mach-O dylib
+       (third_party/omvll/omvll_ndk_r29.dylib), which will not load into a Linux clang. Pass
+       --no-omvll to build here - but the resulting provider is UNOBFUSCATED and should not be
+       shipped; generate release artifacts on the Mac."
+    fi
+    # No PYTHONHOME warning here on purpose: build_android.sh already emits one, and it does so
+    # only on the path that actually loads the plugin. Duplicating it in preflight fired twice
+    # on a real build and, worse, fired at all when Phase 4 goes on to REUSE a cached
+    # libwbcrypto.a and never runs the plugin - a warning about a step that does not happen.
+fi
 
 TOTAL=4
 [ "$HOST_ONLY" -eq 1 ] && TOTAL=3
@@ -167,6 +176,12 @@ HOST_KEYGEN="$WBC/build-host/wb_keygen"
 if [ -x "$HOST_KEYGEN" ] && [ "$FORCE" -eq 0 ]; then
     info "reusing $HOST_KEYGEN (use --force to rebuild)"
 else
+    # gen_blob.sh, NOT the similarly-named scripts/build_host.sh. Upstream ships both and they
+    # are different tools: build_host.sh builds WBC's tests and CLI tools into build/ and
+    # honours ZIG_BIN/EXTRA_CXXFLAGS, so it can hand you a cross-built or O-MVLL-obfuscated
+    # wb_keygen that does not run here. gen_blob.sh refuses both, picks a native compiler, and
+    # writes build-host/wb_keygen - which upstream's own header calls "part of the consumer
+    # contract" with this repo, by name. Do not switch this to build_host.sh.
     info "building the host provisioning tool via scripts/gen_blob.sh …"
     if ! ( cd "$WBC" && bash scripts/gen_blob.sh \
              --key 000102030405060708090a0b0c0d0e0f --pass demo --seed 42 \
@@ -214,8 +229,15 @@ print("    blob header: magic=%s version=%d tier=%d" % blob_header(blob))
 ' "$TMP/probe.blob" "$HOST_KEYGEN" ) \
     || die "$HOST_KEYGEN accepted --kdf but did not produce a v4 light-tier blob (above).
        That is a 3.0.0-or-newer tool behaving unexpectedly - do not pack with it."
-export SOPACK_WBKEYGEN="$HOST_KEYGEN"
-ok "host wb_keygen usable and honours --kdf light: $SOPACK_WBKEYGEN"
+# Copy it where sopack looks for it unaided. provision.find_wb_keygen probes
+# vendor/wbc/bin/wb_keygen FIRST, so from here on `sopack pack` needs no --wb-keygen flag and no
+# $SOPACK_WBKEYGEN - which is why this script no longer exports one. `install -m 0755` rather
+# than cp: the exec bit is the whole point, and a plain cp inherits the source's mode only by
+# luck.
+mkdir -p "$SOPACK/vendor/wbc/bin"
+install -m 0755 "$HOST_KEYGEN" "$SOPACK/vendor/wbc/bin/wb_keygen" \
+    || die "could not copy $HOST_KEYGEN into $SOPACK/vendor/wbc/bin/"
+ok "host wb_keygen usable and honours --kdf light -> vendor/wbc/bin/wb_keygen"
 
 # ---- Phase 2 - unit tests --------------------------------------------------------------
 step 2 "$TOTAL" "Phase 2 - sopack unit tests"
@@ -224,15 +246,45 @@ if [ "$SKIP_TESTS" -eq 1 ]; then
 else
     ( cd "$SOPACK" && python3 -m pytest tests/ -q ) \
         || die "unit tests failed - fix these before trusting anything below"
-    ok "unit tests pass (with SOPACK_WBKEYGEN set, the full-injection tests run too)"
+    ok "unit tests pass (vendor/wbc/bin/wb_keygen exists, so the full-injection tests run too)"
 fi
 
 # ---- Phase 3 - full round-trip through the REAL white-box ------------------------------
 step 3 "$TOTAL" "Phase 3 - host round-trip through the real white-box"
-[ -n "$SODIUM_INC" ] || die "no vendored libsodium headers under $WBC/third_party/libsodium -
-       run $WBC/third_party/fetch_deps.sh libsodium"
-[ -f "$WBC/build-host/libsodium.a" ] || die "no $WBC/build-host/libsodium.a - Phase 1 builds it;
-       re-run with --force"
+# Globbed HERE, not in preflight, and this ordering is load-bearing. libsodium is not committed
+# in WBC - it is fetched by its third_party/fetch_deps.sh, which Phase 1's gen_blob.sh runs. A
+# preflight glob therefore comes up empty on every freshly-initialised submodule and this phase
+# would die telling you to run the fetcher that Phase 1 just ran.
+#
+# And Phase 1 is not a guarantee either: its cache branch skips gen_blob.sh entirely when
+# build-host/wb_keygen already exists, so a tree with a cached keygen and no libsodium reaches
+# here with nothing fetched. Hence the fetch below - it is idempotent (.vendored-ok stamp), so
+# it costs nothing on a warm tree and makes this phase self-sufficient either way.
+#
+# `return 0` is NOT decoration. When the glob matches nothing, `[ -f … ] && SODIUM_INC=…`
+# returns 1, so the for-loop returns 1 and so does the function - and under `set -e` a bare
+# call to it kills the script SILENTLY, right after the step header, with no error and no
+# clue. "libsodium is absent" is exactly the case this function exists to detect, so the
+# not-found path must be an ordinary return, not a fatal one.
+find_sodium_inc() {
+    SODIUM_INC=""
+    for d in "$WBC"/third_party/libsodium/libsodium-*/src/libsodium/include; do
+        [ -f "$d/sodium.h" ] && SODIUM_INC="$d"
+    done
+    return 0
+}
+find_sodium_inc
+if [ -z "$SODIUM_INC" ]; then
+    info "vendoring libsodium into $WBC/third_party (fetch_deps.sh; needs network once) …"
+    ( cd "$WBC" && ./third_party/fetch_deps.sh libsodium ) >"$TMP/fetchdeps.log" 2>&1 \
+        || { tail -20 "$TMP/fetchdeps.log" >&2
+             die "$WBC/third_party/fetch_deps.sh libsodium failed (above)"; }
+    find_sodium_inc
+fi
+[ -n "$SODIUM_INC" ] || die "no vendored libsodium headers under $WBC/third_party/libsodium
+       even after running $WBC/third_party/fetch_deps.sh libsodium"
+[ -f "$WBC/build-host/libsodium.a" ] || die "no $WBC/build-host/libsodium.a - Phase 1 builds it
+       as a side effect of gen_blob.sh; re-run with --force"
 
 info "building the round-trip probe …"
 cc -O2 -I"$WBC/include" -I"$SOPACK/stub" -c "$HERE/rt_roundtrip.c" -o "$TMP/rt_roundtrip.o" \
@@ -292,9 +344,15 @@ step 4 "$TOTAL" "Phase 4 - Android libwbcrypto.a + helper skeleton"
 ANDROID_LIB="$WBC/build-android/libwbcrypto.a"
 if [ -f "$ANDROID_LIB" ] && [ "$FORCE" -eq 0 ]; then
     info "reusing $ANDROID_LIB (use --force to rebuild)"
+    # An archive carries no record of whether O-MVLL ran, so this branch cannot tell an
+    # obfuscated cache from a --no-omvll one. Say so rather than implying the default held.
+    [ "$OMVLL" -eq 1 ] && warn "the cached archive may predate --omvll becoming the default; an
+      .a records no obfuscation state, so re-run with --force if this is a release build"
 else
-    OMVLL_ARG="--no-omvll"
-    [ "$OMVLL" -eq 1 ] && OMVLL_ARG=""
+    # build_android.sh defaults to O-MVLL ON and fetches/configures the plugin itself, so the
+    # obfuscated build is "pass nothing". Preflight already refused --omvll on a non-Darwin host.
+    OMVLL_ARG=""
+    [ "$OMVLL" -eq 0 ] && OMVLL_ARG="--no-omvll"
     info "cross-building the runtime library (${OMVLL_ARG:---omvll}) …"
     # shellcheck disable=SC2086
     ( cd "$WBC" && NDK="$NDK" ./scripts/build_android.sh --abi "$ABI" --api "$API" $OMVLL_ARG ) \
@@ -568,11 +626,12 @@ cat <<EOF
   mkdir -p output
   python3 -m sopack.cli pack <your.apk> \\
     --lib "libfoo.so,libbar.so" \\
-    --cipher wbaes \\
     --abi $ABI \\
-    --wb-keygen "$SOPACK_WBKEYGEN" \\
-    -o output/packed.apk \\
-    --verify
+    -o output/packed.apk
+
+  No --cipher, no --wb-keygen, no --verify: wbaes and --verify are the defaults, and the
+  keygen this phase just built is found at vendor/wbc/bin/wb_keygen. Omit --lib as well to
+  pack every lib/$ABI/*.so in the APK.
 
   Quote the --lib list: it is ONE argv word, so an unquoted space after a comma makes
   argparse reject the second name.

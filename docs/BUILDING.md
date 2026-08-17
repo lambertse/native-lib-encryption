@@ -98,9 +98,12 @@ sopack pack in.apk \
     --exclude-lib 'libc++_shared,libmy*' \
     --cipher chacha20 \
     --log \
-    --keystore "$HOME/.sopack/debug.keystore" \
-    --verify
+    --keystore "$HOME/.sopack/debug.keystore"
 ```
+
+`--cipher chacha20` is spelled out here because the **default is `wbaes`**, which needs the
+per-ABI artifacts `./scripts/build_wbaes.sh` builds. `--log` is a stub-cipher option, so the
+two go together. `--verify` is the default and is omitted.
 
 - **Library selection is optional.** Omit `--lib`/`--libs` and every `lib/<abi>/*.so` in
   the APK is encrypted, for the ABIs `--abi` selects.
@@ -120,16 +123,21 @@ sopack pack in.apk \
   (excluded by policy; `--no-default-exclude` turns that one off).
 - `--abi` - defaults to **`arm64-v8a` alone**, the only ABI protected in practice. Pass
   `--abi all` for all three, or a comma list such as `--abi arm64-v8a,x86_64`.
-- `--cipher` - `chacha20` (default), `xor`, or `wbaes`. The first two use the freestanding
-  stub. `wbaes` is white-box AES-128 key wrapping via injected helpers: it ships no
-  portable key, but it has prerequisites the other modes do not -
-  whitebox-cryptography >= 3.0.0, a host `wb_keygen` (`--wb-keygen` or `$SOPACK_WBKEYGEN`),
-  and **two** hand-built per-ABI skeletons in `sopack/stubs/`: the thin helper
-  `sopk_rt_<abi>.so` **and** the shared white-box provider `sopk_wb_<abi>.so`. Run
-  `./scripts/build_wbaes.sh` to produce both; read
+- `--cipher` - `wbaes` (**default**), `chacha20`, or `xor`. The latter two use the
+  freestanding stub and need no build step, but ship the raw key in the binary (whitened).
+  `wbaes` is white-box AES-128 key wrapping via injected helpers: it ships no portable key,
+  but it has prerequisites the other modes do not - whitebox-cryptography >= 3.0.0 (the
+  pinned submodule), a host `wb_keygen`, and **two** per-ABI skeletons in `sopack/stubs/`:
+  the thin helper `sopk_rt_<abi>.so` **and** the shared white-box provider
+  `sopk_wb_<abi>.so`. `./scripts/build_wbaes.sh` produces all of them in one command; read
   [technical/WBAES.md](./technical/WBAES.md) before using this mode.
-- `--wb-keygen` - path to a HOST `wb_keygen` (for `--cipher wbaes`); otherwise
-  `$SOPACK_WBKEYGEN`, otherwise one on `PATH`.
+- There is **no `--wb-keygen`**. `provision.find_wb_keygen` probes, in order:
+  `vendor/wbc/bin/wb_keygen` (what `build_wbaes.sh` installs), the portable bundle beside an
+  installed venv, `$SOPACK_WBKEYGEN`, then `PATH`. The env var deliberately ranks *below* the
+  local build, so a stale export cannot beat the keygen the build just verified.
+- `--no-verify` - skip the post-signing `apksigner` certificate dump. Verification is **on by
+  default**. `--verify` still exists for explicitness; the two are last-flag-wins, so
+  `--no-verify --verify` verifies.
 - `--min-sdk` - minimum SDK passed through to `apksigner`.
 - `--allow-helper-log` - permit packing a *tracing* wbaes skeleton (built with
   `-DSOPK_RT_LOG`). Warns on every pack; the result is **not shippable**. Only for a first

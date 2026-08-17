@@ -15,6 +15,7 @@ always wins over selection, including over an explicit --lib.
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 from pathlib import Path
 
@@ -123,9 +124,12 @@ def _cmd_pack(args: argparse.Namespace) -> int:
           + ("" if args.abi else "  (default; --abi all for every supported ABI)"))
     print(f"  libs={'ALL lib/<abi>/*.so' if libs is None else ','.join(libs)}")
     print(f"  excluding: {', '.join(eff_excludes)}")
+    # No wb_keygen= : the flag is gone and provision.find_wb_keygen locates one on its own
+    # (vendor/wbc/bin/ from a local build, or the bundle it was installed from). repackage still
+    # takes the kwarg, so a library caller can pin one.
     res = repackage(args.input, args.output, libs, cipher=args.cipher,
                     abis=abis, keystore=ks, min_sdk=args.min_sdk, log=args.log,
-                    wb_keygen=args.wb_keygen, allow_helper_log=args.allow_helper_log,
+                    allow_helper_log=args.allow_helper_log,
                     exclude_libs=excludes, no_default_exclude=args.no_default_exclude)
 
     print(f"\nInjected {len(res.injected)} librar{'y' if len(res.injected)==1 else 'ies'}:")
@@ -170,17 +174,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="drop the built-in exclusion list "
                          f"({', '.join(DEFAULT_EXCLUDE_PATTERNS)}). sopack's own injected "
                          "artifacts (libsopk_*) stay excluded regardless.")
-    pk.add_argument("--cipher", choices=["chacha20", "xor", "wbaes"], default="chacha20",
-                    help="chacha20/xor: freestanding stub (raw key ships whitened). "
-                         "wbaes: white-box AES-128 key wrapping via an injected helper - the "
-                         "long-term key is sealed and never reconstructed, and the white-box "
-                         "unwraps a session key that ChaCha20-decrypts .text. Requires "
-                         "whitebox-cryptography >= 3.0.0 for both vendor/wbc/ and the helper "
-                         "skeleton (2.0.0 removed the bulk API and bumped the blob to v3, so "
-                         "1.x artifacts will not link or load).")
-    pk.add_argument("--wb-keygen", default=None,
-                    help="path to a HOST wb_keygen (for --cipher wbaes); else "
-                         "$SOPACK_WBKEYGEN or one on PATH")
+    pk.add_argument("--cipher", choices=["chacha20", "xor", "wbaes"], default="wbaes",
+                    help="wbaes (DEFAULT): white-box AES-128 key wrapping via an injected "
+                         "helper - the long-term key is sealed and never reconstructed, and "
+                         "the white-box unwraps a session key that ChaCha20-decrypts .text. "
+                         "Needs the artifacts ./scripts/build_wbaes.sh produces (a host "
+                         "wb_keygen and this ABI's skeletons); a portable bundle carries them "
+                         "already. chacha20/xor: the freestanding stub, no white-box and no "
+                         "build step, but the raw key ships in the binary (whitened).")
     pk.add_argument("--abi",
                     help=f"comma list, or 'all'; default {','.join(DEFAULT_ABIS)} "
                          f"(the only ABI protected in practice); "
@@ -198,7 +199,12 @@ def build_parser() -> argparse.ArgumentParser:
     pk.add_argument("--ks-alias", default="sopack")
     pk.add_argument("--ks-pass", default="sopack")
     pk.add_argument("--key-pass", default=None)
-    pk.add_argument("--verify", action="store_true", help="print signer certs after signing")
+    # store_true/store_false rather than BooleanOptionalAction: the latter needs 3.9, which is
+    # exactly this project's floor (pyproject.toml requires-python), leaving no margin.
+    pk.add_argument("--verify", action="store_true", default=True,
+                    help="print signer certs after signing (DEFAULT; --no-verify to skip)")
+    pk.add_argument("--no-verify", action="store_false", dest="verify",
+                    help="skip the post-signing apksigner verify")
     pk.set_defaults(func=_cmd_pack)
     return p
 
@@ -207,7 +213,11 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except (FileNotFoundError, RuntimeError, ValueError) as e:
+    # CalledProcessError is in the tuple because --verify is now the DEFAULT: verify_signature
+    # runs apksigner with check=True, so without this an apksigner hiccup turns an otherwise
+    # successful pack into a raw traceback - after the output APK has already been written.
+    except (FileNotFoundError, RuntimeError, ValueError,
+            subprocess.CalledProcessError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 

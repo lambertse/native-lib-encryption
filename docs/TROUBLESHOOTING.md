@@ -14,6 +14,36 @@ The stub emits staged lines (`A:entry`, `B:…`, `C:mmap…`, `D:decrypt…`, `E
 
 ---
 
+## `error: could not find a host wb_keygen` on a fresh checkout
+
+`--cipher wbaes` is the **default**, and it needs artifacts that are built rather than
+committed. Nothing is wrong; the build step has not been run:
+
+```bash
+git submodule update --init      # the pinned whitebox-cryptography dependency
+pip install -e .
+./scripts/build_wbaes.sh         # host keygen + Android lib + both skeletons
+```
+
+`build_wbaes.sh` leaves the keygen at `vendor/wbc/bin/wb_keygen`, which is the first thing
+`provision.find_wb_keygen` probes - so there is nothing to export afterwards, and no
+`--wb-keygen` flag to pass (it was removed). The same applies to
+`error: wbaes … skeleton for <abi> not found`, which is the same cause one step later.
+
+Three ways out, in order of preference:
+
+- run the build above (needs the NDK, macOS for O-MVLL, and network once);
+- install from a portable bundle (`artifacts/install.sh`), which carries all of it prebuilt;
+- pack with **`--cipher chacha20`**, which needs no build at all but ships the key inside the
+  library (whitened). This is the right answer for a quick test, not for a release.
+
+**A plain `pip install .` from a checkout cannot work with the default cipher**, even after
+`build_wbaes.sh`: the skeletons are gitignored and deliberately not package data (see the note
+in `scripts/artifact_generation.sh` about why `pyproject.toml` must not gain `stubs/*.so`). Use
+`pip install -e .`, or install a bundle.
+
+---
+
 ## App crashes with SIGILL inside the dynamic linker at launch
 
 ```
@@ -376,8 +406,11 @@ provider* pair is caught too.
 `provision.py` refuses anything but a **v≥4, tier-0 (`light`)** sealed blob:
 
 - *"blames a stale keygen"* - your host `wb_keygen` is pre-3.0.0 and emits a v3 blob.
-  Rebuild it from the SDK (`scripts/gen_blob.sh`), with `--force` so a cached binary is not
-  reused.
+  Rebuild it with `./scripts/build_wbaes.sh --force` (the `--force` matters: both the host
+  keygen and the Android archive are cached, and a stale one survives an SDK bump). That
+  re-runs the submodule's `scripts/gen_blob.sh` and refreshes `vendor/wbc/bin/wb_keygen`.
+  If the submodule itself is behind, update it first:
+  `git submodule update --init` (or `--remote` to move the pin, which changes what ships).
 - *"blames sopack"* - the blob is v4 but sealed at `medium`/`heavy`. `wb_keygen` **defaults to
   `heavy`**, so this means the `--kdf light` flag was dropped; a heavy blob costs ~266 ms of
   Argon2id and a transient 64 MiB *per library* on device.
