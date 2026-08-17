@@ -1,0 +1,817 @@
+#!/usr/bin/env bash
+#
+# artifact_generation.sh - build the portable pack bundle in artifacts/: everything a SECOND macOS
+# machine needs to run `sopack pack`, and nothing it does not.
+#
+# The split that makes this possible: of the artifacts sopack needs, only ONE is host-specific.
+# The stub blobs and both wbaes skeletons are Android target ELFs - they do not care what packed
+# them - so they travel. `wb_keygen` is a native host binary and does not, which is why this
+# script refuses to run anywhere but macOS unless you pass --allow-foreign-host.
+#
+# Scope is PACK-ONLY. The receiving machine runs sopack; it does not rebuild skeletons, so it
+# needs no NDK, no cmake/ninja and no whitebox-cryptography checkout. artifacts/README.md spells
+# out what it DOES need (JDK, apksigner) - that list is the point of the bundle.
+#
+# The bundle also carries THE TOOL, as a py3-none-any wheel with this ABI's skeletons baked in as
+# package data. That is why the receiving machine needs no sopack checkout at all - it used to be
+# told to `git clone` and `pip install -e .`, which is exactly what a machine "without source
+# code" cannot do. See "gate 7 + the wheel" below for why the wheel is built from a STAGED tree.
+#
+# Usage:
+#   ./scripts/artifact_generation.sh                       # build, then bundle
+#   ./scripts/artifact_generation.sh --skip-build --tar    # bundle what is already built
+#   WBC=~/src/whitebox-cryptography ./scripts/artifact_generation.sh --tar
+#
+# Options:
+#   --abi ABI            default arm64-v8a. Selects which skeleton PAIR is built and bundled;
+#                        all three stub blobs ship regardless (they are 6-8 KB and committed).
+#   --api N              default 24
+#   --wbc PATH           whitebox-cryptography checkout. Else $WBC, else <repo>/../whitebox-cryptography
+#   --ndk PATH           Android NDK root.  Else $NDK / $ANDROID_NDK_HOME / $ANDROID_NDK_ROOT
+#   --wb-keygen PATH     host wb_keygen. Else $SOPACK_WBKEYGEN, else $WBC/build-host/wb_keygen.
+#                        Under --skip-build this is the ONLY way it gets found, since nothing
+#                        builds it.
+#   --out DIR            default <repo>/artifacts
+#   --skip-build         do not run build_wbaes.sh; bundle what is in sopack/stubs/ already.
+#   --rebuild-stubs      also re-run stub/build_stubs.sh. OFF by default because stub_*.bin/.json
+#                        are COMMITTED package data and a different LLVM produces different (still
+#                        valid) blobs - i.e. a dirty tree you did not ask for.
+#   --force              passed to build_wbaes.sh (redoes the cached host wb_keygen and Android
+#                        libwbcrypto.a phases). Slow.
+#   --allow-foreign-host generate on a non-macOS host. bin/wb_keygen is then OMITTED and the
+#                        bundle only supports --cipher chacha20/xor.
+#   --tar                also write ../sopack-bundle-<abi>-<host>-<rev>.tar.gz next to --out.
+#
+# SOPACK is this script's own repo - never asked for.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOPACK="$(cd "$HERE/.." && pwd)"
+# shellcheck source=scripts/_common.sh
+. "$HERE/_common.sh"
+
+# Byte semantics: the skeleton gates grep ELF files, and a UTF-8 grep gives up on invalid
+# multibyte sequences and reports NO MATCH on data that plainly contains the string. Here that
+# would silently pass a TRACING skeleton off as a release build. Same reasoning as
+# device_test.sh; set once.
+export LC_ALL=C
+
+ABI="arm64-v8a"
+API=24
+OUT="$SOPACK/artifacts"
+WBC_ARG=""
+NDK_ARG=""
+WBKEYGEN_ARG=""
+SKIP_BUILD=0
+REBUILD_STUBS=0
+FORCE=0
+ALLOW_FOREIGN=0
+MAKE_TAR=0
+# 2: the bundle carries sopack-*.whl and MANIFEST.txt gained a `wheel:` field. A format-1 bundle
+# installed itself by copying into an existing editable checkout, which no longer exists as a
+# flow, so install.sh refuses anything but 2 rather than half-installing.
+BUNDLE_FORMAT=2
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --abi)                ABI="$2"; shift 2 ;;
+        --api)                API="$2"; shift 2 ;;
+        --wbc)                WBC_ARG="$2"; shift 2 ;;
+        --ndk)                NDK_ARG="$2"; shift 2 ;;
+        --wb-keygen)          WBKEYGEN_ARG="$2"; shift 2 ;;
+        --out)                OUT="$2"; shift 2 ;;
+        --skip-build)         SKIP_BUILD=1; shift ;;
+        --rebuild-stubs)      REBUILD_STUBS=1; shift ;;
+        --force)              FORCE=1; shift ;;
+        --allow-foreign-host) ALLOW_FOREIGN=1; shift ;;
+        --tar)                MAKE_TAR=1; shift ;;
+        # 2..45 is the header comment block; it ends at the "SOPACK is this script's own repo"
+        # line, immediately before `set -euo pipefail`. Widen this if the header grows, or
+        # --help starts printing shell code.
+        -h|--help)            sed -n '2,45p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1 (try --help)" ;;
+    esac
+done
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/sopack-bundle.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+
+case "$ABI" in
+    arm64-v8a|armeabi-v7a|x86_64) ;;
+    *) die "unsupported --abi $ABI (choose arm64-v8a, armeabi-v7a or x86_64)" ;;
+esac
+
+STUBDIR="$SOPACK/sopack/stubs"
+SKEL="$STUBDIR/sopk_rt_$ABI.so"
+PROV="$STUBDIR/sopk_wb_$ABI.so"
+
+# shasum(1) on macOS, sha256sum(1) on Linux. Both emit and accept "<hex>  <path>", so a bundle
+# generated on either host verifies on either host.
+if have shasum;        then SHA256="shasum -a 256"
+elif have sha256sum;   then SHA256="sha256sum"
+else die "neither shasum nor sha256sum on PATH - cannot checksum the bundle"
+fi
+
+# ---- gate 1: destination guard ---------------------------------------------------------
+# FIRST, before the host gate, because this is the data-loss check and it has to be reachable
+# on every host. --out defaults into the repo, and the directory this one replaced used to hold
+# 640 MB of APK corpus (that is `test_apks/` now). A cleaner that trusts its argument would
+# have deleted it.
+say "preflight"
+if [ -e "$OUT" ]; then
+    [ -d "$OUT" ] || die "--out $OUT exists and is not a directory"
+    if [ -n "$(find "$OUT" -maxdepth 1 -name '*.apk' -print -quit 2>/dev/null)" ]; then
+        die "refusing to clean $OUT - it contains .apk files, so it is an APK corpus (this
+       repo keeps one in test_apks/) and not a generated bundle. Point --out elsewhere."
+    fi
+    if [ -n "$(find "$OUT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] \
+       && [ ! -f "$OUT/MANIFEST.txt" ]; then
+        die "refusing to clean $OUT - it is not empty and has no MANIFEST.txt, so it was not
+       produced by this script. Remove it yourself if you meant to, or pass --out DIR."
+    fi
+    ok "$OUT is safe to regenerate"
+fi
+
+# ---- gate 2: host gate -----------------------------------------------------------------
+HOST_OS="$(uname -s)"
+HOST_ARCH="$(uname -m)"
+WITH_KEYGEN=1
+if [ "$HOST_OS" != "Darwin" ]; then
+    if [ "$ALLOW_FOREIGN" -eq 0 ]; then
+        die "this host is $HOST_OS, and a wbaes-capable bundle can only be generated on macOS.
+       bin/wb_keygen is a native binary, and sopack/provision.py:_host_incompatible_reason
+       hard-refuses an ELF wb_keygen on a darwin pack host - so an ELF one bundled here would
+       be dead weight the receiving Mac rejects by file magic. Run this on the Mac, or pass
+       --allow-foreign-host to build a chacha20/xor-only bundle (no wb_keygen)."
+    fi
+    warn "generating on $HOST_OS with --allow-foreign-host: bin/wb_keygen is OMITTED, so this
+      bundle supports --cipher chacha20/xor only, NOT wbaes"
+    WITH_KEYGEN=0
+fi
+info "host: $HOST_OS/$HOST_ARCH   target: $ABI / android-$API"
+
+need python3
+( cd "$SOPACK" && python3 -c 'import sopack' >/dev/null 2>&1 ) \
+    || die "cannot import sopack from $SOPACK - run: pip install -e ."
+need tar "the bundle is written as a directory tree, and --tar archives it"
+
+WBC="${WBC_ARG:-${WBC:-$SOPACK/../whitebox-cryptography}}"
+NDK="${NDK_ARG:-${NDK:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}}"
+WBKEYGEN="${WBKEYGEN_ARG:-${SOPACK_WBKEYGEN:-$WBC/build-host/wb_keygen}}"
+
+# ---- build (unless --skip-build) -------------------------------------------------------
+if [ "$REBUILD_STUBS" -eq 1 ]; then
+    # Off by default on purpose: sopack/stubs/stub_*.bin|.json are committed package data, and
+    # rebuilding with a different LLVM produces different-but-valid blobs. See
+    # build_chacha20.sh's note - expect a dirty tree afterwards and only commit if you meant to.
+    say "rebuilding the per-ABI stub blobs (api $API) - this REWRITES tracked files"
+    ( cd "$SOPACK" && bash stub/build_stubs.sh "$API" ) || die "stub/build_stubs.sh failed"
+fi
+
+if [ "$SKIP_BUILD" -eq 1 ]; then
+    warn "--skip-build: bundling whatever is in sopack/stubs/ right now"
+    [ -f "$SKEL" ] || die "no $SKEL - drop --skip-build, or build it first"
+    [ -f "$PROV" ] || die "no $PROV - drop --skip-build, or build it first"
+else
+    [ -d "$WBC" ] || die "no whitebox-cryptography checkout at $WBC - pass --wbc PATH or export
+       WBC. (This script never prompts: it is meant to run unattended in a release step.)"
+    [ -n "$NDK" ] || die "no Android NDK - pass --ndk PATH or export NDK/ANDROID_NDK_HOME."
+    say "building the wbaes artifacts via build_wbaes.sh (release, $ABI)"
+    BUILD_ARGS="--release --abi $ABI --api $API"
+    [ "$FORCE" -eq 1 ] && BUILD_ARGS="$BUILD_ARGS --force"
+    # shellcheck disable=SC2086
+    if ! ( cd "$SOPACK" && ./scripts/build_wbaes.sh $BUILD_ARGS --wbc "$WBC" --ndk "$NDK" ) \
+            >"$TMP/build.log" 2>&1; then
+        tail -30 "$TMP/build.log" >&2
+        die "build_wbaes.sh failed (log above). Its gates are the same ones a bundle would
+       otherwise hide until the receiving machine packs an APK."
+    fi
+    # The sentinel build_wbaes.sh prints only after every Phase 1-4 PASS check, same as
+    # device_test.sh:241. Exit 0 alone is weaker - a phase can be skipped by a flag.
+    grep -q 'Host phases 1-4 PASS' "$TMP/build.log" \
+        || die "build_wbaes.sh exited 0 but never printed 'Host phases 1-4 PASS' - it did not
+       complete Phase 4, so the skeletons are not trustworthy. Full log: $TMP/build.log"
+    ok "build_wbaes.sh reached Host phases 1-4 PASS"
+fi
+
+# ---- gates 3-6: they inspect artifacts, so they run AFTER the build --------------------
+say "artifact gates"
+
+# 3. Release-skeleton gate. device_test.sh builds --trace skeletons into these exact paths, so
+#    "the file exists" says nothing about which build it is. A tracing helper logs the target
+#    name, .text address and size at load, and `sopack pack` refuses it without
+#    --allow-helper-log - so bundling one ships something that is either rejected or unsafe.
+for so in "$SKEL" "$PROV"; do
+    if grep -qa '__android_log_print' "$so"; then
+        die "$(basename "$so") is a TRACING build (-DSOPK_RT_LOG): it imports
+       __android_log_print. That is almost certainly device_test.sh's skeleton, which writes to
+       the same path. Rebuild without --trace (./scripts/build_wbaes.sh --release) and re-run;
+       do not ship a diagnostic skeleton."
+    fi
+done
+ok "both skeletons are release builds (no __android_log_print)"
+
+# 4+5. wb_keygen: the one host-specific file, so both its checks are about the RECEIVING Mac.
+KEYGEN_DESC="omitted (--allow-foreign-host; chacha20/xor only)"
+if [ "$WITH_KEYGEN" -eq 1 ]; then
+    [ -x "$WBKEYGEN" ] || die "no runnable host wb_keygen at $WBKEYGEN. Pass --wb-keygen PATH,
+       export SOPACK_WBKEYGEN, or (without --skip-build) let build_wbaes.sh produce
+       \$WBC/build-host/wb_keygen."
+
+    # 4. Self-containment. A Homebrew libsodium/libomp picked up at link time resolves fine
+    #    HERE and fails with a dyld error on a Mac that does not have it - at first pack, long
+    #    after this script said OK. Only /usr/lib and /System are guaranteed present.
+    if have otool; then
+        FOREIGN="$(otool -L "$WBKEYGEN" | tail -n +2 | awk '{print $1}' \
+                   | grep -v '^/usr/lib/' | grep -v '^/System/' || true)"
+        [ -z "$FOREIGN" ] || die "$WBKEYGEN links libraries outside /usr/lib and /System:
+$(printf '       %s\n' $FOREIGN)
+       Those will not exist on the receiving Mac and dyld fails at first pack. Rebuild it
+       statically (whitebox-cryptography scripts/gen_blob.sh vendors libsodium)."
+        ok "wb_keygen links only system libraries"
+    else
+        warn "no otool on PATH - cannot check wb_keygen for non-system dylib dependencies"
+    fi
+
+    # 5. CAPABILITY probe, not an existence check - the same reasoning as build_wbaes.sh:188.
+    #    A cached pre-3.0.0 wb_keygen survives an SDK upgrade and seals a heavy/v3 blob that
+    #    only misbehaves on device. Verified through the packer's OWN parser so the offsets
+    #    cannot drift from provision.py.
+    if ! "$WBKEYGEN" --key 000102030405060708090a0b0c0d0e0f --pass p --seed 1 \
+            --kdf light --out "$TMP/probe.blob" >"$TMP/probe.log" 2>&1; then
+        if grep -qE -- '--kdf|unknown arg' "$TMP/probe.log"; then
+            die "$WBKEYGEN is a STALE PRE-3.0.0 host wb_keygen: it rejects --kdf. sopack seals
+       at the light tier and requires whitebox-cryptography >= 3.0.0. Rebuild it
+       (./scripts/build_wbaes.sh --force) before bundling it."
+        fi
+        tail -5 "$TMP/probe.log" >&2
+        die "$WBKEYGEN does not run on this host (an Android build cannot) - so it would not run
+       on the receiving Mac either. Rebuild it with \$WBC/scripts/gen_blob.sh."
+    fi
+    ( cd "$SOPACK" && python3 -c '
+import sys
+from sopack.provision import assert_light_blob
+assert_light_blob(open(sys.argv[1], "rb").read(), tool=sys.argv[2])
+' "$TMP/probe.blob" "$WBKEYGEN" ) \
+        || die "$WBKEYGEN accepted --kdf but did not produce a v>=4 light-tier blob (above).
+       Do not bundle it."
+    KEYGEN_DESC="$(file -b "$WBKEYGEN" 2>/dev/null || echo 'unknown')"
+    ok "wb_keygen seals a v>=4 light-tier blob: $WBKEYGEN"
+fi
+
+# 6. Build markers. A stale skeleton is undiagnosable on device - the ctor requires an exact
+#    region-version match, finds none, and aborts with no explanation - so the marker is the
+#    only thing that turns a mismatch into a visible error. Checked here AND recorded in the
+#    manifest, so install.sh can re-check it against the rt_meta it just installed. That check is
+#    near-tautological now that both ship in one wheel - which is the point; it used to be the
+#    only thing standing between a stale skeleton and an unexplained abort on device.
+( cd "$SOPACK" && python3 - "$SKEL" "$PROV" <<'PY'
+import sys
+from sopack.rt_meta import HELPER_BUILD_MARKER, PROVIDER_BUILD_MARKER, REGION_VERSION
+for path, marker, src in ((sys.argv[1], HELPER_BUILD_MARKER, 'stub/sopk_rt.c'),
+                          (sys.argv[2], PROVIDER_BUILD_MARKER, 'stub/sopk_wb.c')):
+    if marker not in open(path, 'rb').read():
+        sys.exit(f"ERROR: {path} lacks the v{REGION_VERSION} build marker ({marker.hex()}) - "
+                 f"it was built from an older {src}. sopack would refuse it at pack time, so "
+                 f"bundling it would ship a brick.")
+PY
+) || exit 1
+ok "both skeletons carry the v$(cd "$SOPACK" && python3 -c 'from sopack.rt_meta import REGION_VERSION; print(REGION_VERSION)') build markers"
+
+# ---- provenance ------------------------------------------------------------------------
+# Read before the wheel is built, not just before MANIFEST.txt: the wheel's PEP 440 local version
+# is derived from SOPACK_REV, so `pip show sopack` on the receiving machine names the bundle.
+SOPACK_REV="$(git -C "$SOPACK" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+[ -n "$(git -C "$SOPACK" status --porcelain 2>/dev/null)" ] && SOPACK_REV="$SOPACK_REV-dirty"
+WBC_REV="$(git -C "$WBC" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+LIEF_VER="$(cd "$SOPACK" && python3 -c 'import lief; print(lief.__version__)' 2>/dev/null \
+            || echo unknown)"
+eval "$(cd "$SOPACK" && python3 -c 'from sopack import rt_meta as m; print(
+    "REGION_VERSION=%d\nHELPER_MARKER=%s\nPROVIDER_MARKER=%s\nPROVIDER_SONAME=%s" % (
+    m.REGION_VERSION, m.HELPER_BUILD_MARKER.hex(), m.PROVIDER_BUILD_MARKER.hex(),
+    m.PROVIDER_SONAME))')"
+
+# ---- the wheel: ship the TOOL, not just its artifacts ----------------------------------
+# Earlier bundles carried only Android artifacts and told the receiving machine to `git clone`
+# sopack and `pip install -e .` - the one thing a machine without source code cannot do. So the
+# tool travels as a py3-none-any wheel (sopack is pure Python; lief is its only dependency) with
+# the two GATED skeletons baked in as package data.
+#
+# Built from a STAGED copy in $TMP, never from $SOPACK, for two independent reasons:
+#   1. package-data globs stubs/*.so. A build from the repo would sweep in skeletons for ABIs no
+#      gate above ever inspected - every gate runs against $SKEL/$PROV, which are two files.
+#   2. pyproject.toml must NOT gain stubs/*.so permanently. .gitignore:12-15 calls those a local
+#      artifact, not package data, and flipping that globally would let any `pip install .` embed
+#      whatever happens to sit in sopack/stubs/ - including the --trace build that device_test.sh
+#      writes to those exact paths and that gate 3 exists to refuse.
+# The package-data line is therefore an OVERLAY on the staged tree: "a wheel with skeletons in it"
+# stays a gated output of this script rather than something anyone can produce by accident.
+say "building the sopack wheel"
+python3 -m pip --version >/dev/null 2>&1 \
+    || die "python3 -m pip is unavailable, so the wheel cannot be built. The wheel IS the tool as
+       far as the receiving machine is concerned, so there is no useful bundle without it."
+
+WSRC="$TMP/wheelsrc"
+mkdir -p "$WSRC/sopack/stubs"
+cp "$SOPACK/pyproject.toml" "$WSRC/"
+cp "$SOPACK"/sopack/*.py "$WSRC/sopack/"
+cp "$STUBDIR"/stub_*.bin "$STUBDIR"/stub_*.json "$WSRC/sopack/stubs/"
+cp "$SKEL" "$PROV" "$WSRC/sopack/stubs/"
+STAGED_SO="$(find "$WSRC/sopack/stubs" -name '*.so' | wc -l | tr -d ' ')"
+[ "$STAGED_SO" = "2" ] \
+    || die "staged $STAGED_SO skeletons, expected exactly 2 (the gated $ABI pair). Something
+       copied more than \$SKEL and \$PROV into $WSRC - do not ship skeletons no gate inspected."
+
+# PEP 440 local version: alphanumerics separated by dots, nothing else. SOPACK_REV is
+# "<sha>-dirty" on a dirty tree and every ABI name has a hyphen, so both must be sanitised or
+# `pip wheel` fails with an invalid-version error that says nothing about this script.
+WHEEL_LOCAL="$(printf '%s.api%s.%s' "$(printf '%s' "$ABI" | tr -d '-')" "$API" "$SOPACK_REV" \
+               | tr -c '[:alnum:]' '.' | sed 's/\.\{2,\}/./g; s/^\.//; s/\.$//')"
+python3 - "$WSRC/pyproject.toml" "$WHEEL_LOCAL" <<'PY' || exit 1
+import re, sys
+path, local = sys.argv[1], sys.argv[2]
+src = open(path).read()
+
+src, n = re.subn(r'(?m)^(version = "[^"+]+)"', lambda m: '%s+%s"' % (m.group(1), local), src, 1)
+if n != 1:
+    sys.exit('ERROR: no `version = "..."` line in the staged pyproject.toml to tag')
+
+# Tolerant of formatting, because the point is to notice when the real file changes shape rather
+# than to silently no-op: locate the package-data list itself and append to it.
+m = re.search(r'(?ms)^\[tool\.setuptools\.package-data\]\s*\nsopack\s*=\s*\[(.*?)\]', src)
+if not m:
+    sys.exit('ERROR: no [tool.setuptools.package-data] sopack = [...] block in pyproject.toml - '
+             'the overlay cannot be applied, and a wheel without the skeletons in it is useless '
+             'to the receiving machine.')
+if '*.so' not in m.group(1):
+    src = src[:m.end(1)] + ', "stubs/*.so"' + src[m.end(1):]
+open(path, 'w').write(src)
+PY
+
+WHEELDIR="$TMP/wheel"
+mkdir -p "$WHEELDIR"
+# Isolated build first (it is what a release build should do), falling back to the local backend:
+# isolation downloads setuptools from PyPI, and this script is otherwise happy offline.
+if ! python3 -m pip wheel "$WSRC" --no-deps -w "$WHEELDIR" >"$TMP/wheel.log" 2>&1; then
+    warn "isolated wheel build failed (no network for the build backend?) - retrying with
+      --no-build-isolation"
+    if ! python3 -m pip wheel "$WSRC" --no-deps --no-build-isolation -w "$WHEELDIR" \
+            >>"$TMP/wheel.log" 2>&1; then
+        tail -30 "$TMP/wheel.log" >&2
+        die "could not build the sopack wheel (log above; full log at $TMP/wheel.log)."
+    fi
+fi
+WHEEL="$(find "$WHEELDIR" -maxdepth 1 -name 'sopack-*.whl' | head -1)"
+[ -n "$WHEEL" ] || die "pip wheel exited 0 but produced no sopack-*.whl in $WHEELDIR"
+
+# ---- gate 7: the wheel actually carries what the receiving machine will need ------------
+# A package-data glob that quietly fails to match produces a wheel that INSTALLS CLEANLY and only
+# fails when an APK is packed, with StubMissingError, on the machine that has no toolchain to
+# diagnose it. So read the built wheel back rather than trusting the build.
+python3 - "$WHEEL" "$SKEL" "$PROV" "$ABI" <<'PY' || exit 1
+import sys, zipfile
+
+whl, skel, prov, abi = sys.argv[1:5]
+z = zipfile.ZipFile(whl)
+names = set(z.namelist())
+
+skel_member, prov_member = 'sopack/stubs/sopk_rt_%s.so' % abi, 'sopack/stubs/sopk_wb_%s.so' % abi
+required = [skel_member, prov_member,
+            'sopack/cli.py', 'sopack/stubs.py', 'sopack/rt_meta.py', 'sopack/provision.py']
+for a in ('arm64-v8a', 'armeabi-v7a', 'x86_64'):
+    required += ['sopack/stubs/stub_%s.bin' % a, 'sopack/stubs/stub_%s.json' % a]
+
+missing = [n for n in required if n not in names]
+if missing:
+    sys.exit('ERROR: the wheel is missing %d file(s): %s\n'
+             '       package-data in the staged pyproject.toml did not match. A wheel like this\n'
+             '       installs cleanly and only fails when the receiving machine packs an APK.'
+             % (len(missing), ', '.join(missing)))
+
+# Bytes, not just names: the skeletons in the wheel must be the ones gates 3 and 6 inspected.
+for member, path in ((skel_member, skel), (prov_member, prov)):
+    if z.read(member) != open(path, 'rb').read():
+        sys.exit('ERROR: %s in the wheel differs from the gated %s' % (member, path))
+
+# And nothing else, so an ABI no gate looked at cannot ride along.
+extra = sorted(n for n in names
+               if n.startswith('sopack/stubs/') and n.endswith('.so') and n not in required)
+if extra:
+    sys.exit('ERROR: the wheel carries ungated skeletons: %s' % ', '.join(extra))
+PY
+ok "wheel carries both $ABI skeletons + all six stub blobs: $(basename "$WHEEL")"
+
+# ---- assemble --------------------------------------------------------------------------
+say "assembling the bundle in $OUT"
+rm -rf "$OUT"
+mkdir -p "$OUT/stubs" "$OUT/bin"
+
+# All three ABIs' blobs regardless of --abi: they are 6-8 KB, they are committed, and a
+# receiving Mac running `--cipher chacha20 --abi all` needs them. --abi governs the skeletons.
+for f in "$STUBDIR"/stub_*.bin "$STUBDIR"/stub_*.json; do
+    [ -f "$f" ] || die "no stub blobs in $STUBDIR - they are committed package data, so this
+       means the checkout is incomplete. Run: bash stub/build_stubs.sh $API"
+    cp "$f" "$OUT/stubs/"
+done
+cp "$SKEL" "$PROV" "$OUT/stubs/"
+# The wheel goes in the bundle ROOT, not beside it like the tarball: install.sh verifies
+# SHA256SUMS before it installs anything, and the `find . -type f` below picks the wheel up for
+# free only if it is already in place. Installing an unverified wheel would defeat that check.
+cp "$WHEEL" "$OUT/"
+WHEEL_NAME="$(basename "$WHEEL")"
+if [ "$WITH_KEYGEN" -eq 1 ]; then
+    cp "$WBKEYGEN" "$OUT/bin/wb_keygen"
+    chmod +x "$OUT/bin/wb_keygen"
+else
+    rmdir "$OUT/bin"
+fi
+
+cat >"$OUT/MANIFEST.txt" <<EOF
+# sopack portable pack bundle. Generated by scripts/artifact_generation.sh - do not hand-edit;
+# install.sh reads these fields back and refuses on a mismatch.
+bundle-format: $BUNDLE_FORMAT
+generated-utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+sopack-rev: $SOPACK_REV
+wbc-rev: $WBC_REV
+lief-version: $LIEF_VER
+host-os: $HOST_OS
+host-arch: $HOST_ARCH
+abi: $ABI
+api: $API
+wheel: $WHEEL_NAME
+skeleton-build: release
+region-version: $REGION_VERSION
+helper-build-marker: $HELPER_MARKER
+provider-build-marker: $PROVIDER_MARKER
+provider-soname: $PROVIDER_SONAME
+wb-keygen: $KEYGEN_DESC
+EOF
+
+# ---- install.sh (runs on the receiving machine) ----------------------------------------
+# Quoted heredoc: nothing here is interpolated from THIS host. Everything it needs to know it
+# reads back out of MANIFEST.txt, so the two can never disagree.
+cat >"$OUT/install.sh" <<'INSTALL_SH'
+#!/usr/bin/env bash
+#
+# install.sh - install sopack from this bundle onto THIS machine.
+#
+# This bundle carries the TOOL (sopack-*.whl, with this ABI's wbaes skeletons baked in as package
+# data) plus the one host-specific binary, bin/wb_keygen. There is nothing to clone: no sopack
+# checkout, no NDK, no whitebox-cryptography.
+#
+# By default it creates a virtualenv beside this script, installs the wheel into it, and then
+# verifies that the install can actually reach its own skeletons. pip needs network once, to
+# fetch lief.
+#
+# Usage:
+#   ./install.sh                 # venv at ./venv, install the wheel, verify
+#   ./install.sh --python PATH   # build the venv from a specific interpreter
+#   ./install.sh --no-venv       # install into `python3 -m pip` instead (PEP 668 applies)
+#   ./install.sh --no-keygen     # skip bin/wb_keygen; chacha20/xor packing only
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+say()  { printf '==> %s\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+ok()   { printf '    OK: %s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+NO_KEYGEN=0
+USE_VENV=1
+PYTHON=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --no-keygen)  NO_KEYGEN=1; shift ;;
+        --no-venv)    USE_VENV=0; shift ;;
+        --python)     PYTHON="$2"; shift 2 ;;
+        # 2..17 is the header block, ending just before `set -euo pipefail`.
+        -h|--help)    sed -n '2,17p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1 (try --help)" ;;
+    esac
+done
+
+[ -f "$HERE/MANIFEST.txt" ] || die "no MANIFEST.txt beside $0 - this is not a sopack bundle"
+man() { sed -n "s/^$1: //p" "$HERE/MANIFEST.txt" | head -1; }
+
+[ "$(man bundle-format)" = "2" ] \
+    || die "bundle-format $(man bundle-format) is not 2 - this bundle was made by a different
+       artifact_generation.sh than the install script expects. Format 1 bundles carried no wheel
+       and installed by copying into an existing sopack checkout; regenerate the bundle."
+
+say "bundle $(man sopack-rev), $(man abi) / android-$(man api), built $(man generated-utc)"
+
+# 1. Host match. Only bin/wb_keygen is host-specific, so this check is only about that file:
+#    a bundle generated with --allow-foreign-host has none, and installs anywhere.
+WANT_OS="$(man host-os)"; WANT_ARCH="$(man host-arch)"
+HAVE_OS="$(uname -s)";    HAVE_ARCH="$(uname -m)"
+if [ ! -f "$HERE/bin/wb_keygen" ]; then
+    [ "$WANT_OS/$WANT_ARCH" = "$HAVE_OS/$HAVE_ARCH" ] \
+        || info "built on $WANT_OS/$WANT_ARCH; everything in it is host-neutral"
+elif [ "$WANT_OS/$WANT_ARCH" != "$HAVE_OS/$HAVE_ARCH" ] && [ "$NO_KEYGEN" -eq 0 ]; then
+    die "this bundle's bin/wb_keygen was built on $WANT_OS/$WANT_ARCH and this host is
+       $HAVE_OS/$HAVE_ARCH, so it will not execute here. Everything else in the bundle is either
+       pure Python or an Android target ELF and is host-neutral: re-run with --no-keygen to
+       install those, then build a host wb_keygen from the whitebox-cryptography repo
+       (scripts/gen_blob.sh)."
+fi
+
+# 2. Checksums. BEFORE anything is installed - the wheel is inside the bundle, and installing an
+#    unverified wheel would make this check decorative.
+if   command -v shasum    >/dev/null 2>&1; then SHA="shasum -a 256"
+elif command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"
+else SHA=""
+fi
+if [ -n "$SHA" ] && [ -f "$HERE/SHA256SUMS" ]; then
+    ( cd "$HERE" && $SHA -c SHA256SUMS >/dev/null ) \
+        || die "SHA256SUMS does not verify - the bundle is corrupt or was edited in place"
+    ok "checksums verify"
+else
+    warn "no shasum/sha256sum on PATH - skipping the integrity check"
+fi
+
+# 3. Install the wheel.
+WHEEL="$(man wheel)"
+[ -n "$WHEEL" ] || die "MANIFEST.txt names no wheel - this bundle carries no tool to install"
+[ -f "$HERE/$WHEEL" ] || die "MANIFEST.txt names $WHEEL but it is not in this bundle"
+
+PY="${PYTHON:-python3}"
+command -v "$PY" >/dev/null 2>&1 || die "no '$PY' on PATH - pass --python /path/to/python3"
+"$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
+    || die "$PY is $("$PY" -V 2>&1); sopack needs Python >= 3.9. Pass --python PATH."
+
+if [ "$USE_VENV" -eq 1 ]; then
+    # The venv is not tidiness. Homebrew's python3 on macOS is externally managed (PEP 668), so a
+    # bare `pip install ./sopack-*.whl` dies with "error: externally-managed-environment" - a
+    # message that never mentions sopack. A fresh venv also cannot contain a competing editable
+    # sopack from an old checkout, which is the one way this install can appear to work and do
+    # nothing.
+    VENVDIR="$HERE/venv"
+    if [ ! -x "$VENVDIR/bin/python" ]; then
+        "$PY" -m venv "$VENVDIR" || die "'$PY -m venv' failed. On Debian/Ubuntu: apt install
+       python3-venv. On macOS both python.org and Homebrew python3 ship it."
+    fi
+    RUNPY="$VENVDIR/bin/python"
+    SOPACK_CMD="$VENVDIR/bin/sopack"
+    info "virtualenv: $VENVDIR"
+else
+    RUNPY="$PY"
+    SOPACK_CMD="$PY -m sopack.cli"
+    warn "--no-venv: installing into $PY. If that interpreter is externally managed (PEP 668)
+      pip will refuse, and an editable sopack already installed there will shadow this one."
+fi
+
+say "installing $WHEEL (pip fetches lief from PyPI - this step needs network once)"
+# Two calls on purpose. The first resolves dependencies (lief) on a fresh environment. The second
+# forces THESE bytes into place with no download: the wheel version only changes with the git
+# rev, so re-installing a regenerated bundle at the same rev would otherwise be "already
+# satisfied" and leave the OLD skeletons installed - the stale-artifact failure this bundle
+# exists to prevent, and one that is invisible until the packed app aborts on device.
+"$RUNPY" -m pip install "$HERE/$WHEEL" || die "pip install failed (output above)"
+"$RUNPY" -m pip install --force-reinstall --no-deps "$HERE/$WHEEL" \
+    || die "pip re-install failed (output above)"
+
+# The console script is written by the installer, and a force-reinstall is an uninstall followed
+# by an install - which is exactly where an entry-point script can go missing. Every recipe below
+# (and in README.md) points at it, so check rather than assume.
+if [ "$USE_VENV" -eq 1 ]; then
+    [ -x "$SOPACK_CMD" ] || die "the wheel installed but $SOPACK_CMD does not exist. Use
+       '$RUNPY -m sopack.cli' instead, and report this - the bundle's README points at the
+       console script."
+fi
+
+# 4. Post-install probe. This replaces the region-version/build-marker cross-check that format-1
+#    bundles ran against a sopack CHECKOUT. The tool and the skeletons now ship inside one wheel,
+#    so they cannot drift from each other; what can still go wrong is that the install is not
+#    what gets imported, or that the wheel did not carry what we think. Both are silent until an
+#    APK is packed on a machine with no toolchain to debug it.
+"$RUNPY" - "$(man abi)" "$(man region-version)" "$(man helper-build-marker)" \
+             "$(man provider-build-marker)" "$(man lief-version)" <<'PY'
+import os, sys
+
+abi, want_ver, want_h, want_p, want_lief = sys.argv[1:6]
+
+try:
+    import sopack
+    import sopack.rt_meta as m
+    import sopack.stubs as s
+except Exception as e:
+    sys.exit("ERROR: cannot import sopack after installing it: %s" % e)
+
+pkg = os.path.dirname(os.path.abspath(sopack.__file__))
+if 'site-packages' not in pkg.split(os.sep):
+    sys.exit(
+        "ERROR: `import sopack` resolves to %s, which is not an installed package. Something\n"
+        "       else - almost certainly an editable install from an old sopack checkout on this\n"
+        "       machine - is shadowing the wheel, so the skeletons this bundle carries would\n"
+        "       never be read. Re-run without --no-venv, or `pip uninstall sopack` there first."
+        % pkg)
+
+# Reachable, not merely present in the zip: this is the check that catches a package-data glob
+# that silently did not match, which otherwise surfaces as StubMissingError at pack time.
+try:
+    s.provider_skeleton_path(abi)
+    s.helper_skeleton_path(abi)
+    for a in s.SUPPORTED_ABIS:
+        s.load_stub(a)
+except Exception as e:
+    sys.exit("ERROR: the installed sopack cannot reach its own artifacts: %s" % e)
+
+have = (want_ver, want_h, want_p) == (str(m.REGION_VERSION), m.HELPER_BUILD_MARKER.hex(),
+                                      m.PROVIDER_BUILD_MARKER.hex())
+if not have:
+    sys.exit(
+        "ERROR: MANIFEST.txt says region v%s (helper %s, provider %s) but the sopack just\n"
+        "       installed is v%d (helper %s, provider %s). The bundle was assembled from\n"
+        "       mismatched parts - regenerate it; this pair would abort on device with no\n"
+        "       explanation." % (want_ver, want_h, want_p, m.REGION_VERSION,
+                                 m.HELPER_BUILD_MARKER.hex(), m.PROVIDER_BUILD_MARKER.hex()))
+
+# lief is the one dependency install.sh does not control - pip resolved it just now. A Python
+# newer than any published lief wheel makes pip fall back to a source build that either takes a
+# very long time or dies in a compiler error naming neither lief nor sopack.
+try:
+    import lief
+except Exception as e:
+    sys.exit(
+        "ERROR: lief did not install: %s\n"
+        "       sopack cannot do any ELF surgery without it. If pip tried to BUILD it, this\n"
+        "       interpreter (Python %d.%d) is newer than any published lief wheel: re-run as\n"
+        "       ./install.sh --python /path/to/python3.11"
+        % (e, sys.version_info[0], sys.version_info[1]))
+if want_lief not in ('', 'unknown', lief.__version__):
+    print("    WARN: lief %s here, %s on the machine that generated this bundle. The >=1.0 floor\n"
+          "          is what matters (0.17.0 emitted 4 KB-aligned LOAD segments sopack refuses)."
+          % (lief.__version__, want_lief), file=sys.stderr)
+
+print("    OK: sopack installed at %s" % pkg)
+print("    OK: %s skeletons reachable, region v%d, lief %s"
+      % (abi, m.REGION_VERSION, lief.__version__))
+PY
+
+if [ "$NO_KEYGEN" -eq 1 ] || [ ! -f "$HERE/bin/wb_keygen" ]; then
+    cat <<EOF
+
+==> Installed. This bundle has no usable wb_keygen here, so pack with a stub cipher:
+
+  $SOPACK_CMD pack <your.apk> --cipher chacha20 --abi $(man abi) \\
+      -o packed.apk --verify
+
+EOF
+    exit 0
+fi
+
+chmod +x "$HERE/bin/wb_keygen"
+cat <<EOF
+
+==> Installed. Point sopack at the bundled provisioning tool and pack:
+
+  export SOPACK_WBKEYGEN="$HERE/bin/wb_keygen"
+  $SOPACK_CMD pack <your.apk> \\
+    --cipher wbaes \\
+    --abi $(man abi) \\
+    -o packed.apk \\
+    --verify
+
+  Omit --lib to pack every lib/$(man abi)/*.so in the APK.
+
+  This bundle carries wbaes skeletons for $(man abi) ONLY. The stub blobs cover all three
+  ABIs, so --cipher chacha20 --abi all works, but 'wbaes --abi all' would fail with a
+  StubMissingError at pack time - regenerate the bundle per ABI if you need another.
+  See README.md in this bundle for the tools you still need on this machine (JDK, apksigner).
+EOF
+INSTALL_SH
+chmod +x "$OUT/install.sh"
+
+# ---- README.md -------------------------------------------------------------------------
+# Unquoted heredoc so $ABI etc. interpolate; every literal dollar below is escaped.
+cat >"$OUT/README.md" <<EOF
+# sopack portable pack bundle
+
+This bundle is self-contained: it carries **the tool** (\`$WHEEL_NAME\`) as well as the
+artifacts it needs. Everything in it is host-neutral - pure Python, or an **Android target ELF**
+that does not care which machine packed it - except the single binary \`bin/wb_keygen\`, which is
+why the bundle is pinned to $HOST_OS/$HOST_ARCH: see \`MANIFEST.txt\`.
+
+Generated from sopack \`$SOPACK_REV\` for \`$ABI\` / android-$API.
+
+## Install
+
+\`\`\`bash
+cd /path/to/this/bundle && ./install.sh
+./venv/bin/sopack pack <your.apk> --cipher wbaes -o packed.apk --verify
+\`\`\`
+
+\`install.sh\` verifies the checksums, checks that this host can run \`bin/wb_keygen\`, creates a
+virtualenv at \`./venv\`, installs the wheel into it, and then verifies that the installed sopack
+can actually reach its own skeletons. **There is no repository to clone.**
+
+The virtualenv is not tidiness: Homebrew's \`python3\` on macOS is externally managed (PEP 668),
+so installing the wheel into it directly fails with \`error: externally-managed-environment\`.
+Useful flags: \`--python PATH\` (build the venv from a specific interpreter), \`--no-venv\`
+(install into \`python3 -m pip\` anyway), \`--no-keygen\` (skip \`bin/wb_keygen\` on a host that
+cannot run it - you still get \`--cipher chacha20\`).
+
+## What you still need on this machine
+
+| Dependency | Why | Required? |
+|---|---|---|
+| Python >= 3.9 with \`venv\` | runs the tool; \`install.sh\` builds the venv with it | **yes** |
+| **Network, once** | \`pip\` fetches \`lief\` while installing the wheel. Nothing else is downloaded | **yes**, at install time only |
+| A **JDK** (\`keytool\`, \`java\`) | \`keytool\` runs on your **first pack even without \`--keystore\`** - sopack generates \`~/.sopack/debug.keystore\`. \`java\` is needed when apksigner resolves to a \`.jar\` | **yes**, every cipher |
+| \`apksigner\` | signs the repackaged APK, and backs \`--verify\` | **yes**. Found on PATH, under \`\$ANDROID_SDK_ROOT\`/\`\$ANDROID_HOME\` \`build-tools/*\`, or via \`\$SOPACK_APKSIGNER_JAR\` |
+| \`bin/wb_keygen\` (in this bundle) | seals the white-box blob at pack time | \`--cipher wbaes\` only. Export \`\$SOPACK_WBKEYGEN\` or pass \`--wb-keygen\` |
+| \`zipalign\` | 16 KB alignment of the output APK | optional - sopack falls back to a pure-Python aligner |
+| \`openssl\` | fast ChaCha20 / AES-CTR | optional - pure-Python fallback runs at ~0.6 MB/s, so a multi-MB \`.text\` is slow but correct |
+
+\`lief >= 1.0\` is a **hard floor**, pinned in the wheel's metadata so pip enforces it: 0.17.0
+emitted 4 KB-aligned LOAD segments that fail sopack's 16 KB check.
+
+**Not needed**, which is the whole point: **the sopack git repository**, the Android NDK, cmake,
+ninja, a whitebox-cryptography checkout, or \`aapt\`. Those produced \`stubs/*\` on the generating
+machine, and their output travels inside the wheel.
+
+## Contents
+
+| Path | Host-neutral? | What |
+|---|---|---|
+| \`$WHEEL_NAME\` | yes | **the tool**, pure Python. Carries the \`$ABI\` skeletons + all three ABIs' stub blobs as package data - which is why its version carries the \`+$WHEEL_LOCAL\` local tag naming the ABI, API level and sopack revision it was cut from. \`pip show sopack\` on this machine reads it back |
+| \`stubs/stub_*.bin\`, \`stubs/stub_*.json\` | yes | freestanding stub blobs for all three ABIs (\`--cipher chacha20\`/\`xor\`), as loose copies |
+| \`stubs/sopk_wb_$ABI.so\` | yes | the shared white-box provider, one per ABI |
+| \`stubs/sopk_rt_$ABI.so\` | yes | the thin per-target helper skeleton the packer clones |
+| \`bin/wb_keygen\` | **no** | host provisioning tool, $HOST_OS/$HOST_ARCH |
+| \`MANIFEST.txt\` | - | provenance; \`install.sh\` reads it back |
+| \`SHA256SUMS\` | - | integrity, over every file including the wheel |
+
+\`stubs/\` duplicates what is already inside the wheel. It is kept because it is a few hundred KB
+and it is what you diff, checksum or hand to someone debugging a device failure - the installed
+copy lives inside \`venv/\` where nobody looks.
+
+Both skeletons are **release** builds: no logcat tracing, so a failure at load is a silent
+SIGABRT by design. If a packed app crashes on device, rebuild with
+\`./scripts/build_wbaes.sh --trace\` on the generating machine and pack with
+\`--allow-helper-log\` to find out why - do not ship that build.
+
+To regenerate this bundle: \`./scripts/artifact_generation.sh\` in the sopack repo.
+EOF
+
+# SHA256SUMS last, and over everything else - relative paths, so it verifies from any location.
+# One invocation per file rather than xargs: it costs nothing at this file count and survives a
+# path with a space in it, which an unquoted `xargs $SHA256` would split.
+( cd "$OUT" && find . -type f ! -name SHA256SUMS | LC_ALL=C sort | while IFS= read -r f; do
+      # shellcheck disable=SC2086
+      $SHA256 "$f"
+  done >SHA256SUMS )
+ok "SHA256SUMS over $(grep -c . "$OUT/SHA256SUMS") files"
+
+BUNDLE_SZ="$(du -sh "$OUT" | awk '{print $1}')"
+ok "bundle: $OUT ($BUNDLE_SZ)"
+
+# ---- optional tarball ------------------------------------------------------------------
+# Staged through $TMP and written to $OUT's PARENT: an archive created inside the directory it
+# is archiving either self-includes or needs an exclude dance. Archive root is the bundle's
+# CONTENTS (./install.sh, ./stubs/, ./bin/), so `tar xzf` lands install.sh where you are.
+TARBALL=""
+if [ "$MAKE_TAR" -eq 1 ]; then
+    HOSTTAG="$(printf '%s-%s' "$HOST_OS" "$HOST_ARCH" | tr '[:upper:]' '[:lower:]')"
+    TARBALL="$(cd "$(dirname "$OUT")" && pwd)/sopack-bundle-$ABI-$HOSTTAG-$SOPACK_REV.tar.gz"
+    ( cd "$OUT" && tar czf "$TMP/bundle.tar.gz" . )
+    mv "$TMP/bundle.tar.gz" "$TARBALL"
+    ok "tarball: $TARBALL ($(du -h "$TARBALL" | awk '{print $1}'))"
+fi
+
+cat <<EOF
+
+==> Bundle ready. On the target macOS machine - no clone, the tool is in the bundle:
+EOF
+if [ -n "$TARBALL" ]; then
+    cat <<EOF
+
+  mkdir -p ~/sopack-bundle && tar xzf $(basename "$TARBALL") -C ~/sopack-bundle
+  ~/sopack-bundle/install.sh
+  ~/sopack-bundle/venv/bin/sopack pack <your.apk> --cipher wbaes -o packed.apk --verify
+EOF
+else
+    cat <<EOF
+
+  # copy $(basename "$OUT")/ across, then:
+  ./$(basename "$OUT")/install.sh
+  ./$(basename "$OUT")/venv/bin/sopack pack <your.apk> --cipher wbaes -o packed.apk --verify
+EOF
+fi
+cat <<EOF
+
+  install.sh installs $WHEEL_NAME into a venv it creates
+  beside itself, then verifies the installed sopack can reach its own skeletons. That machine
+  needs Python >= 3.9 and network once (pip fetches lief).
+
+  $(basename "$OUT")/README.md lists what else it needs (JDK + apksigner are the ones people
+  forget; the sopack repo, the NDK and whitebox-cryptography are NOT needed).
+EOF
+if [ "$WITH_KEYGEN" -eq 0 ]; then
+    cat <<EOF
+
+  This bundle has NO wb_keygen (--allow-foreign-host on a $HOST_OS builder), so it supports
+  --cipher chacha20/xor only. Re-generate it on macOS for wbaes.
+EOF
+fi

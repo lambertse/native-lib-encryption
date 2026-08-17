@@ -274,7 +274,7 @@ def test_wbaes_injection_surgery(monkeypatch, tmp_path):
     tight libraries), and emit the per-target helper carrying the region.
 
     Runs against the committed fixture only. A variant against a large real library used to run
-    from `assets/`, but that directory is gitignored, so what it tested varied by machine - and
+    from the local APK corpus (`test_apks/`, gitignored), so what it tested varied by machine - and
     some LIEF versions add a 4 KB-aligned segment to a big library, failing the 16 KB assertion
     below for reasons that are neither sopack's nor the test's. See docs/TROUBLESHOOTING.md."""
     src = FIXTURE

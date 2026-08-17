@@ -183,7 +183,94 @@ an abort instead. Use `adb logcat -s sopk_rt sopk_wb DEBUG`, and see
 
 ---
 
-## 6. Reminders
+## 6. The two harness scripts
+
+Neither is on the critical path for a single pack, and both are easy to miss.
+
+### `scripts/device_test.sh` - the whole corpus, on a real device
+
+Packs every APK in `test_apks/` with `--cipher wbaes`, installs and launches each one, and
+reports whether the injected helper actually decrypted what the packer claims it encrypted.
+The pass criterion is deliberately stricter than "no crash": a library that was packed but
+whose helper constructor never ran produces **no crash and no message**, so the script
+compares the number of libraries that logged a decrypt against the number `sopack pack` said
+it injected, and calls a mismatch `WARN`.
+
+```bash
+./scripts/device_test.sh                        # every test_apks/*.apk
+./scripts/device_test.sh --only Flappy          # just the matching ones
+./scripts/device_test.sh --apks ~/other-apks    # a different corpus
+./scripts/device_test.sh --dry-run              # preflight only, touch no device
+```
+
+It builds `--trace` skeletons, so the APKs it produces need `pack --allow-helper-log` and log
+the target name, `.text` address and size. **They are diagnostic builds; do not ship them.**
+Results land in `output/testrun/`, one directory per APK plus a `summary.md`.
+
+### `scripts/artifact_generation.sh` - a portable bundle for a second machine
+
+Builds `artifacts/`: everything another macOS machine needs to run `sopack pack`, and nothing
+it does not. Only **one** file in it is host-specific - the stub blobs and both wbaes skeletons
+are Android target ELFs and do not care which machine packed them, and sopack itself is pure
+Python, while `wb_keygen` is a native host binary. That split is the whole reason a bundle is
+possible, and it is why the script refuses to run anywhere but macOS unless you pass
+`--allow-foreign-host` (which drops `wb_keygen` and leaves you a chacha20/xor-only bundle).
+
+The bundle carries **the tool as well as its artifacts**: a `py3-none-any` wheel with that ABI's
+skeletons baked in as package data. So the receiving machine clones nothing. The wheel is built
+from a **staged copy** of the tree in `$TMP`, never from the repo, and the `stubs/*.so`
+package-data line is an overlay applied only to that copy - `pyproject.toml` on `master`
+deliberately does not ship `.so` as package data (`.gitignore:12-15` calls those a local
+artifact), so that no ordinary `pip install .` can embed whatever skeleton happens to be sitting
+in `sopack/stubs/`, including a `--trace` build. Gate 7 then reads the built wheel back and
+asserts it carries the two gated skeletons byte-for-byte and no others: a package-data glob that
+silently fails to match produces a wheel that installs cleanly and only fails at pack time, on
+the machine with no toolchain to diagnose it.
+
+```bash
+./scripts/artifact_generation.sh --tar            # build, bundle, and archive it
+./scripts/artifact_generation.sh --skip-build     # bundle what is already in sopack/stubs/
+```
+
+If you last ran `device_test.sh`, `sopack/stubs/` holds its **`--trace`** skeletons and this
+script refuses them - they log the target `.text` address and size, and `sopack pack` rejects
+them without `--allow-helper-log`. Both scripts write to the same paths, so the refusal is
+expected, not a bug: re-run `./scripts/build_wbaes.sh` (release is the default) first, or drop
+`--skip-build` and let the generator do it.
+
+On the receiving machine:
+
+```bash
+cd /path/to/bundle && ./install.sh
+./venv/bin/sopack pack app.apk --cipher wbaes -o packed.apk --verify
+```
+
+`install.sh` verifies the checksums (**before** it installs anything - the wheel is inside the
+bundle), checks the host can run `bin/wb_keygen`, creates a virtualenv at `./venv`, installs the
+wheel into it, and then probes the result. The venv is not tidiness: Homebrew's `python3` on
+macOS is externally managed (PEP 668), so installing the wheel into it directly dies with
+`error: externally-managed-environment` and a message that never mentions sopack. `--python
+PATH`, `--no-venv` and `--no-keygen` are the escape hatches.
+
+That machine needs Python >= 3.9 with `venv`, network once (pip fetches LIEF), a JDK and
+`apksigner` - the generated `artifacts/README.md` lists them - but **no sopack checkout, no NDK,
+no cmake/ninja and no whitebox-cryptography checkout**.
+
+The post-install probe replaces the region-version/build-marker cross-check older bundles ran
+against a receiving *checkout*. Tool and skeletons now ship in one wheel and cannot drift from
+each other, so what is left to check is that the install is what actually gets imported (an old
+editable checkout on that machine would shadow it), that the skeletons are **reachable** and not
+merely present in the zip, and that LIEF resolved. Each of those is otherwise silent until an APK
+is packed.
+
+The bundle is an **output**. It is regenerated, never edited in place, and `artifacts/` is
+gitignored along with `test_apks/` (the APK corpus) and `vendor/` (the third-party
+`libwbcrypto.a` + `wbcrypto.h` that `build_wbaes.sh` copies out of your whitebox-cryptography
+checkout).
+
+---
+
+## 7. Reminders
 
 - **Re-signing = new signing identity.** The output can't update-install over the
   original, and in-app signature/integrity checks will see the new certificate.

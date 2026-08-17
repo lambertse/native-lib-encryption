@@ -601,7 +601,7 @@ def _check_wbaes_skeleton(skeleton: str, kind: str, allow_helper_log: bool) -> N
             f"{kind} skeleton {name} imports {wb_unresolved} instead of defining them - it was "
             "linked against a pre-3.0.0 libwbcrypto.a (or none). Note wbc_blob_kdf_tier in "
             "particular is the 3.0.0-only symbol. It would fail to load, taking every thin "
-            "helper and their targets with it. Rebuild assets/wbc/ from whitebox-cryptography "
+            "helper and their targets with it. Rebuild vendor/wbc/ from whitebox-cryptography "
             ">= 3.0.0 (scripts/build_android.sh) and link with -Wl,--no-undefined so this fails "
             "at build time instead.")
     # The thin helper must import the provider entry point - the other half of the pairing check.

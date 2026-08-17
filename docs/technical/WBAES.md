@@ -37,7 +37,7 @@ leaves the missing `wbc_*` as `UND` imports. See §8.
 
 | from WBC | used by | notes |
 |---|---|---|
-| `wb_keygen` CLI: `--key <hex> --pass <str> --seed <n> --kdf light --out <path>` | `provision.py:_seal` | must be a **host** build (WBC `scripts/gen_blob.sh`). `assets/wbc/` holds only `libwbcrypto.a` + `wbcrypto.h`; any `wb_keygen` delivered out of band is an *Android* binary and is not in this repo - `provision.py:_host_incompatible_reason` recognises that exact mistake by file magic |
+| `wb_keygen` CLI: `--key <hex> --pass <str> --seed <n> --kdf light --out <path>` | `provision.py:_seal` | must be a **host** build (WBC `scripts/gen_blob.sh`). `vendor/wbc/` holds only `libwbcrypto.a` + `wbcrypto.h`; any `wb_keygen` delivered out of band is an *Android* binary and is not in this repo - `provision.py:_host_incompatible_reason` recognises that exact mistake by file magic |
 | `libwbcrypto.a` | the **provider** skeleton link (`stub/sopk_wb.c`) only | the **Android** archive, from WBC `scripts/build_android.sh` (distinct from `gen_blob.sh` above, which builds the host keygen). **Bundles libsodium** since 2.0.0, so no separate Android libsodium |
 | `wbcrypto.h` | `stub/sopk_wb.c` | |
 | `wbc_blob_kdf_tier`, `wbc_open`, `wbc_unwrap_key`, `wbc_close`, `wbc_wipe` | `stub/sopk_wb.c:sopk_wb_k` | **five calls - that is the entire device-side surface.** `wbc_blob_kdf_tier` is a header read (no passphrase, no cost) and doubles as the 3.0.0 version tripwire |
@@ -477,7 +477,7 @@ separate Android `libsodium.a` the old recipe built by hand is no longer needed:
 ```bash
 cd "$WBC"
 ./scripts/build_android.sh --abi arm64-v8a --api 24     # -> build-android/libwbcrypto.a
-cp build-android/libwbcrypto.a include/wbcrypto.h "$SOPACK/assets/wbc/"
+cp build-android/libwbcrypto.a include/wbcrypto.h "$SOPACK/vendor/wbc/"
 ```
 
 **4a - the shared provider.** Add YOUR O-MVLL plugin flags to this line:
@@ -493,7 +493,7 @@ CXX="$NDK/toolchains/llvm/prebuilt/$(uname | tr A-Z a-z)-x86_64/bin/clang++"
     -static-libstdc++ \
     -I"$WBC/include" -I"$SOPACK/stub" \
     -x c "$SOPACK/stub/sopk_wb.c" -x none \
-    "$SOPACK/assets/wbc/libwbcrypto.a" \
+    "$SOPACK/vendor/wbc/libwbcrypto.a" \
     -o "$SOPACK/sopack/stubs/sopk_wb_arm64-v8a.so"
 
 "$(dirname "$CXX")/llvm-strip" --strip-all "$SOPACK/sopack/stubs/sopk_wb_arm64-v8a.so"
@@ -520,9 +520,9 @@ Six things about that link line, all load-bearing:
   thin helper and of the **target** fails too - surfacing as a crash inside whatever was
   loading the target, nowhere near the real cause. `--no-undefined` turns it into `undefined
   reference to 'wbc_unwrap_key'` at build time. This is why the `build_android.sh` step above
-  is a prerequisite and not a suggestion: nothing under `assets/` is tracked (it holds large
-  third-party binaries), so the archive is whatever you last built there - check it before
-  blaming the link.
+  is a prerequisite and not a suggestion: nothing under `vendor/` is tracked (it holds
+  third-party binaries that are not ours to redistribute), so the archive is whatever you last
+  built there - check it before blaming the link.
 
 - **Do not link `libwbvm.a` / `libwbprovision.a`.** Those carry the *provisioning* surface
   (`wbc_seal_key`, the white-box generator, the reference AES) which must never ship in an

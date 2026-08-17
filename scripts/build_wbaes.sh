@@ -304,7 +304,7 @@ fi
 
 # BEFORE the copy, not after. The branch above reuses a cached build-android/libwbcrypto.a, but
 # the cp below takes the FRESH $WBC/include/wbcrypto.h - so a stale cache pairs a 3.0.0 header
-# with a pre-3.0.0 archive in assets/wbc/. sopk_rt.c then COMPILES and the link fails, which is
+# with a pre-3.0.0 archive in vendor/wbc/. sopk_rt.c then COMPILES and the link fails, which is
 # a confusing place to discover it. Check the archive itself, here.
 if [ -x "$NDKBIN/llvm-nm" ]; then
     ARCHIVE_SYMS="$("$NDKBIN/llvm-nm" --defined-only "$ANDROID_LIB" 2>/dev/null || true)"
@@ -315,15 +315,15 @@ case "$ARCHIVE_SYMS" in
     *wbc_blob_kdf_tier*) ;;
     *) die "$ANDROID_LIB defines no wbc_blob_kdf_tier, so it is a PRE-3.0.0 archive - almost
        certainly the CACHED one from an earlier run (this phase reuses build-android/). Copying
-       it into assets/wbc/ next to a 3.0.0 wbcrypto.h pairs a new header with an old archive:
+       it into vendor/wbc/ next to a 3.0.0 wbcrypto.h pairs a new header with an old archive:
        stub/sopk_rt.c compiles and the LINK then fails on wbc_blob_kdf_tier. Re-run with
        --force." ;;
 esac
 ok "$(basename "$ANDROID_LIB") is a 3.0.0 archive (defines wbc_blob_kdf_tier)"
 
-mkdir -p "$SOPACK/assets/wbc"
-cp "$ANDROID_LIB" "$WBC/include/wbcrypto.h" "$SOPACK/assets/wbc/"
-ok "assets/wbc/ refreshed from $WBC/build-android"
+mkdir -p "$SOPACK/vendor/wbc"
+cp "$ANDROID_LIB" "$WBC/include/wbcrypto.h" "$SOPACK/vendor/wbc/"
+ok "vendor/wbc/ refreshed from $WBC/build-android"
 
 SKEL="$SOPACK/sopack/stubs/sopk_rt_$ABI.so"
 PROV="$SOPACK/sopack/stubs/sopk_wb_$ABI.so"
@@ -364,7 +364,7 @@ link_provider() {   # link_provider <extra flags…>
         "$@" \
         -I"$WBC/include" -I"$SOPACK/stub" \
         -x c "$SOPACK/stub/sopk_wb.c" -x none \
-        "$SOPACK/assets/wbc/libwbcrypto.a" \
+        "$SOPACK/vendor/wbc/libwbcrypto.a" \
         $TRACE_FLAGS \
         -o "$PROV" 2>"$TMP/link.log"
 }
@@ -381,7 +381,7 @@ if ! link_provider -static-libstdc++; then
     else
         cat "$TMP/link.log" >&2
         if grep -q "undefined reference to \`wbc_" "$TMP/link.log"; then
-            die "the archive in assets/wbc/ is missing symbols sopk_wb.c needs, i.e. it is
+            die "the archive in vendor/wbc/ is missing symbols sopk_wb.c needs, i.e. it is
        PRE-3.0.0. Note sopk_wb.c COMPILED, so the header is 3.0.0 and only the archive is
        stale - the classic cached-build-android/ pairing. --no-undefined caught it here
        instead of on device. Re-run with --force."

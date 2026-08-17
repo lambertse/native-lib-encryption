@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# device_test.sh - pack every APK in assets/ with --cipher wbaes, run each one on a connected
+# device_test.sh - pack every APK in test_apks/ with --cipher wbaes, run each one on a connected
 # device, and report whether the injected helper actually decrypted what the packer claims it
 # encrypted. Never aborts mid-run: one bad APK is a row in the report, not the end of the run.
 #
@@ -10,7 +10,7 @@
 # logged a decrypt equals the number `sopack pack` said it injected".
 #
 # Usage:
-#   ./scripts/device_test.sh                        # build once, then every assets/*.apk
+#   ./scripts/device_test.sh                        # build once, then every test_apks/*.apk
 #   ./scripts/device_test.sh --only Flappy          # just the APKs whose name matches
 #   ./scripts/device_test.sh --skip-build --watch 30
 #   ./scripts/device_test.sh --dry-run              # preflight + print, touch no device
@@ -27,7 +27,7 @@
 #   --keep-installed  leave each app installed after its test (default: uninstall, to keep
 #                     from filling device storage - packed APKs are LARGER than the input).
 #   --dry-run         run preflight and aapt, print the pack/adb commands, touch no device.
-#   --assets DIR      default <repo>/assets
+#   --apks DIR        default <repo>/test_apks (the local APK corpus)
 #   --out DIR         default <repo>/output/testrun
 #   --abi ABI         default arm64-v8a (the only ABI sopack protects in practice)
 #   --wbc PATH        whitebox-cryptography checkout.  Else $WBC, else <repo>/../whitebox-cryptography
@@ -61,7 +61,7 @@ SKIP_BUILD=0
 FORCE_BUILD=0
 KEEP_INSTALLED=0
 DRY_RUN=0
-ASSETS="$SOPACK/assets"
+APK_DIR="$SOPACK/test_apks"
 OUTDIR="$SOPACK/output/testrun"
 WBC_ARG=""
 NDK_ARG=""
@@ -77,7 +77,7 @@ $2"; shift 2 ;;
         --force-build)    FORCE_BUILD=1; shift ;;
         --keep-installed) KEEP_INSTALLED=1; shift ;;
         --dry-run)        DRY_RUN=1; shift ;;
-        --assets)         ASSETS="$2"; shift 2 ;;
+        --apks)           APK_DIR="$2"; shift 2 ;;
         --out)            OUTDIR="$2"; shift 2 ;;
         --abi)            ABI="$2"; shift 2 ;;
         --wbc)            WBC_ARG="$2"; shift 2 ;;
@@ -106,7 +106,7 @@ need adb "device automation needs the Android platform-tools on PATH"
     || die "cannot import sopack from $SOPACK - run: pip install -e ."
 SOPACK_VER="$( cd "$SOPACK" && python3 -c 'import sopack; print(sopack.__version__)' 2>/dev/null || echo "?" )"
 
-[ -d "$ASSETS" ] || die "--assets $ASSETS is not a directory"
+[ -d "$APK_DIR" ] || die "--apks $APK_DIR is not a directory"
 
 # ---- toolchain paths -----------------------------------------------------------------------
 # $SOPACK_WBKEYGEN is exported INSIDE build_wbaes.sh (scripts/build_wbaes.sh:217) and so never
@@ -268,14 +268,14 @@ EOF
 }
 
 APKS=""
-for apk in "$ASSETS"/*.apk; do
+for apk in "$APK_DIR"/*.apk; do
     [ -f "$apk" ] || continue          # no match -> the glob itself
     if wanted "$apk"; then
         APKS="$APKS$apk
 "
     fi
 done
-[ -n "$APKS" ] || die "no APKs to test under $ASSETS${ONLY_PATS:+ matching --only}"
+[ -n "$APKS" ] || die "no APKs to test under $APK_DIR${ONLY_PATS:+ matching --only}"
 TOTAL="$(printf '%s' "$APKS" | grep -c . || true)"
 
 say "$TOTAL APK(s) to test - watch window ${WATCH}s each, output under $OUTDIR"

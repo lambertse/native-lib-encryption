@@ -7,7 +7,10 @@ Two audiences, two directories.
 Start here if you want to pack an APK.
 
 - **[BUILDING.md](./BUILDING.md)** - install the toolchain, build the stub blobs, pack an
-  APK, verify the result. **Start here.**
+  APK, verify the result. **Start here.** §6 covers the two harness scripts:
+  `scripts/device_test.sh` (pack the whole `test_apks/` corpus and run it on a device) and
+  `scripts/artifact_generation.sh` (build the portable `artifacts/` bundle - tool included, so
+  the second machine needs no checkout).
 - **[SECURITY.md](./SECURITY.md)** - what this actually protects, the honest ceiling, and
   what is deliberately left visible. Read it before describing sopack to anyone else.
 - **[TROUBLESHOOTING.md](./TROUBLESHOOTING.md)** - concrete failure modes (SIGILL at load,

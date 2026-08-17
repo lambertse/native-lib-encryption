@@ -41,6 +41,16 @@ pip install -e .                            # install the CLI (pulls in LIEF)
 # Hard-fails if the blob has any relocation, undefined symbol, or (arm64) adrp.
 bash stub/build_stubs.sh [API_LEVEL]        # default API 24 -> sopack/stubs/*.bin + *.json
 
+# Harness scripts (see "Directory layout" below for the three gitignored directories)
+./scripts/device_test.sh [--only PAT]       # pack every test_apks/*.apk with wbaes, install and
+                                            #   launch each on a device, and assert
+                                            #   decrypted-library COUNT == injected COUNT. Builds
+                                            #   --trace skeletons: its output is NOT shippable.
+./scripts/artifact_generation.sh [--tar]    # build artifacts/: the portable pack bundle for
+                                            #   another macOS machine. --skip-build bundles what
+                                            #   is in sopack/stubs/ already; --allow-foreign-host
+                                            #   drops bin/wb_keygen (chacha20/xor-only bundle).
+
 # Pack an APK
 sopack pack in.apk -o out.apk \
     [--lib libfoo.so,libbar.so] [--libs libs.txt] \
@@ -77,6 +87,38 @@ python -m pytest tests/test_integration.py -k init_array   # a single test by na
 
 `tests/test_integration.py` builds real `.so` fixtures, injects, and `dlopen`s them - the
 arm64 decrypt-and-run assertions only exercise fully on an aarch64 host.
+
+## Directory layout (the three gitignored ones)
+
+They look interchangeable and are not - one is input, one is a build input, one is an output.
+They were a single `assets/` until they were split, and that name is now retired: `assets/` is
+a *real Android APK directory*, so it read as "files bundled into the APK" in a tool whose whole
+job is unpacking APKs. Do not merge them back, and do not reintroduce `assets/`.
+
+- **`test_apks/`** - the local APK corpus `scripts/device_test.sh` globs (`*.apk`, non-recursive).
+  Pure test **input**. Nothing in `sopack/` reads it.
+- **`vendor/wbc/`** - `libwbcrypto.a` + `wbcrypto.h`, a third-party **build input** that
+  `scripts/build_wbaes.sh` copies out of your whitebox-cryptography checkout on **every** run
+  and links the provider against. Because it is untracked, the archive is whatever you last
+  built there - which is why `build_wbaes.sh` symbol-checks it for `wbc_blob_kdf_tier` before
+  the copy rather than trusting it.
+- **`artifacts/`** - the portable pack bundle, an **output** of `scripts/artifact_generation.sh`.
+  Regenerate it; never edit it in place. It carries the Android artifacts (host-neutral),
+  `bin/wb_keygen` (the only host-specific file), and **the tool itself** as a `py3-none-any`
+  wheel with that ABI's skeletons baked in as package data - so the receiving machine clones
+  nothing and needs no checkout. `install.sh` there verifies checksums, then installs the wheel
+  into a venv it creates beside itself (Homebrew python is PEP 668 externally-managed, so a bare
+  `pip install` of the wheel fails), then probes the result: `import sopack` must resolve inside
+  that install (an old editable checkout would shadow it), the skeletons must be **reachable**,
+  and LIEF must have resolved. The old marker cross-check against a receiving checkout is gone
+  because wheel-and-skeletons cannot drift; the probe covers what can still fail silently.
+  The wheel is built from a **staged copy** in `$TMP` with the `stubs/*.so` package-data line
+  applied as an overlay - `pyproject.toml` must NOT gain it (see the `.gitignore` note above),
+  or any `pip install .` would embed whatever skeleton is lying in `sopack/stubs/`, including a
+  `--trace` build. Gate 7 reads the built wheel back and asserts it carries the two **gated**
+  skeletons byte-for-byte and no others, because a package-data glob that silently misses
+  produces a wheel that installs cleanly and only fails at pack time.
+  `--tar` writes the archive **beside** the bundle, never inside it.
 
 ## Architecture (the parts that span files)
 
@@ -154,7 +196,7 @@ rather than size (and why the `light` KDF tier made it cheap), is in `docs/techn
 Pieces:
 
 - **Host provisioning** (`sopack/provision.py`): per target, generate a long-term key `kek`
-  and seal it with a **host** `wb_keygen` at the **`light`** KDF tier (`assets/wbc/` holds only
+  and seal it with a **host** `wb_keygen` at the **`light`** KDF tier (`vendor/wbc/` holds only
   `libwbcrypto.a` + `wbcrypto.h`; any `wb_keygen` delivered out of band is an *Android* build and
   does NOT run on the pack host - build one from the whitebox-cryptography repo
   `scripts/gen_blob.sh`; point `--wb-keygen`/`$SOPACK_WBKEYGEN` at it). Then generate a 32-byte

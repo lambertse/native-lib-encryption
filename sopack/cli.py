@@ -175,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "wbaes: white-box AES-128 key wrapping via an injected helper - the "
                          "long-term key is sealed and never reconstructed, and the white-box "
                          "unwraps a session key that ChaCha20-decrypts .text. Requires "
-                         "whitebox-cryptography >= 3.0.0 for both assets/wbc/ and the helper "
+                         "whitebox-cryptography >= 3.0.0 for both vendor/wbc/ and the helper "
                          "skeleton (2.0.0 removed the bulk API and bumped the blob to v3, so "
                          "1.x artifacts will not link or load).")
     pk.add_argument("--wb-keygen", default=None,

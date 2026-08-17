@@ -24,7 +24,22 @@ libvosWrapperEx-arm64.so
 
 # Local binary/APK fixtures and third-party white-box artifacts — large, and not ours to
 # redistribute. Tests that need them skip; tests/fixtures/ below is the committed substitute.
-assets/
+#
+# Three separate things, deliberately three directories (see CLAUDE.md "Directory layout"):
+#   test_apks/  the local APK corpus scripts/device_test.sh runs. *.apk below already covers
+#               what is in there today, but keep the directory rule so an unpacked APK tree
+#               dropped in it does not turn `git status` into 1900 lines.
+#   vendor/     third-party BUILD INPUTS - vendor/wbc/ is the libwbcrypto.a + wbcrypto.h that
+#               scripts/build_wbaes.sh copies out of your whitebox-cryptography checkout.
+#   artifacts/  the GENERATED portable pack bundle from scripts/artifact_generation.sh. It is an
+#               output, not a source: regenerate it, never edit it in place. (This was `assets/`
+#               until the split - retired because assets/ is a real Android APK directory.)
+test_apks/
+vendor/
+artifacts/
+# ...and the tarball --tar writes NEXT TO the bundle (never inside it - an archive created in
+# the directory it is archiving self-includes).
+sopack-bundle-*.tar.gz
 
 # ...except the small purpose-built test fixtures, which MUST be committed so the wbaes
 # tests run on a bare clone (see tests/test_wbaes.py).
