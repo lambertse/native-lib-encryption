@@ -3,8 +3,88 @@
 Concrete failure modes seen with sopack, what causes each, and how to confirm/fix.
 Background for all of these is in [`technical/ARCHITECTURE.md`](./technical/ARCHITECTURE.md).
 
-The single most useful diagnostic is packing with **`logging.stub-log: true`** in your config
-and reading logcat:
+## Start here: every pack leaves a record
+
+You do not need to reproduce a failure to diagnose it. Every `sopack pack` writes a self-contained
+record under **`~/.sopack/logs/`** (override with `logging.file.dir`, or `$SOPACK_LOG_DIR`):
+
+```
+~/.sopack/logs/
+├── sopack.log[.1-.4]   rotating firehose, every run interleaved   (50 MB x 5)
+├── index.jsonl         ONE LINE PER RUN - the batch view
+└── runs/<run-id>/
+    ├── report.json     the full record: every library, every skip and its reason
+    └── run.log         that run's own DEBUG log
+```
+
+**If you are filing a bug, attach `runs/<run-id>/`.** It already contains what would otherwise be
+three rounds of questions: the fully resolved config (passwords redacted), `lief.__version__`, the
+resolved paths of `wb_keygen`/`apksigner`/`zipalign`, every external command with its stdout and
+stderr, the per-library selection decisions, and the Python traceback.
+
+### Triaging a batch
+
+This is what the per-run records are for - a run of 40 APKs leaves 40 records, not one:
+
+```bash
+L=~/.sopack/logs
+
+# which runs failed, and why
+jq -c 'select(.exit_code!=0)|{apk,exit_code,status,error}' $L/index.jsonl
+
+# a count by outcome
+jq -s 'group_by(.status)|map({(.[0].status):length})' $L/index.jsonl
+
+# packs that SUCCEEDED but shipped libraries in cleartext - exit 0 hides this
+jq -c 'select(.exit_code==0 and .failed_count>0)|{apk,encrypted_count,failed_count}' $L/index.jsonl
+
+# how many libraries got encrypted overall
+jq -s 'map(.encrypted_count)|add' $L/index.jsonl
+```
+
+Export **`$SOPACK_RUN_TAG`** once before a batch and every record carries it, so one filter scopes
+every query to that batch:
+
+```bash
+export SOPACK_RUN_TAG=nightly-42
+for f in *.apk; do sopack pack "$f" -o "packed-$f"; done
+jq -c 'select(.tag=="nightly-42" and .exit_code!=0)' ~/.sopack/logs/index.jsonl
+```
+
+Retention: the newest `logging.file.max-runs` (200) run directories are kept, while `index.jsonl`
+keeps far more (`max-index-lines`, 5000) because it is the batch history. A run whose directory has
+been pruned keeps its index line with `"dir": null` and `"detail_pruned": true` - the query still
+answers, it just tells you the detail is gone.
+
+## Exit codes
+
+`sopack pack` returns a stable code per failure class, so a wrapper can branch without parsing
+output. The *count* of encrypted libraries is deliberately **not** in the exit status - an exit
+status is 8 bits, so it cannot carry both a class and a count (and a negative code would arrive as
+255). Read `encrypted_count` from the record instead.
+
+| Code | Status | Meaning | Where to look |
+|-----:|--------|---------|---------------|
+| `0` | `ok` | at least one library encrypted | check `failed_count` - 0 can still mean libraries shipped in cleartext |
+| `1` | `internal-error` | unmodelled failure; treat as a sopack bug | the traceback in `runs/<id>/run.log` |
+| `2` | `usage-error` | bad command line, a removed flag, or `init-config` over an existing file | **stderr only - there is no run record**, because nothing was packed |
+| `3` | `config-error` | config missing, unparseable, or an unknown/misplaced key | the message names the key |
+| `4` | `input-error` | input APK missing, unreadable, or not a zip | |
+| `5` | `selection-error` | nothing matched `libraries.include` | [§no .so entries matched](#error-no-so-entries-matched-the-requested-list-nothing-to-encrypt) |
+| `6` | `nothing-encrypted` | the pack ran and protected zero libraries | [§none of the N entries were packed](#error-none-of-the-n-libso-entries-in-this-apk-were-packed) |
+| `7` | `toolchain-error` | missing stub blob or helper skeleton, no `wb_keygen`, sealing failed | [§could not find a host wb_keygen](#error-could-not-find-a-host-wb_keygen-on-a-fresh-checkout) |
+| `8` | `inject-error` | injection, self-verify, or a 16 KB alignment refusal | [§16 KB](#so-is-not-16-kb-page-compatible-to-begin-with-arm64) |
+| `9` | `signing-error` | `apksigner` was found but failed | [§could not find apksigner](#could-not-find-apksigner-zipalign-keytool) |
+| `10` | `output-error` | could not write the output APK | |
+
+Note `2` is reserved: `argparse` uses it for a malformed command line, so nothing else may take it.
+An **unsigned but successfully packed** APK is still `0` - signing is best-effort by design; detect
+it with `"signed": false` in the record rather than an exit code.
+
+## The on-device diagnostic
+
+For a pack that succeeds but misbehaves *on the device*, the most useful diagnostic is packing with
+**`logging.stub-log: true`** in your config and reading logcat:
 
 ```bash
 adb logcat -s sopack:I
@@ -12,6 +92,9 @@ adb logcat -s sopack:I
 
 The stub emits staged lines (`A:entry`, `B:…`, `C:mmap…`, `D:decrypt…`, `E:mremap…`,
 `H:native .text decrypted OK`). The **last** line you see tells you how far it got.
+
+Note `logging.stub-log`/`logging.allow-helper-log` are about the **device**; the
+`logging.file` block above is about the **host**. They are unrelated despite sharing a section.
 
 ---
 

@@ -302,6 +302,31 @@ EOF
     return 1
 }
 
+# One field out of a pack's run record. $1 = that pack's SOPACK_LOG_DIR, $2 = the field name.
+#
+# Reads the LAST line of index.jsonl, which is that pack's own because each pack gets a private
+# log directory above. This replaced three greps over the human-readable output ("^Injected N
+# librar", "ship in CLEARTEXT", "^error: "), all of which silently returned nothing whenever the
+# wording changed - and a harness that reports 0 injected because a message moved is worse than
+# one that fails.
+#
+# python3 rather than jq: this script already requires python3 (it imports sopack for a preflight)
+# and jq is not a documented dependency anywhere in the repo.
+pack_field() {
+    python3 - "$1/index.jsonl" "$2" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        lines = [l for l in fh if l.strip()]
+    value = json.loads(lines[-1]).get(sys.argv[2])
+except (OSError, ValueError, IndexError):
+    sys.exit(1)
+# A missing/null field prints nothing, so the caller's `[ -n ... ]` guard sees an empty string
+# rather than the string "None".
+sys.stdout.write("" if value is None else str(value))
+PY
+}
+
 APKS=""
 for apk in "$APK_DIR"/*.apk; do
     [ -f "$apk" ] || continue          # no match -> the glob itself
@@ -378,18 +403,47 @@ for APK in "${APK_LIST[@]}"; do
             STATUS="DRY-RUN"; NOTE="nothing was packed or installed"
         else
             info "packing (auto-select: every lib/$ABI/*.so)"
-            if ! ( cd "$SOPACK" && "${PACK_CMD[@]}" ) >"$DIR/pack.log" 2>&1; then
-                STATUS="PACK-FAIL"
-                NOTE="$(grep -m1 '^error: ' "$DIR/pack.log" || tail -3 "$DIR/pack.log" | tr '\n' ' ')"
-                warn "pack failed: $NOTE"
+            # Each pack gets its OWN log directory, so "the newest index.jsonl line" is
+            # unambiguously this pack's - reading a shared ~/.sopack/logs would race with a
+            # developer packing in another terminal.
+            PACK_LOGS="$DIR/sopack-logs"
+            rm -rf "$PACK_LOGS"
+            if ! ( cd "$SOPACK" && SOPACK_LOG_DIR="$PACK_LOGS" SOPACK_RUN_TAG="device_test" \
+                   "${PACK_CMD[@]}" ) >"$DIR/pack.log" 2>&1; then
+                PACK_RC=$?
+                # The record is written even for a failed pack, and it names the status slug -
+                # far better than the exit code alone for a harness summary.
+                PACK_STATUS="$(pack_field "$PACK_LOGS" status)"
+                PACK_ERR="$(pack_field "$PACK_LOGS" error)"
+                if [ "$PACK_STATUS" = "nothing-encrypted" ]; then
+                    # An APK with no lib/$ABI/*.so is not a packer failure - there was simply
+                    # nothing to protect, so there is nothing to observe on the device either.
+                    # sopack RAISES in this case (apk.NothingPackedError) rather than exiting 0,
+                    # which is why the old `INJECTED -eq 0` test below could never see it; the
+                    # dedicated exit code is what makes the distinction reachable.
+                    STATUS="NO-TARGETS"
+                    NOTE="no lib/$ABI/*.so to protect"
+                    warn "$STATUS - skipping the device phase"
+                else
+                    STATUS="PACK-FAIL"
+                    NOTE="${PACK_STATUS:-unknown} (exit $PACK_RC): $PACK_ERR"
+                    [ -n "$PACK_STATUS$PACK_ERR" ] || \
+                        NOTE="$(grep -m1 '^error: ' "$DIR/pack.log" \
+                                || tail -3 "$DIR/pack.log" | tr '\n' ' ')"
+                    warn "pack failed: $NOTE"
+                fi
             else
-                INJECTED="$(awk '/^Injected [0-9]+ librar/{print $2; exit}' "$DIR/pack.log")"
+                # Read the machine-readable record rather than scraping the human report. This
+                # used to be three separate greps over pack.log ("^Injected N librar",
+                # "ship in CLEARTEXT", "^error: "), each of which broke whenever the wording
+                # moved. index.jsonl is a published shape with a schema version.
+                INJECTED="$(pack_field "$PACK_LOGS" encrypted_count)"
                 [ -n "$INJECTED" ] || INJECTED=0
                 # Auto-select is fail-soft by design (CLAUDE.md §Library selection): an
                 # un-injectable prebuilt is a recorded skip, not a dead pack. Report it, do not
                 # fail on it.
-                if grep -q 'ship in CLEARTEXT' "$DIR/pack.log"; then
-                    CLEAR="$(awk '/ship in CLEARTEXT/{f=1;next} f&&/^  /{n++} f&&/^$/{exit} END{print n+0}' "$DIR/pack.log")"
+                CLEAR="$(pack_field "$PACK_LOGS" failed_count)"
+                if [ -n "$CLEAR" ] && [ "$CLEAR" -gt 0 ] 2>/dev/null; then
                     NOTE="$CLEAR cleartext skip(s)"
                     warn "$CLEAR selected librar(y/ies) could not be injected and ship in CLEARTEXT"
                 fi

@@ -129,6 +129,20 @@ sopack init-config [-o PATH]                # write a commented config.yaml ('-'
 #                                     without a path now applies instead of being ignored.
 #   logging.stub-log: false           the old --log.
 #   logging.allow-helper-log: false   the old --allow-helper-log.
+#   logging.file.*                    THE HOST log, unrelated to the two DEVICE keys above -
+#                                     nested under `file:` precisely so the two cannot be misread
+#                                     as one another. `enabled: true`, `dir:` (null ->
+#                                     ~/.sopack/logs; $SOPACK_LOG_DIR OUTRANKS the config, since
+#                                     the caller who needs to redirect is the tool invoking
+#                                     sopack, which cannot edit the user's YAML), `level: debug`
+#                                     (file only - the terminal is untouched), `max-size-mb: 50`,
+#                                     `max-files: 5` (counting the live file, so backupCount is
+#                                     max-files-1), `max-runs: 200`, `max-index-lines: 5000`.
+#                                     All five caps go through _as_positive_int, NOT _as_int:
+#                                     `max-files: 0` makes RotatingFileHandler stop rotating and
+#                                     `max-runs: 0` would delete each record as it is written, so
+#                                     a user setting either to "off" would get the opposite of a
+#                                     bounded log. `enabled: false` is the off switch.
 #
 # AN UNKNOWN OR MISPLACED KEY IS AN ERROR, at every nesting level, and only the dash spelling is
 # accepted. This is the guard that replaces argparse: `--ciper xor` used to fail, so `ciper: xor`
@@ -169,6 +183,10 @@ python -m pytest tests/test_config.py       # the YAML config: sample, defaults,
 python -m pytest tests/test_lib_select.py   # auto-select, exclusions, the CLI surface, fail-soft
 python -m pytest tests/test_wbaes.py        # wbaes guards, the strip, and real injection
                                            #   (2 tests skip w/o a host wb_keygen)
+python -m pytest tests/test_diag.py         # the host log: rotation, retention, redaction,
+                                           #   concurrent index appends, run-id sanitisation
+python -m pytest tests/test_exitcodes.py    # the exception->code map + the 8-bit subprocess check
+python -m pytest tests/test_report.py       # report.json / index.jsonl shape and the schema
 python -m pytest tests/test_integration.py -k init_array   # a single test by name
 ```
 
@@ -438,7 +456,136 @@ Flutter `libapp.so` case) never gets decrypted. That is why the *trigger* stays 
 target and only the *provider* is shared. See `docs/technical/ARCHITECTURE.md` §11b and
 `docs/technical/IMPROVEMENTS.md`.
 
+### Diagnostics: the host log, the run record, and exit codes
+
+Three small modules serve *callers* rather than humans, because sopack is increasingly driven by
+other tools and its output used to be human-only.
+
+- **`sopack/diag.py`** - terminal output, the rotating log, and per-run records. **It is named
+  `diag`, NOT `log`, and that is load-bearing**: `apk.repackage()` has a `log: bool` parameter
+  (`apk.py:218`), which would shadow a module named `log` inside that function body so
+  `log.debug(...)` would resolve to a bool and raise. `repackage`'s signature is library API, so
+  the module was renamed instead of the parameter. Do not "tidy" this back.
+- **`sopack/exitcodes.py`** - the code constants + status slugs, one source of truth.
+- **`sopack/report.py`** - `RepackResult` + `Config` → `report.json` and the `index.jsonl` line.
+- **`sopack/errors.py`** - `ToolMissingError` and `InputError`, both `FileNotFoundError`
+  subclasses. It imports nothing from sopack, so any layer can use it without a cycle.
+
+**All output already funnelled through three seams, so nothing was scattered:** `cli.py`'s ~24
+prints, the `logger=print` keyword `apk.repackage` already accepted (`apk.py:223`, 11 call sites -
+now passed `diag.emit`, no signature change), and `elf_inject._warn`. **No new dependency**: stdlib
+`logging` + `json` only, which matters because adding one is a three-file change (see §Environment).
+
+Layout under `~/.sopack/logs/` (beside `debug.keystore`; `logging.file.dir` or `$SOPACK_LOG_DIR`):
+
+```
+sopack.log[.1-.4]   rotating firehose, all runs interleaved, pid-tagged   (max-size-mb x max-files)
+index.jsonl         ONE COMPACT LINE PER RUN, append-only: the batch view
+.lock               flock target for pruning / index trimming
+runs/<run-id>/      report.json + run.log - the self-contained unit you attach to a bug report
+```
+
+**Why per-run records and not one `last-run.json`.** The driving use case is a *batch* - customers
+pack many APKs repeatedly - so a single overwritten file would preserve one run and destroy the
+other 39, and a batch is exactly where "three of these failed and I don't know which" happens. A
+run's `run.log` and `report.json` are created and pruned **together**, so they cannot disagree.
+
+**Exit code = status class ONLY; the count lives in the record.** `0` ok, `1` internal, `2` usage,
+`3` config, `4` input, `5` selection, `6` nothing-encrypted, `7` toolchain, `8` inject, `9` signing,
+`10` output. Three properties are deliberate and were the reason the originally-proposed encoding
+(negative codes for errors, `>0` = number encrypted, `0` = nothing encrypted) was not used:
+
+- **An exit status is 8 bits unsigned.** `sopack.cli:main` is wrapped by setuptools as
+  `sys.exit(main())` and CPython masks the value, so `sys.exit(-1)` arrives as **255**. Negative
+  codes cannot cross the process boundary at all. `tests/test_exitcodes.py` pins this with a real
+  subprocess, because an in-process `main() == N` assertion cannot detect truncation.
+- **One byte cannot carry a class and a count** - `exit 3` would mean both "config error" and "3
+  libraries encrypted".
+- **`0` must keep meaning success**, or the case most worth flagging (nothing protected) becomes
+  the one `set -e` and every CI runner reads as fine. It is code `6` instead, and it stays a
+  failure, matching the pre-existing invariant at `apk.py:397-409`.
+
+**`2` is reserved for a malformed command line and nothing else may take it** - argparse exits 2 on
+its own, so sharing it would make "you typed the command wrong" indistinguishable. The two
+`SystemExit(str)` paths (`cli._reject_removed_flags`, `init-config` refusing to clobber) map here;
+they previously exited **1**, reporting a stale `--cipher` - the most likely automation failure
+after the flags-to-YAML move - as an *internal error*. `_Usage` splits the two halves that conflict:
+the code goes to `SystemExit.__init__` (so `.code == 2`), the message is kept on the instance with
+`__str__` returning it, and `main` prints it before re-raising. Both fire **before** `open_run`, so
+neither leaves a run record - correct, since nothing was packed, and documented as such.
+
+`NothingPackedError`/`SelectionError` in `apk.py` replaced three bare `RuntimeError`s; both stay
+`RuntimeError` subclasses so `cli.main`'s pre-existing except-tuple and every library caller are
+unaffected. The `_CODE_FOR` mapping is an **ordered tuple, not a dict**, because `SelectionError ⊂
+NothingPackedError`, `ConfigError ⊂ ValueError` and `StubMissingError ⊂ FileNotFoundError` - a dict
+would make precedence depend silently on insertion order.
+
 ### Invariants that will break things silently if violated
+
+- **The terminal output must stay byte-for-byte identical, on both streams separately.** The
+  console handler emits `record.getMessage()` with no level prefix and no timestamp, `INFO` to
+  stdout and `WARNING`+ to stderr, mirroring the old `print()`/`print(file=sys.stderr)` split. Do
+  not add a level prefix: `cli._print_summary`'s report carries meaning in its indentation. Verify
+  with **separate** captures (`>out 2>err`, diffing each) - a merged `2>&1` diff can fail on
+  interleaving without a real regression, or hide one.
+- **Logging must never fail a pack.** Handler installation and every prune are wrapped in
+  `try/except OSError`; an unwritable log directory warns once and continues console-only. A packer
+  that refuses to run because it cannot open its own log file is a worse tool.
+- **`diag` must work without `bootstrap()`.** `elf_inject._warn` promises its warnings cannot be
+  ignored, and `elf_inject`/`apk` are importable as a library, so `_ensure_console()` installs the
+  console pair lazily. It keys on **our handler type**, not on `log.handlers` being empty: pytest's
+  caplog (and any embedding app) attaches handlers to this logger, and an emptiness test let a
+  foreign handler silently swallow every warning. For the same reason `bootstrap`/`reset` remove
+  only handlers tagged `_sopack_owned`, and `reset` restores `propagate = True` - leaving a
+  module-level logger permanently non-propagating outlives our run and swallows records for
+  whoever imports sopack next (in-process, that is the next test).
+- **The console handler must resolve `sys.stdout`/`sys.stderr` at EMIT time** (`_StdStreamHandler`).
+  A plain `StreamHandler` captures the stream once and keeps writing to it forever, so anything that
+  replaces the stream afterwards - pytest's capsys, an embedder redirecting output - loses every
+  message.
+- **`index.jsonl` appends must be one `os.write` on an `O_APPEND` fd**, never `open(path, "a")`:
+  buffered text I/O makes no promise about how many syscalls it issues, and the guarantee relied on
+  is that `O_APPEND` makes seek-to-end-and-write atomic against other writers. (This is *not* a
+  `PIPE_BUF` argument - that concerns pipes.) Hence the line carries **counts only**; the
+  per-library arrays live in `report.json`, and a pathological field is truncated with
+  `"truncated": true`.
+- **Index retention is decoupled from run-directory retention, on purpose.** Run directories are
+  the bulky artifact; an index line is ~300 bytes. Trimming the index down to the surviving
+  directories would erase the batch history the index exists for - with "many APKs, many times",
+  `max-runs` can be a single afternoon. So a pruned run **keeps** its line with `"dir": null` and
+  `"detail_pruned": true`, and `max-index-lines` (5000) is deliberately far above `max-runs` (200).
+  A test pins that the two defaults cannot converge.
+- **Secrets are scrubbed at the single chokepoint.** `diag.redact` masks secret-looking dataclass
+  fields (the keystore passwords arrive via `${VAR}` expansion, so the resolved `Config` holds
+  plaintext) and `diag.scrub_argv` masks `--ks-pass pass:…`, `--ks-pass=pass:…`, `-storepass …` and
+  `-keypass …`. Scrubbing lives inside `log_subprocess` rather than at each call site because a
+  missed call site leaks silently and permanently into a file the user is invited to email.
+  `provision._seal` elides `--key`/`--pass` itself, since neither has a prefix the pattern catches.
+- **`FileNotFoundError` must never be mapped directly to an exit code.** It was doing triple duty -
+  missing input APK, missing *host tool*, unwritable output path - and because it is also an
+  `OSError` subclass, mapping it to `INPUT` **shadowed the `OSError → OUTPUT` entry entirely**. Two
+  concrete bugs resulted: `provision.find_wb_keygen` raised a bare `FileNotFoundError`, so "could
+  not find a host wb_keygen" (the first section of `docs/TROUBLESHOOTING.md`, and the most-hit
+  failure on a fresh checkout) reported exit **4** while the docs promised **7**; and
+  `-o /no/such/dir/out.apk` also reported 4, blaming the input. Hence `errors.ToolMissingError`
+  (raised by all four tool probes: `apksigner_cmd`, `find_keytool`, `find_build_tool`,
+  `find_wb_keygen`) and `errors.InputError` (raised by an explicit up-front `isfile` check in
+  `_cmd_pack`), both listed **above** the generic entry. Both subclass `FileNotFoundError` on
+  purpose so `repackage`'s best-effort signing path still catches a missing apksigner and demotes
+  it to a warning. A bare `FileNotFoundError` now means OUTPUT.
+  **The general lesson: a table that matches `code_for()` is not evidence it matches reality.**
+  Codes 7-10 were table-tested and wrong; `test_exitcodes.py` now drives every documented code
+  through a real code path, and `test_every_documented_code_is_reachable` fails if a code has only
+  a `code_for()` assertion behind it.
+- **`NothingPackedError`/`SelectionError` carry the partial `RepackResult`.** Raising discards the
+  accumulated per-library skips, and those are the diagnosis - the message even ends with "see the
+  per-library reasons above", i.e. terminal output, which is what the run record exists to replace.
+  `cli.main` recovers it via `getattr(e, "result", None)`, so a code-6 `report.json` lists all 53
+  candidates and why each was skipped instead of just `failed_count: 0`.
+- **`InjectResult.entry` is filled in by `apk.py`, not `elf_inject`.** `inject_so` only ever sees a
+  temp copy and cannot know the APK entry name, so the run report could not say *which* library it
+  encrypted until `apk.py` stamped it (`ir.entry = name`). `failed`/`untouched` were already keyed
+  on the entry, so this is also what makes the three lists line up.
 
 - **An unknown or misplaced config key must be an ERROR, at every nesting level.** This is the
   guard that replaces argparse, and it is the failure mode the whole config design has to

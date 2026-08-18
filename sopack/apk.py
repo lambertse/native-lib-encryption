@@ -24,6 +24,8 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import diag
+from .errors import ToolMissingError
 from .elf_inject import InjectError, InjectResult, inject_so
 from .stubs import DEFAULT_ABIS, SUPPORTED_ABIS
 
@@ -71,7 +73,7 @@ def find_tool(name: str) -> str:
         cands = sorted(glob.glob(os.path.join(sdk, "build-tools", "*", name)))
         if cands:
             return cands[-1]
-    raise FileNotFoundError(
+    raise ToolMissingError(
         f"could not find '{name}'. Put it on PATH or set ANDROID_SDK_ROOT to your SDK."
     )
 
@@ -85,7 +87,7 @@ def find_keytool() -> str:
         cand = os.path.join(jh, "bin", "keytool")
         if os.path.exists(cand):
             return cand
-    raise FileNotFoundError("could not find 'keytool'. Install a JDK or set JAVA_HOME.")
+    raise ToolMissingError("could not find 'keytool'. Install a JDK or set JAVA_HOME.")
 
 
 def apksigner_cmd() -> list[str]:
@@ -105,7 +107,7 @@ def apksigner_cmd() -> list[str]:
                 if cands[-1].endswith(".jar"):
                     return [shutil.which("java") or "java", "-jar", cands[-1]]
                 return [cands[-1]]
-    raise FileNotFoundError(
+    raise ToolMissingError(
         "could not find apksigner. Set SOPACK_APKSIGNER_JAR to apksigner.jar, or put "
         "apksigner on PATH, or set ANDROID_SDK_ROOT.")
 
@@ -130,14 +132,52 @@ def ensure_keystore(ks: KeystoreInfo) -> KeystoreInfo:
     if os.path.exists(ks.path):
         return ks
     os.makedirs(os.path.dirname(os.path.abspath(ks.path)) or ".", exist_ok=True)
-    subprocess.run([
+    cmd = [
         find_keytool(), "-genkeypair", "-v",
         "-keystore", ks.path, "-alias", ks.alias,
         "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
         "-storepass", ks.store_pass, "-keypass", ks.key_pass,
         "-dname", "CN=sopack, O=sopack, C=US",
-    ], check=True)
+    ]
+    diag.debug(f"generating a keystore at {ks.path} (alias {ks.alias})")
+    diag.log_subprocess(cmd)
+    subprocess.run(cmd, check=True)
     return ks
+
+
+class NothingPackedError(RuntimeError):
+    """The pack ran but protected zero libraries.
+
+    Its own class so `cli.main` can map it to a dedicated exit code instead of the generic 1 -
+    "your APK came out with nothing encrypted" is a completely different thing for a caller to
+    handle than "the packer crashed", and it used to be indistinguishable.
+
+    Still a RuntimeError, so `cli.main`'s pre-existing except-tuple keeps catching it and nothing
+    that calls `repackage` as a library has to change.
+
+    Note this is deliberately NOT exit code 0. Making "nothing was encrypted" a success would
+    invert what `set -e` and every CI runner read 0 as, guaranteeing that the one case most worth
+    flagging is the one that goes unnoticed.
+
+    **It carries the partial `RepackResult`.** Raising loses the accumulated per-library skips
+    otherwise, and those ARE the diagnosis - the message itself ends with "see the per-library
+    reasons above", which is terminal output, i.e. exactly what the run record exists to stop
+    people depending on. With this, a code-6 report.json lists every candidate and why it was
+    not packed.
+    """
+
+    def __init__(self, message: str, result: "RepackResult | None" = None) -> None:
+        super().__init__(message)
+        self.result = result
+
+
+class SelectionError(NothingPackedError):
+    """Nothing matched an EXPLICIT `libraries.include`.
+
+    Narrower than its parent, and separated because the fix differs: this one means the names in
+    the config do not match the APK's contents (a typo, or the wrong ABI), whereas a bare
+    NothingPackedError means selection worked and every candidate was then excluded or failed.
+    """
 
 
 # ---- target selection -------------------------------------------------------------
@@ -267,6 +307,11 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                     candidates += 1
                     select, why = _classify(name, m.group(1), m.group(2),
                                             wanted, abis_set, excludes)
+                    # Every selection decision, including the ones _print_summary collapses to a
+                    # bare count as terminal noise. "why is this library in cleartext?" is the
+                    # most common question about a pack, and this answers it per entry.
+                    diag.debug(f"select {name}: "
+                               + ("YES" if select else f"no ({why})"))
                 if select:
                     abi = m.group(1)
                     logger(f"  injecting {name} [{abi}] …")
@@ -311,6 +356,9 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                         continue
                     with open(dst, "rb") as f:
                         data = f.read()
+                    # inject_so worked on a temp copy and cannot know the APK entry name, so
+                    # stamp it here: the run report has to name the library it encrypted.
+                    ir.entry = name
                     result.injected.append(ir)
                     matched_any = True
                     # wbaes: stage the per-target helper .so to add into lib/<abi>/.
@@ -395,18 +443,21 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                         f"is a packer bug, not a bad input.")
 
         if not matched_any:
+            # `result` rides along on every one of these: it holds the accumulated per-library
+            # skips, which are the actual diagnosis, and they would otherwise be discarded by the
+            # raise and survive only as terminal output.
             if not auto:
-                raise RuntimeError(
+                raise SelectionError(
                     "no .so entries matched the requested list; nothing to encrypt. "
-                    f"requested={sorted(wanted)}")
+                    f"requested={sorted(wanted)}", result)
             if candidates == 0:
-                raise RuntimeError(
-                    "this APK has no lib/<abi>/*.so entries at all; nothing to encrypt.")
-            raise RuntimeError(
+                raise NothingPackedError(
+                    "this APK has no lib/<abi>/*.so entries at all; nothing to encrypt.", result)
+            raise NothingPackedError(
                 f"none of the {candidates} lib/<abi>/*.so entries in this APK were packed: "
                 f"{len(result.untouched)} excluded or outside `abis:` "
                 f"{','.join(sorted(abis_set))}, {len(result.failed)} could not be injected. "
-                "See the per-library reasons above.")
+                "See the per-library reasons above.", result)
 
         # Align uncompressed entries to 16 KB pages (native `zipalign` if present and
         # runnable, else the built-in Python aligner - needed on hosts without an
@@ -448,6 +499,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
             if min_sdk is not None:
                 sign_cmd += ["--min-sdk-version", str(min_sdk)]
             sign_cmd += ["--out", out_apk, aligned]
+            diag.log_subprocess(sign_cmd)
             subprocess.run(sign_cmd, check=True)
 
     return result
@@ -462,12 +514,16 @@ def _align_apk(src: str, dst: str, page: int = 16384, logger=print) -> None:
             c = sorted(glob.glob(os.path.join(sdk, "build-tools", "*", "zipalign")))
             zipalign = c[-1] if c else None
     if zipalign:
+        cmd = [zipalign, "-P", str(page // 1024), "-f", "4", src, dst]
         try:
-            subprocess.run([zipalign, "-P", str(page // 1024), "-f", "4", src, dst],
-                           check=True, capture_output=True)
+            out = subprocess.run(cmd, check=True, capture_output=True)
+            diag.log_subprocess(cmd, out.returncode, out.stdout, out.stderr)
             return
         except (subprocess.CalledProcessError, OSError) as e:
+            diag.log_subprocess(cmd, getattr(e, "returncode", None),
+                                getattr(e, "stdout", None), getattr(e, "stderr", None))
             logger(f"  (native zipalign unusable: {e}; using built-in aligner)")
+    diag.debug(f"aligning with the built-in Python aligner (page={page})")
     python_zipalign(src, dst, page)
 
 
@@ -493,5 +549,13 @@ def verify_signature(apk: str, min_sdk: int | None = None) -> str:
     if min_sdk is not None:
         cmd += ["--min-sdk-version", str(min_sdk)]
     cmd.append(apk)
-    out = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    try:
+        out = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        # apksigner's own explanation is the whole diagnosis here, and it would otherwise be
+        # discarded: cli.main renders CalledProcessError as its bare str(), which names the exit
+        # status and nothing else.
+        diag.log_subprocess(cmd, e.returncode, e.stdout, e.stderr)
+        raise
+    diag.log_subprocess(cmd, out.returncode, out.stdout, out.stderr)
     return out.stdout

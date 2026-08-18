@@ -11,19 +11,62 @@ built-in defaults.
 `sopack init-config` writes a fully commented config.yaml, every key set to its default, so
 an unedited one packs exactly like a bare `sopack pack`. `config.sample.yaml` in the repo is
 the same file.
+
+Two things here exist for CALLERS rather than humans, because sopack is increasingly driven by
+other tools:
+
+* **A stable exit code per failure class** (`sopack/exitcodes.py`). Every failure used to
+  collapse to 1, so a wrapper could tell "it broke" but not what broke.
+* **A per-run record** (`sopack/report.py`) under the log directory, carrying the number of
+  encrypted libraries and the reason for every one that was skipped. That is where counts live:
+  an exit status is 8 bits and cannot carry both a class and a count.
+
+The terminal output is unchanged by both. It goes through `diag.emit` instead of `print`, with a
+formatter that emits the message verbatim, so stdout and stderr are byte-for-byte what they were.
 """
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
+import time
+import traceback
+import zipfile
 from pathlib import Path
 
-from . import __version__
-from .apk import (DEFAULT_KEYSTORE_PATH, KeystoreInfo, build_excludes, repackage,
-                  verify_signature)
-from .config import DEFAULT_CONFIG_NAME, SAMPLE_YAML, load
-from .stubs import SUPPORTED_ABIS
+from . import __version__, diag, exitcodes, report
+from .apk import (DEFAULT_KEYSTORE_PATH, KeystoreInfo, NothingPackedError, SelectionError,
+                  build_excludes, repackage, verify_signature)
+from .config import DEFAULT_CONFIG_NAME, SAMPLE_YAML, Config, ConfigError, load
+from .elf_inject import InjectError
+from .errors import InputError, ToolMissingError
+from .provision import ProvisionError
+from .stubs import SUPPORTED_ABIS, StubMissingError
+
+
+class _Usage(SystemExit):
+    """A malformed command line, as opposed to a malformed config or a failed pack.
+
+    Its own type so it can carry exit code 2. Both places that raise it used to raise a bare
+    `SystemExit(str)`, and `SystemExit` with a *string* argument exits **1** - so `--cipher` on a
+    stale wrapper, the single most likely automation failure after the flags-to-YAML move,
+    reported itself as an internal error.
+
+    The two halves have to be separated because they conflict: `SystemExit(2)` gets the code right
+    but makes Python print nothing, while `SystemExit(msg)` prints but exits 1. So the code goes
+    to `SystemExit.__init__` (hence `.code == 2`), the message is kept on the instance, `__str__`
+    returns it - which is also what `pytest.raises(..., match=...)` reads - and `main` prints it
+    before re-raising.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(exitcodes.USAGE)
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
 
 # Every flag that used to exist, mapped to what replaces it. Without this, a stale script
 # dies on argparse's "unrecognized arguments: --cipher", which names the flag but not the
@@ -66,7 +109,7 @@ def _reject_removed_flags(argv) -> None:
         flag = arg.split("=", 1)[0]
         replacement = _REMOVED_FLAGS.get(flag)
         if replacement:
-            raise SystemExit(
+            raise _Usage(
                 f"error: {flag} was removed - sopack is configured by a YAML file now.\n"
                 f"       Set `{replacement}` in {DEFAULT_CONFIG_NAME} instead.\n"
                 f"       Run `sopack init-config` to write a commented one.")
@@ -86,25 +129,25 @@ def _print_summary(res, abis) -> None:
     with the reason - rather than silently dropped from the report.
     """
     if res.failed:
-        print("\nSkipped (selected but could not be injected - these ship in CLEARTEXT):")
+        diag.emit("\nSkipped (selected but could not be injected - these ship in CLEARTEXT):")
         for entry, err in res.failed:
-            print(f"  {entry}: {err}")
+            diag.emit(f"  {entry}: {err}")
     if res.untouched:
         by_reason: dict[str, list[str]] = {}
         for entry, reason in res.untouched:
             by_reason.setdefault(reason, []).append(entry)
-        print("\nNot selected:")
+        diag.emit("\nNot selected:")
         for reason in sorted(by_reason):
             names = by_reason[reason]
-            print(f"  {reason}: {len(names)}")
+            diag.emit(f"  {reason}: {len(names)}")
             if not reason.startswith("abi "):    # those are noise; the count is enough
                 for entry in names:
-                    print(f"    {entry}")
+                    diag.emit(f"    {entry}")
 
     seen = {ir.abi for ir in res.injected}
     seen |= {_abi_of(e) for e, _ in res.failed}
     seen |= {_abi_of(e) for e, _ in res.untouched}
-    print("\nPer ABI:")
+    diag.emit("\nPer ABI:")
     for abi in sorted(seen):
         inj = sum(1 for ir in res.injected if ir.abi == abi)
         bad = sum(1 for e, _ in res.failed if _abi_of(e) == abi)
@@ -115,11 +158,42 @@ def _print_summary(res, abis) -> None:
             mark = "   (not in `abis:`)"
         else:
             mark = "   (unsupported by sopack)"
-        print(f"  {abi:<12} {inj} injected, {bad} skipped, {unt} not selected{mark}")
+        diag.emit(f"  {abi:<12} {inj} injected, {bad} skipped, {unt} not selected{mark}")
 
 
-def _cmd_pack(args: argparse.Namespace) -> int:
-    cfg, source = load(args.config)
+def _cmd_pack(args: argparse.Namespace, ctx: dict) -> int:
+    # Recorded before anything can fail, so the finally block in `main` can name the APK even for
+    # a run that died in `load`.
+    ctx["input"], ctx["output"] = args.input, args.output
+
+    # The config decides where the log goes, but a broken config is exactly what most needs
+    # logging - so `load` runs with only the console handler live and `diag.open_run` replays
+    # everything buffered so far once a destination exists. On a ConfigError we open the run with
+    # the DEFAULT log settings rather than skipping the record.
+    try:
+        cfg, source = load(args.config)
+    except BaseException:
+        # Open the run with DEFAULT log settings so the failure is still recorded - but do NOT
+        # put this Config in ctx. It was never in effect, and reporting its `cipher: wbaes` as
+        # the run's cipher would describe settings the user's rejected config never supplied.
+        diag.open_run(Config.default().logging.file, args.input)
+        diag.debug("config load FAILED; see the error below")
+        diag.debug(traceback.format_exc())
+        raise
+
+    ctx["cfg"] = cfg
+    ctx["config_source"] = source
+    diag.open_run(cfg.logging.file, args.input)
+    diag.log_config(cfg, source)
+
+    # Checked HERE, up front, rather than left to whichever open() fails first. A missing input and
+    # an unwritable output both surface as FileNotFoundError from deep inside the pack, and an
+    # errno does not say which path it was about - which is how `-o /no/such/dir/o.apk` came to be
+    # reported as a missing input APK.
+    if not os.path.isfile(args.input):
+        what = "is a directory" if os.path.isdir(args.input) else "does not exist"
+        raise InputError(f"input APK {args.input} {what}")
+
     ks_cfg = cfg.signing.keystore
 
     # None means auto-select every lib/<abi>/*.so; an empty list is NOT the same thing and
@@ -136,11 +210,11 @@ def _cmd_pack(args: argparse.Namespace) -> int:
                       key_pass=ks_cfg.key_pass or ks_cfg.store_pass)
 
     eff_excludes = build_excludes(excludes)
-    print(f"sopack {__version__}: packing {args.input} -> {args.output}")
-    print(f"  config: {source or f'built-in defaults (no {DEFAULT_CONFIG_NAME} found)'}")
-    print(f"  cipher={cfg.cipher}  abis={','.join(cfg.abis)}")
-    print(f"  libs={'ALL lib/<abi>/*.so' if libs is None else ','.join(libs)}")
-    print(f"  excluding: {', '.join(eff_excludes)}")
+    diag.emit(f"sopack {__version__}: packing {args.input} -> {args.output}")
+    diag.emit(f"  config: {source or f'built-in defaults (no {DEFAULT_CONFIG_NAME} found)'}")
+    diag.emit(f"  cipher={cfg.cipher}  abis={','.join(cfg.abis)}")
+    diag.emit(f"  libs={'ALL lib/<abi>/*.so' if libs is None else ','.join(libs)}")
+    diag.emit(f"  excluding: {', '.join(eff_excludes)}")
     # No wb_keygen= : there is no config key for it either, and provision.find_wb_keygen
     # locates one on its own (vendor/wbc/bin/ from a local build, or the bundle it was
     # installed from). repackage still takes the kwarg, so a library caller can pin one.
@@ -148,36 +222,45 @@ def _cmd_pack(args: argparse.Namespace) -> int:
                     abis=cfg.abis, keystore=ks, min_sdk=cfg.signing.min_sdk,
                     log=cfg.logging.stub_log,
                     allow_helper_log=cfg.logging.allow_helper_log,
-                    exclude_libs=excludes, no_sign=not cfg.signing.sign)
+                    exclude_libs=excludes, no_sign=not cfg.signing.sign,
+                    logger=diag.emit)
+    ctx["res"] = res
 
-    print(f"\nInjected {len(res.injected)} librar{'y' if len(res.injected)==1 else 'ies'}:")
+    diag.emit(f"\nInjected {len(res.injected)} librar{'y' if len(res.injected)==1 else 'ies'}:")
     for ir in res.injected:
-        print(f"  [{ir.abi}] .text rva=0x{ir.text_rva:x} size={ir.text_size} "
-              f"seg=0x{ir.seg_rva:x} entry=0x{ir.entry_rva:x} via {ir.strategy}")
+        diag.emit(f"  [{ir.abi}] .text rva=0x{ir.text_rva:x} size={ir.text_size} "
+                  f"seg=0x{ir.seg_rva:x} entry=0x{ir.entry_rva:x} via {ir.strategy}")
     _print_summary(res, cfg.abis)
+
+    # Cleartext skips are an exit-0 outcome that changes what the artifact IS, so they have to
+    # reach the run record too - a batch cannot otherwise tell a clean pack from a degraded one.
+    if res.failed:
+        diag.note_warning(f"WARNING: {len(res.failed)} selected librar"
+                          f"{'y' if len(res.failed) == 1 else 'ies'} could not be injected and "
+                          f"ship in CLEARTEXT")
 
     # signing.verify runs apksigner too, so an unsigned output has nothing to verify and the
     # attempt would fail for the same reason signing did.
     if cfg.signing.verify and res.signed:
-        print("\nSignature:")
-        print(verify_signature(args.output, min_sdk=cfg.signing.min_sdk))
-    print(f"\nDone: {args.output}")
+        diag.emit("\nSignature:")
+        diag.emit(verify_signature(args.output, min_sdk=cfg.signing.min_sdk))
+    diag.emit(f"\nDone: {args.output}")
     if res.signed:
-        print("Note: re-signed with a new certificate - this is a new app identity "
-              "(cannot update-install over the original).")
+        diag.emit("Note: re-signed with a new certificate - this is a new app identity "
+                  "(cannot update-install over the original).")
     else:
         # Last line of output, because it is the one thing that decides what you can do with
         # this file. A packed-but-unsigned APK is a normal pipeline artifact, but `adb install`
         # rejects it with an error that says nothing about signing being skipped here.
-        print("Note: this APK is UNSIGNED and cannot be installed as-is. Sign it before use:")
-        print(f"  apksigner sign --ks <keystore> --out signed.apk {args.output}")
-    return 0
+        diag.emit("Note: this APK is UNSIGNED and cannot be installed as-is. Sign it before use:")
+        diag.emit(f"  apksigner sign --ks <keystore> --out signed.apk {args.output}")
+    return exitcodes.OK
 
 
-def _cmd_init_config(args: argparse.Namespace) -> int:
+def _cmd_init_config(args: argparse.Namespace, ctx: dict) -> int:
     if args.output == "-":
         sys.stdout.write(SAMPLE_YAML)
-        return 0
+        return exitcodes.OK
     dest = Path(args.output)
     try:
         # "x" rather than exists()-then-write: the check and the write are one operation, and
@@ -185,13 +268,13 @@ def _cmd_init_config(args: argparse.Namespace) -> int:
         with open(dest, "x", encoding="utf-8") as fh:
             fh.write(SAMPLE_YAML)
     except FileExistsError:
-        raise SystemExit(f"error: {dest} already exists - delete it first, edit it in place, "
-                         f"or write elsewhere with `sopack init-config -o PATH`")
-    print(f"wrote {dest}")
-    print("Every key is set to its default, so packing with it unedited behaves exactly like "
-          "packing without it.")
-    print("Edit it, then: sopack pack <in.apk> -o <out.apk>")
-    return 0
+        raise _Usage(f"error: {dest} already exists - delete it first, edit it in place, "
+                     f"or write elsewhere with `sopack init-config -o PATH`")
+    diag.emit(f"wrote {dest}")
+    diag.emit("Every key is set to its default, so packing with it unedited behaves exactly like "
+              "packing without it.")
+    diag.emit("Edit it, then: sopack pack <in.apk> -o <out.apk>")
+    return exitcodes.OK
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -218,21 +301,108 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# Exception -> exit code, MOST SPECIFIC FIRST: SelectionError is a NothingPackedError, ConfigError
+# is a ValueError, and StubMissingError is a FileNotFoundError, so order is what makes each one
+# reachable. A tuple of pairs rather than a dict for exactly that reason - dicts do not express
+# precedence, and an isinstance dispatch over one silently depends on insertion order.
+_CODE_FOR = (
+    (ConfigError, exitcodes.CONFIG),
+    (SelectionError, exitcodes.SELECTION),
+    (NothingPackedError, exitcodes.NOTHING_ENCRYPTED),
+    (StubMissingError, exitcodes.TOOLCHAIN),
+    (ProvisionError, exitcodes.TOOLCHAIN),
+    (InjectError, exitcodes.INJECT),
+    (subprocess.CalledProcessError, exitcodes.SIGNING),
+    (zipfile.BadZipFile, exitcodes.INPUT),
+    # Both of these are FileNotFoundError subclasses and must precede it. ToolMissingError is a
+    # missing apksigner/keytool/zipalign/wb_keygen - a TOOLCHAIN problem, and reporting it as an
+    # input error is what made "could not find a host wb_keygen" (the most-hit failure on a fresh
+    # checkout) point the reader at their APK instead of their toolchain.
+    (ToolMissingError, exitcodes.TOOLCHAIN),
+    (InputError, exitcodes.INPUT),
+    # Deliberately last among the OSErrors, and note this now catches a BARE FileNotFoundError
+    # too: the input is validated up front in _cmd_pack, so an ENOENT reaching here is a path we
+    # were told to WRITE. FileNotFoundError is an OSError subclass, so listing it above with
+    # INPUT used to shadow this entry entirely.
+    (OSError, exitcodes.OUTPUT),
+    (ValueError, exitcodes.CONFIG),
+    (RuntimeError, exitcodes.INTERNAL),
+)
+
+
+def code_for(exc: BaseException) -> int:
+    for kind, code in _CODE_FOR:
+        if isinstance(exc, kind):
+            return code
+    return exitcodes.INTERNAL
+
+
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
-    _reject_removed_flags(argv)
-    args = build_parser().parse_args(argv)
+    diag.bootstrap()
+    # ctx collects whatever the command managed to establish before failing, so the finally block
+    # can write a report for a run that died halfway - which is the run you most want a record of.
+    ctx: dict = {"cfg": None, "res": None, "config_source": None}
+    started = time.time()
+    code = exitcodes.INTERNAL
+    error: str | None = None
     try:
-        return args.func(args)
-    # ConfigError is a ValueError, so a bad config key prints as `error: ...` rather than a
-    # traceback. CalledProcessError is in the tuple because signing.verify defaults to true:
-    # verify_signature runs apksigner with check=True, so without this an apksigner hiccup
-    # turns an otherwise successful pack into a raw traceback - after the output APK has
-    # already been written.
-    except (FileNotFoundError, RuntimeError, ValueError,
-            subprocess.CalledProcessError) as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
+        _reject_removed_flags(argv)
+        args = build_parser().parse_args(argv)
+        try:
+            code = args.func(args, ctx)
+            return code
+        # ConfigError is a ValueError, so a bad config key prints as `error: ...` rather than a
+        # traceback. CalledProcessError is in the tuple because signing.verify defaults to true:
+        # verify_signature runs apksigner with check=True, so without this an apksigner hiccup
+        # turns an otherwise successful pack into a raw traceback - after the output APK has
+        # already been written.
+        except (FileNotFoundError, RuntimeError, ValueError, OSError,
+                zipfile.BadZipFile, subprocess.CalledProcessError) as e:
+            code = code_for(e)
+            error = str(e)
+            # NothingPackedError carries the partial result. Recovering it here is what lets a
+            # code-6 report list every candidate and the reason it was skipped, instead of a bare
+            # "nothing was packed" plus a message that points at terminal output.
+            if ctx.get("res") is None and getattr(e, "result", None) is not None:
+                ctx["res"] = e.result
+            # The terminal keeps its one-line message; the log gets the traceback, which is the
+            # difference between "error: X" and knowing which of six call paths produced X.
+            diag.debug(f"failed with {type(e).__name__} -> exit {code} "
+                       f"({exitcodes.slug(code)})")
+            diag.debug(traceback.format_exc())
+            diag.warn(f"error: {e}")
+            return code
+        except Exception as e:                  # genuinely unmodelled: keep the traceback visible
+            code, error = exitcodes.INTERNAL, str(e)
+            diag.debug(traceback.format_exc())
+            raise
+    except _Usage as e:
+        # Re-raised, not returned: three existing tests assert `pytest.raises(SystemExit)` here,
+        # and .code is already 2 so the process exits correctly. Python prints nothing for an int
+        # code, hence the explicit warn.
+        code, error = exitcodes.USAGE, str(e)
+        diag.warn(str(e))
+        raise
+    except SystemExit as e:
+        # argparse's own exit (usage errors, --help, --version). Preserve its code verbatim: 0 for
+        # --help/--version, 2 for a usage error, which is why nothing else may claim 2.
+        code = e.code if isinstance(e.code, int) else exitcodes.USAGE
+        raise
+    finally:
+        # Recorded even on failure, and even for a partial run: a batch triages from these, so a
+        # pack that died is exactly the one that must leave a line behind. Wrapped because a bug
+        # in the reporting layer must never replace the real diagnosis.
+        try:
+            if diag.run_dir():
+                report.finalize(ctx.get("cfg"), ctx.get("res"),
+                                input_apk=ctx.get("input"), output_apk=ctx.get("output"),
+                                exit_code=code, error=error,
+                                config_source=ctx.get("config_source"),
+                                duration_ms=int((time.time() - started) * 1000))
+        except Exception:                                   # pragma: no cover - defensive
+            diag.debug("could not finalize the run report:\n" + traceback.format_exc())
+        diag.reset()
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 import lief
 
+from . import diag
 from .cipher import CIPHER_IDS, CIPHER_WBAES, WHITEN_SPAN, apply_cipher, gen_key_nonce, whiten
 from .metadata import (DecInfo, FLAG_CHAIN_INIT, FLAG_LOG, FLAG_NEED_ICACHE,
                        MAGIC, SIZE as DECINFO_SIZE, VERSION)
@@ -53,8 +54,14 @@ SEGMENT_ALIGN = 16384
 def _warn(msg: str) -> None:
     """Warnings that must survive being ignored: stderr, not the `logger` the APK layer
     threads around, because these fire deep in the injection and describe a shippable
-    artifact that is not shippable."""
-    print(f"WARNING: {msg}", file=sys.stderr)
+    artifact that is not shippable.
+
+    Routed through `diag` so the same text also lands in the run record and the log file - these
+    are precisely the warnings a caller wants to see after the fact, and stderr alone is gone the
+    moment the terminal scrolls. `diag.note_warning` keeps them on stderr (it logs at WARNING,
+    which the console handler sends there) AND records them in report.json's `warnings`, so a
+    pack that "succeeded" with a caveat is machine-detectable."""
+    diag.note_warning(f"WARNING: {msg}")
 
 # Spare bytes reserved in the appended string-table segment, so the common case needs a single
 # LIEF write. LIEF's rebuilt .dynstr normally has the same size (it reorders, it does not add),
@@ -113,6 +120,11 @@ class InjectResult:
     # emitted alongside. apk.py passes a pack_key and emits one provider per ABI itself, so it
     # gets None here - otherwise every target would emit a provider carrying a different blob.
     provider_path: str | None = None
+    # The APK entry this came from (lib/<abi>/libfoo.so), filled in by apk.py - inject_so only
+    # ever sees a temp copy, so it cannot know the name itself. Needed because the run report
+    # has to say WHICH library it encrypted, and `RepackResult.failed`/`untouched` are keyed on
+    # the entry while `injected` was not, which made the three lists impossible to line up.
+    entry: str | None = None
 
 
 def _find_text(binary) -> "lief.ELF.Section":

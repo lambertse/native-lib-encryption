@@ -49,6 +49,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+
+from . import diag
+from .errors import ToolMissingError
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -219,14 +222,24 @@ def find_wb_keygen(explicit: str | None = None) -> str:
     *Android* wb_keygen in one location does not mask a usable one in the next, and the failure
     is a clear message instead of a mid-pack 'Exec format error'."""
     bad = []
-    for cand in (explicit, _repo_wb_keygen(), _bundle_wb_keygen(),
-                 os.environ.get("SOPACK_WBKEYGEN"), shutil.which("wb_keygen")):
+    for label, cand in (("explicit", explicit),
+                        ("vendor/wbc/bin", _repo_wb_keygen()),
+                        ("portable bundle", _bundle_wb_keygen()),
+                        ("$SOPACK_WBKEYGEN", os.environ.get("SOPACK_WBKEYGEN")),
+                        ("PATH", shutil.which("wb_keygen"))):
+        # The probe order is load-bearing and invisible from the outside: "sopack used a
+        # different wb_keygen than I expected" is otherwise unanswerable without reading this
+        # function, so record every candidate and the verdict on it.
         if not cand or not os.path.exists(cand):
+            diag.debug(f"wb_keygen probe [{label}]: "
+                       + ("not set" if not cand else f"{cand} does not exist"))
             continue
         reason = _host_incompatible_reason(cand)
         if reason:
+            diag.debug(f"wb_keygen probe [{label}]: {cand} REJECTED - {reason}")
             bad.append(f"{cand}: {reason}")
             continue
+        diag.debug(f"wb_keygen probe [{label}]: {cand} SELECTED")
         return cand
     msg = ("could not find a host wb_keygen, which `cipher: wbaes` needs to seal the white-box "
            "blob. Run ./scripts/build_wbaes.sh - it builds one from the pinned "
@@ -235,7 +248,7 @@ def find_wb_keygen(explicit: str | None = None) -> str:
            "a white-box at all, set `cipher: chacha20` in your config.")
     if bad:
         msg += "\n  Candidates found but not runnable here:\n    " + "\n    ".join(bad)
-    raise FileNotFoundError(msg)
+    raise ToolMissingError(msg)
 
 
 def _seal(key: bytes, passphrase: str, seed: int, wb_keygen: str) -> bytes:
@@ -246,14 +259,21 @@ def _seal(key: bytes, passphrase: str, seed: int, wb_keygen: str) -> bytes:
     gates rather than knobs. See the module docstring for why that is security-neutral."""
     with tempfile.TemporaryDirectory(prefix="sopack-seal-") as td:
         out = os.path.join(td, "sealed.blob")
+        # --key and --pass are the long-term secret and its passphrase, so the argv is logged
+        # with them elided rather than scrubbed by pattern: neither has a recognisable prefix
+        # for diag.scrub_argv to catch, and this is the one place they appear on a command line.
+        cmd = [wb_keygen, "--key", key.hex(), "--pass", passphrase,
+               "--seed", str(seed), "--kdf", "light", "--out", out]
+        diag.log_subprocess([wb_keygen, "--key", "<REDACTED>", "--pass", "<REDACTED>",
+                             "--seed", str(seed), "--kdf", "light", "--out", out])
         try:
-            subprocess.run(
-                [wb_keygen, "--key", key.hex(), "--pass", passphrase,
-                 "--seed", str(seed), "--kdf", "light", "--out", out],
-                check=True, capture_output=True,
-            )
+            proc = subprocess.run(cmd, check=True, capture_output=True)
+            diag.log_subprocess([wb_keygen, "…"], proc.returncode, proc.stdout, proc.stderr)
         except subprocess.CalledProcessError as e:
             err = e.stderr.decode("utf-8", "replace").strip()
+            # Keep the tool's FULL output in the log. The exception message below interpolates
+            # only part of it, and on a stale-toolchain failure the rest is the diagnosis.
+            diag.log_subprocess([wb_keygen, "…"], e.returncode, e.stdout, e.stderr)
             msg = f"wb_keygen failed (exit {e.returncode}): {err}"
             # The realistic upgrade failure, and the one that actually fires: a pre-3.0.0
             # wb_keygen has no --kdf, and its argv loop ends in `unknown arg` + exit 2. Name

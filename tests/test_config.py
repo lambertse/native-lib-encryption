@@ -12,6 +12,7 @@ have several tests each:
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,9 @@ def test_sample_round_trips_to_exactly_the_defaults():
     "cipher", "abis", "libraries", "include", "exclude",
     "signing", "sign", "verify", "min-sdk", "keystore", "path", "alias",
     "store-pass", "key-pass", "logging", "stub-log", "allow-helper-log",
+    # the host troubleshooting log
+    "file", "enabled", "dir", "level", "max-size-mb", "max-files", "max-runs",
+    "max-index-lines",
 ])
 def test_sample_documents_every_key(key):
     """A new option that the sample does not mention is an undocumented option."""
@@ -170,6 +174,13 @@ def test_duplicate_key_is_an_error():
     ("libraries:\n  cipher: wbaes\n", "cipher"),                 # right key, wrong section
     ("signing:\n  stub-log: true\n", "stub-log"),                # right key, wrong section
     ("signing:\n  keystore:\n    password: x\n", "password"),    # invented key
+    # logging.file: a nested section, so it needs the same guard at its own level
+    ("logging:\n  file:\n    maxsize: 5\n", "maxsize"),           # typo in a subkey
+    ("logging:\n  max-runs: 5\n", "max-runs"),                    # right key, wrong level
+    ("logging:\n  dir: /tmp/x\n", "dir"),                         # right key, wrong level
+    ("file:\n  enabled: true\n", "file"),                         # flattened to the top level
+    ("max-files: 5\n", "max-files"),                              # flattened to the top level
+    ("signing:\n  file:\n    enabled: true\n", "file"),           # right key, wrong section
 ])
 def test_unknown_or_misplaced_keys_are_an_error(text, bad):
     """A silently ignored `verify: false` is worse than a typo - the user believes they
@@ -182,11 +193,88 @@ def test_unknown_or_misplaced_keys_are_an_error(text, bad):
     "signing:\n  min_sdk: 24\n",
     "signing:\n  keystore:\n    store_pass: x\n",
     "logging:\n  stub_log: true\n",
+    "logging:\n  file:\n    max_size_mb: 5\n",
+    "logging:\n  file:\n    max_files: 5\n",
+    "logging:\n  file:\n    max_runs: 5\n",
+    "logging:\n  file:\n    max_index_lines: 5\n",
 ])
 def test_underscore_spellings_are_rejected_with_a_hint(text):
     """One spelling, not two. Accepting both would mean keeping both working forever."""
     with pytest.raises(ConfigError, match="dashes, not underscores"):
         loads(text)
+
+
+# ---- logging.file: the host troubleshooting log -------------------------------------
+@pytest.mark.parametrize("key", ["max-size-mb", "max-files", "max-runs", "max-index-lines"])
+@pytest.mark.parametrize("value", [0, -1, -50])
+def test_log_caps_must_be_positive(key, value):
+    """Zero is the dangerous one, and it is why these do not go through the plain _as_int.
+    `max-files: 0` makes RotatingFileHandler stop rotating (one unbounded file) and
+    `max-runs: 0` would delete every record as it is written - so a user who set either to
+    "off" would get the exact opposite of a bounded log. `enabled: false` is how you turn it
+    off, and the message says so."""
+    with pytest.raises(ConfigError, match=">= 1"):
+        loads(f"logging:\n  file:\n    {key}: {value}\n")
+
+
+@pytest.mark.parametrize("key", ["max-size-mb", "max-files", "max-runs", "max-index-lines"])
+def test_log_caps_reject_a_boolean(key):
+    """bool is a subclass of int, so `max-files: true` would otherwise be accepted as 1."""
+    with pytest.raises(ConfigError, match="whole number"):
+        loads(f"logging:\n  file:\n    {key}: true\n")
+
+
+def test_log_level_is_checked_against_a_known_set():
+    with pytest.raises(ConfigError, match="expected one of"):
+        loads("logging:\n  file:\n    level: verbose\n")
+
+
+def test_log_level_is_case_insensitive_and_normalised():
+    assert loads("logging:\n  file:\n    level: DEBUG\n").logging.file.level == "debug"
+
+
+def test_log_file_must_be_a_mapping():
+    with pytest.raises(ConfigError, match="expected a mapping"):
+        loads("logging:\n  file: yes-please\n")
+
+
+def test_log_dir_expands_a_tilde():
+    """Matches signing.keystore.path. Note ${VAR} is deliberately NOT expanded here - that stays
+    scoped to the keystore fields, and $SOPACK_LOG_DIR already covers redirecting from the
+    environment."""
+    got = loads("logging:\n  file:\n    dir: ~/mylogs\n").logging.file.dir
+    assert got == os.path.expanduser("~/mylogs")
+    assert "~" not in got
+
+
+def test_log_dir_default_is_none_not_a_home_path():
+    """Config.default() must not depend on who is running it, or the sample-vs-defaults test
+    would pass or fail based on $HOME. diag resolves None to ~/.sopack/logs instead."""
+    assert Config.default().logging.file.dir is None
+
+
+def test_partial_log_file_section_keeps_the_other_defaults():
+    got = loads("logging:\n  file:\n    max-runs: 7\n").logging.file
+    d = config.LogFileConfig()
+    assert got.max_runs == 7
+    assert (got.enabled, got.level, got.max_size_mb, got.max_files, got.max_index_lines) == \
+           (d.enabled, d.level, d.max_size_mb, d.max_files, d.max_index_lines)
+
+
+def test_index_cap_defaults_far_above_the_run_cap():
+    """The whole point of separating them: run directories are bulky and get pruned early, while
+    the index is the batch history and has to outlive them. If these ever converge, a pruned run
+    takes last week's triage data with it."""
+    d = config.LogFileConfig()
+    assert d.max_index_lines > d.max_runs * 5
+
+
+def test_the_device_log_keys_and_the_host_log_keys_stay_separate():
+    """logging.stub-log/allow-helper-log control what the INJECTED code prints to logcat; the
+    logging.file block controls what the packer records locally. Conflating them is the mistake
+    the nesting exists to prevent, so the two must not share a level."""
+    assert "file" in config._LOG_KEYS
+    assert not (config._LOG_KEYS - {"file"}) & config._LOGFILE_KEYS
 
 
 def test_retired_key_gets_a_targeted_message():
@@ -411,11 +499,18 @@ def packed(tmp_path, monkeypatch):
         return _Res()
 
     monkeypatch.setattr(cli, "repackage", _fake_repackage)
+    # repackage is faked, but _cmd_pack now validates the input APK up front so a missing input
+    # gets exit 4 with a clear message instead of an ENOENT from deep inside the pack (which was
+    # indistinguishable from an unwritable OUTPUT path). So the input has to actually exist.
+    src = tmp_path / "in.apk"
+    src.write_bytes(b"PK\x05\x06" + b"\x00" * 18)          # an empty but real zip
+    monkeypatch.setenv("SOPACK_LOG_DIR", str(tmp_path / "logs"))
 
     def run(yaml_text):
         cfg = tmp_path / "c.yaml"
         cfg.write_text(yaml_text)
-        assert cli.main(["pack", "in.apk", "-o", "out.apk", "--config", str(cfg)]) == 0
+        assert cli.main(["pack", str(src), "-o", str(tmp_path / "out.apk"),
+                         "--config", str(cfg)]) == 0
         return calls
 
     return run

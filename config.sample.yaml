@@ -72,3 +72,27 @@ logging:
   # Permit a wbaes helper skeleton built with -DSOPK_RT_LOG. Such a build leaks the
   # target name, .text address and size to logcat: the result is NOT shippable.
   allow-helper-log: false
+
+  # The HOST-side troubleshooting log. Nothing to do with the two keys above, which
+  # control what the INJECTED code prints to logcat on the device - these control what
+  # the packer records on the machine running `sopack pack`.
+  #
+  # Every pack writes a self-contained record under <dir>/runs/<run-id>/ (report.json
+  # plus that run's full DEBUG log), appends one line to <dir>/index.jsonl, and adds to
+  # the rotating <dir>/sopack.log. To triage a batch:
+  #   jq -c 'select(.exit_code!=0)|{apk,exit_code,error}' <dir>/index.jsonl
+  # Set $SOPACK_RUN_TAG before a batch and every record carries it, so one jq filter
+  # scopes to that batch. The terminal output is identical either way.
+  file:
+    enabled: true
+    # null -> ~/.sopack/logs, beside the debug keystore. $SOPACK_LOG_DIR overrides
+    # this, so a caller that cannot edit the config can still redirect the log.
+    dir:
+    level: debug          # verbosity of the FILE log only; the terminal is unaffected
+    max-size-mb: 50       # rotate sopack.log at this size
+    max-files: 5          # how many sopack.log files to keep, counting the live one
+    max-runs: 200         # per-run directories under runs/ to keep
+    # index.jsonl entries to keep. Much larger than max-runs on purpose: a line is
+    # ~300 bytes and it is the batch history, so it outlives the bulky per-run detail.
+    # A run whose directory has been pruned keeps its line, with "dir": null.
+    max-index-lines: 5000

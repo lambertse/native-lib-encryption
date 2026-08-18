@@ -224,6 +224,44 @@ sopack will not sign with an empty password it substituted for you. Literals sti
 and `$${VAR}` escapes to a literal `${VAR}`. Leave `path` null to use (and generate)
 `~/.sopack/debug.keystore`.
 
+## Troubleshooting and automation
+
+Every pack writes a durable record under `~/.sopack/logs/` (override with `logging.file.dir` or
+`$SOPACK_LOG_DIR`), so a failure can be diagnosed after the fact rather than reproduced:
+
+```
+~/.sopack/logs/
+├── sopack.log[.1-.4]   rotating firehose (50 MB x 5)
+├── index.jsonl         ONE LINE PER RUN - the batch view
+└── runs/<run-id>/      report.json + that run's full DEBUG log
+```
+
+**Filing a bug: attach `runs/<run-id>/`.** It carries the resolved config (passwords redacted),
+`lief.__version__`, the resolved `wb_keygen`/`apksigner`/`zipalign` paths, every external command
+with its output, the per-library selection decisions, and the traceback - none of which the terminal
+prints.
+
+`sopack pack` returns a **stable exit code per failure class** so a wrapper can branch without
+parsing prose: `0` ok, `2` usage, `3` config, `4` input APK, `5` library selection, `6` nothing
+encrypted, `7` toolchain, `8` injection, `9` signing, `10` output, `1` internal. The *count* of
+encrypted libraries is not in the exit status - an exit status is 8 bits and cannot carry both a
+class and a count - so read it from the record:
+
+```bash
+sopack pack in.apk -o out.apk; echo "exit=$?"
+
+L=~/.sopack/logs
+jq -c 'select(.exit_code!=0)|{apk,exit_code,status,error}' $L/index.jsonl   # what failed
+jq -s 'group_by(.status)|map({(.[0].status):length})' $L/index.jsonl        # batch summary
+
+# packs that exited 0 but still shipped libraries in cleartext
+jq -c 'select(.exit_code==0 and .failed_count>0)|{apk,encrypted_count,failed_count}' $L/index.jsonl
+```
+
+For a batch, export `$SOPACK_RUN_TAG` once and every record carries it, so one filter scopes each
+query to that batch. Full exit-code table and more recipes in
+[`docs/TROUBLESHOOTING.md`](./docs/TROUBLESHOOTING.md).
+
 ## Verification checklist
 
 - **Static:** `readelf -x .text out.so` (random), `readelf -l out.so` (new `R E`

@@ -130,6 +130,30 @@ logging:
   # Permit a wbaes helper skeleton built with -DSOPK_RT_LOG. Such a build leaks the
   # target name, .text address and size to logcat: the result is NOT shippable.
   allow-helper-log: false
+
+  # The HOST-side troubleshooting log. Nothing to do with the two keys above, which
+  # control what the INJECTED code prints to logcat on the device - these control what
+  # the packer records on the machine running `sopack pack`.
+  #
+  # Every pack writes a self-contained record under <dir>/runs/<run-id>/ (report.json
+  # plus that run's full DEBUG log), appends one line to <dir>/index.jsonl, and adds to
+  # the rotating <dir>/sopack.log. To triage a batch:
+  #   jq -c 'select(.exit_code!=0)|{apk,exit_code,error}' <dir>/index.jsonl
+  # Set $SOPACK_RUN_TAG before a batch and every record carries it, so one jq filter
+  # scopes to that batch. The terminal output is identical either way.
+  file:
+    enabled: true
+    # null -> ~/.sopack/logs, beside the debug keystore. $SOPACK_LOG_DIR overrides
+    # this, so a caller that cannot edit the config can still redirect the log.
+    dir:
+    level: debug          # verbosity of the FILE log only; the terminal is unaffected
+    max-size-mb: 50       # rotate sopack.log at this size
+    max-files: 5          # how many sopack.log files to keep, counting the live one
+    max-runs: 200         # per-run directories under runs/ to keep
+    # index.jsonl entries to keep. Much larger than max-runs on purpose: a line is
+    # ~300 bytes and it is the batch history, so it outlives the bulky per-run detail.
+    # A run whose directory has been pruned keeps its line, with "dir": null.
+    max-index-lines: 5000
 """
 
 
@@ -168,9 +192,35 @@ class LibraryConfig:
 
 
 @dataclass(frozen=True)
+class LogFileConfig:
+    """The HOST-side troubleshooting log - unrelated to LoggingConfig's two device keys.
+
+    `dir=None` means `diag.DEFAULT_LOG_DIR` (~/.sopack/logs), resolved there rather than here
+    so that `Config.default()` stays independent of the user's home directory - a test that
+    pins the sample against the defaults must not depend on who is running it.
+
+    `max_index_lines` is deliberately far larger than `max_runs`: run *directories* are the
+    bulky artifact, while an index line is ~300 bytes and carries the batch history that makes
+    a 40-APK run triageable. Trimming the index down to the surviving directories would throw
+    away exactly what the index exists for.
+    """
+    enabled: bool = True
+    dir: str | None = None
+    level: str = "debug"
+    max_size_mb: int = 50
+    max_files: int = 5              # counting the live sopack.log
+    max_runs: int = 200
+    max_index_lines: int = 5000
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
+    # These two are about the DEVICE: what the injected stub/helper prints to logcat.
     stub_log: bool = False
     allow_helper_log: bool = False
+    # This one is about the HOST: what the packer records locally. Nested rather than flat
+    # so the two concerns cannot be misread as one another.
+    file: LogFileConfig = field(default_factory=LogFileConfig)
 
 
 @dataclass(frozen=True)
@@ -191,7 +241,13 @@ _TOP_KEYS = frozenset({"cipher", "abis", "libraries", "signing", "logging"})
 _LIB_KEYS = frozenset({"include", "exclude"})
 _SIGN_KEYS = frozenset({"sign", "verify", "min-sdk", "keystore"})
 _KS_KEYS = frozenset({"path", "alias", "store-pass", "key-pass"})
-_LOG_KEYS = frozenset({"stub-log", "allow-helper-log"})
+_LOG_KEYS = frozenset({"stub-log", "allow-helper-log", "file"})
+_LOGFILE_KEYS = frozenset({"enabled", "dir", "level", "max-size-mb", "max-files",
+                           "max-runs", "max-index-lines"})
+
+# What `logging.file.level` accepts. Only the levels that mean something for this tool: there
+# is no CRITICAL anywhere in sopack, and offering it would imply a tier that never fires.
+_LOG_LEVELS = ("debug", "info", "warning", "error")
 
 # Keys that USED to exist, by full dotted path, mapped to what replaced them - the config
 # counterpart of cli._REMOVED_FLAGS. An upgrading user has the old key sitting in their file
@@ -275,6 +331,24 @@ def _as_int(value, where: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError(f"{where}: expected a whole number, got {_typename(value)} ({value!r})")
     return value
+
+
+def _as_positive_int(value, where: str, default: int) -> int:
+    """A whole number >= 1, or the default when absent.
+
+    Separate from `_as_int` because the log caps have no meaningful zero and the failure would
+    otherwise be silent-ish: `max-files: 0` makes RotatingFileHandler stop rotating (it keeps
+    one unbounded file), and `max-runs: 0` would delete every run record the moment it is
+    written - a user who set either to "off" would get the opposite of a bounded log. Turn the
+    log off with `enabled: false`, which says so.
+    """
+    if value is None:
+        return default
+    got = _as_int(value, where)
+    if got is None or got < 1:
+        raise ConfigError(f"{where}: expected a whole number >= 1, got {value!r}. To disable "
+                          f"the file log entirely set `logging.file.enabled: false`.")
+    return got
 
 
 def _as_str(value, where: str, default: str | None) -> str | None:
@@ -413,6 +487,35 @@ def _build_signing(raw) -> SigningConfig:
     )
 
 
+def _build_logfile(raw) -> LogFileConfig:
+    data = _mapping(raw, "logging.file")
+    _check_keys(data, _LOGFILE_KEYS, "logging.file")
+    d = LogFileConfig()
+
+    level = _as_str(data.get("level"), "logging.file.level", d.level)
+    if level.lower() not in _LOG_LEVELS:
+        raise ConfigError(f"logging.file.level: expected one of {', '.join(_LOG_LEVELS)}; "
+                          f"got {level!r}")
+
+    # expanduser so `dir: ~/logs` works, matching signing.keystore.path. No ${VAR} expansion:
+    # that stays scoped to the keystore fields (see this module's docstring), and $SOPACK_LOG_DIR
+    # already covers "point the log somewhere from the environment".
+    directory = _as_str(data.get("dir"), "logging.file.dir", d.dir)
+    return LogFileConfig(
+        enabled=_as_bool(data.get("enabled"), "logging.file.enabled", d.enabled),
+        dir=os.path.expanduser(directory) if directory else None,
+        level=level.lower(),
+        max_size_mb=_as_positive_int(data.get("max-size-mb"),
+                                     "logging.file.max-size-mb", d.max_size_mb),
+        max_files=_as_positive_int(data.get("max-files"),
+                                   "logging.file.max-files", d.max_files),
+        max_runs=_as_positive_int(data.get("max-runs"),
+                                  "logging.file.max-runs", d.max_runs),
+        max_index_lines=_as_positive_int(data.get("max-index-lines"),
+                                        "logging.file.max-index-lines", d.max_index_lines),
+    )
+
+
 def _build_logging(raw) -> LoggingConfig:
     data = _mapping(raw, "logging")
     _check_keys(data, _LOG_KEYS, "logging")
@@ -421,6 +524,7 @@ def _build_logging(raw) -> LoggingConfig:
         stub_log=_as_bool(data.get("stub-log"), "logging.stub-log", d.stub_log),
         allow_helper_log=_as_bool(data.get("allow-helper-log"),
                                   "logging.allow-helper-log", d.allow_helper_log),
+        file=_build_logfile(data.get("file")),
     )
 
 
