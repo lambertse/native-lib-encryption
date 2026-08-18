@@ -621,13 +621,13 @@ def _check_wbaes_skeleton(skeleton: str, kind: str, allow_helper_log: bool) -> N
             "final \"OK\" to logcat - an attacker with adb gets the exact address and length to "
             "dump.\n"
             "  To fix:  ./scripts/build_wbaes.sh --release\n"
-            "  To keep: pass --allow-helper-log (for on-device Phase 6 verification only; "
+            "  To keep: set `logging.allow-helper-log: true` (on-device verification only; "
             "the result is NOT shippable)")
     if logging_built:
         # Every pack, not once per run: the whole reason this flag needs a loud footprint is that
         # "remember to drop -DSOPK_RT_LOG" is exactly the convention that already failed. Name
         # the artifact, since either of the two can be the tracing one.
-        _warn(f"{name} is a TRACING build (--allow-helper-log): it logs the target name, .text "
+        _warn(f"{name} is a TRACING build (logging.allow-helper-log): it logs the target name, .text "
               "address and size to logcat. DO NOT SHIP THIS APK.")
 
     # Export hygiene. Re-exported white-box symbols publish the SDK's whole API surface, and
@@ -778,7 +778,7 @@ def _inject_wbaes(in_path: str, out_path: str, abi: str,
                   wb_keygen: str | None, target_name: str | None,
                   allow_helper_log: bool = False,
                   pack_key: PackKey | None = None) -> InjectResult:
-    """`--cipher wbaes`: encrypt `.text` with ChaCha20 under a session key that is wrapped
+    """`cipher: wbaes`: encrypt `.text` with ChaCha20 under a session key that is wrapped
     by a sealed white-box AES-128 key, and inject a per-target DT_NEEDED helper that unwraps
     and decrypts at load. No stub/decinfo/DT_INIT surgery - the helper's constructor runs
     before the target's init via dependency ordering. See sopack/provision.py for why the

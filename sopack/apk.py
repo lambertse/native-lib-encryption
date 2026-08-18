@@ -4,9 +4,9 @@ Flow: for each selected lib/<abi>/*.so inside the APK, inject (encrypt + stub),
 write it back STORED (uncompressed) so it stays page-mappable, strip the old
 signature, then `zipalign -P 16` and `apksigner` with a generated keystore.
 
-Selection is either an explicit list (--lib/--libs) or, when that list is omitted,
+Selection is either an explicit list (libraries.include) or, when that list is omitted,
 every lib/<abi>/*.so in the input APK for the selected ABIs. Exclusion patterns always
-win over selection; see DEFAULT_EXCLUDE_PATTERNS / ALWAYS_EXCLUDE_PATTERNS below.
+win over selection; see ALWAYS_EXCLUDE_PATTERNS below.
 
 Re-signing changes the signing identity: the output is effectively a new app and
 cannot be installed as an update over the original.
@@ -29,18 +29,26 @@ from .stubs import DEFAULT_ABIS, SUPPORTED_ABIS
 
 _LIB_RE = re.compile(r"^lib/([^/]+)/([^/]+\.so)$")
 
-# Excluded by default from BOTH auto-select and an explicit --lib. --no-default-exclude
-# turns this list off. Patterns are fnmatch globs on the basename; a trailing ".so" is
-# optional, so "libflutter" matches "libflutter.so".
-DEFAULT_EXCLUDE_PATTERNS = (
-    "libflutter",       # excluded by user preference; no known technical failure
-)
-
-# Excluded UNCONDITIONALLY - not affected by --no-default-exclude, and not overridable by
-# naming one in --lib. These are sopack's own injected artifacts: the shared provider
-# (rt_meta.PROVIDER_SONAME) and the per-target thin helpers, emitted as
-# libsopk_rt_<target>.so. Auto-selecting them on an already-packed APK would encrypt the
-# very code that does the decrypting.
+# Excluded UNCONDITIONALLY: not overridable by naming one in libraries.include, and not
+# removable by leaving them out of libraries.exclude. Patterns are fnmatch globs on the
+# basename; a trailing ".so" is optional, so "libflutter" matches "libflutter.so".
+#
+# These two entries are here for DIFFERENT reasons - the old comment described only the
+# first and was therefore untrue of the tuple it sat above:
+#
+#   libsopk_*        sopack's OWN injected artifacts - the shared provider
+#                    (rt_meta.PROVIDER_SONAME) and the per-target thin helpers, emitted as
+#                    libsopk_rt_<target>.so. Auto-selecting them on an already-packed APK
+#                    would encrypt the very code that does the decrypting. This one is a
+#                    correctness invariant of the tool, not a preference.
+#   libvosWrapperEx  the V-Key/V-OS wrapper, which ships in the APKs this tool is used on
+#                    and is already self-protected, so packing it buys nothing and risks
+#                    interfering with its own integrity checks.
+#
+# Both are ALSO written into every generated config's `libraries.exclude` so a reader of the
+# config can see them (config.LibraryConfig.exclude). That listing is for visibility only:
+# this tuple is what makes deleting them there a no-op. build_excludes() de-duplicates, so
+# appearing in both places costs nothing.
 ALWAYS_EXCLUDE_PATTERNS = ("libsopk_*", "libvosWrapperEx")
 
 
@@ -103,6 +111,13 @@ def apksigner_cmd() -> list[str]:
 
 
 # ---- keystore ---------------------------------------------------------------------
+# Where a pack signs from when the caller names no keystore. A module constant rather than
+# an inline literal because cli.py now builds a KeystoreInfo unconditionally (the config
+# file always has keystore settings, even if they are all defaults) and both places have to
+# mean the same file.
+DEFAULT_KEYSTORE_PATH = os.path.join(os.path.expanduser("~"), ".sopack", "debug.keystore")
+
+
 @dataclass
 class KeystoreInfo:
     path: str
@@ -136,19 +151,22 @@ class RepackResult:
     # still aborts the whole pack.
     failed: list[tuple[str, str]] = field(default_factory=list)
     output: str = ""
-    # False when the output was left UNSIGNED - either --no-sign, or no apksigner on this
+    # False when the output was left UNSIGNED - either signing.sign: false, or no apksigner on this
     # machine. An unsigned APK cannot be installed until something signs it, so the CLI has to
     # say so rather than letting a successful-looking pack imply an installable artifact.
     signed: bool = True
 
 
-def build_excludes(exclude_libs=None, no_default_exclude: bool = False) -> tuple[str, ...]:
-    """Assemble the effective exclusion pattern list, most-authoritative first."""
-    pats = list(ALWAYS_EXCLUDE_PATTERNS)
-    if not no_default_exclude:
-        pats.extend(DEFAULT_EXCLUDE_PATTERNS)
-    pats.extend(exclude_libs or ())
-    return tuple(pats)
+def build_excludes(exclude_libs=None) -> tuple[str, ...]:
+    """Assemble the effective exclusion pattern list, most-authoritative first.
+
+    ALWAYS_EXCLUDE_PATTERNS is prepended unconditionally, so a caller that passes an empty
+    list - or one that dropped `libsopk_*` from its config - still cannot select sopack's
+    own decryptor. De-duplicated because every generated config already lists those
+    patterns: without this the CLI's "excluding:" line would name each of them twice, which
+    reads as a bug.
+    """
+    return tuple(dict.fromkeys(list(ALWAYS_EXCLUDE_PATTERNS) + list(exclude_libs or ())))
 
 
 def _match_lib_pattern(entry: str, so: str, pat: str) -> bool:
@@ -163,12 +181,12 @@ def _classify(entry: str, abi: str, so: str, wanted: set[str] | None,
     """(select?, reason-if-not). `wanted is None` means auto-select everything.
 
     Exclusion is checked before selection, so an excluded name is never packed even when
-    it was named explicitly in --lib.
+    it was named explicitly in libraries.include.
     """
     if abi not in abis:
-        # Distinguish "you could pass --abi for this" from "sopack has no stub for it":
+        # Distinguish "you could widen `abis:` for this" from "sopack has no stub for it":
         # _LIB_RE matches any <abi> directory name, including lib/x86/ and lib/mips/ that
-        # --abi would reject outright.
+        # `abis:` would reject outright.
         return False, ("abi not selected" if abi in SUPPORTED_ABIS
                        else "abi not supported by sopack")
     for pat in excludes:
@@ -176,13 +194,23 @@ def _classify(entry: str, abi: str, so: str, wanted: set[str] | None,
             return False, f"excluded by {pat!r}"
     if wanted is None:
         return True, ""
-    # Match by full lib path or by bare basename (which then applies to every ABI).
-    if entry in wanted or so in wanted:
+    # Same matcher as the exclusion loop above, deliberately: a full APK path, a bare
+    # basename (which then applies to every ABI), an optional trailing ".so", and fnmatch
+    # globs all work in BOTH lists. This used to be exact set membership, so `include:
+    # [libapp]` silently matched nothing and the pack aborted with "no .so entries matched"
+    # while `exclude: [libflutter]` - written the same way, two lines below it in the same
+    # config - worked fine. One matcher is the only way that stays true as the file is edited.
+    if any(_match_lib_pattern(entry, so, pat) for pat in wanted):
         return True, ""
     return False, "not requested"
 
 
 def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
+              # This is the LIBRARY default and is unreachable from the CLI, which always
+              # passes cipher= explicitly from the config. sopack/config.py owns the
+              # user-facing default (wbaes). Do not "align" the two: flipping this to wbaes
+              # fires the find_wb_keygen preflight below in every test that calls repackage
+              # without a cipher, on machines that have no white-box build.
               cipher: str = "chacha20",
               abis: tuple[str, ...] = DEFAULT_ABIS,
               keystore: KeystoreInfo | None = None,
@@ -191,14 +219,13 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
               wb_keygen: str | None = None,
               allow_helper_log: bool = False,
               exclude_libs: list[str] | None = None,
-              no_default_exclude: bool = False,
               no_sign: bool = False,
               logger=print) -> RepackResult:
     # `None` means auto-select every lib/<abi>/*.so; an empty list is NOT the same thing
-    # (the CLI rejects an empty --libs file rather than silently widening the scope).
+    # (config.py rejects `libraries.include: []` rather than silently widening the scope).
     auto = wanted_libs is None
     wanted = None if auto else set(wanted_libs)
-    excludes = build_excludes(exclude_libs, no_default_exclude)
+    excludes = build_excludes(exclude_libs)
     abis_set = set(abis)
     result = RepackResult(output=out_apk)
 
@@ -377,7 +404,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                     "this APK has no lib/<abi>/*.so entries at all; nothing to encrypt.")
             raise RuntimeError(
                 f"none of the {candidates} lib/<abi>/*.so entries in this APK were packed: "
-                f"{len(result.untouched)} excluded or outside --abi "
+                f"{len(result.untouched)} excluded or outside `abis:` "
                 f"{','.join(sorted(abis_set))}, {len(result.failed)} could not be injected. "
                 "See the per-library reasons above.")
 
@@ -394,7 +421,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
         # happen, and it left a keystore behind on a machine that cannot sign at all.
         signer: list[str] | None = None
         if no_sign:
-            logger("  skipping signing (--no-sign)")
+            logger("  skipping signing (signing.sign: false)")
         else:
             try:
                 signer = apksigner_cmd()
@@ -404,14 +431,14 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                 # later. Refusing here would throw that away over a missing tool.
                 logger(f"  WARNING: {e}")
                 logger("  WARNING: leaving the output UNSIGNED. It cannot be installed as-is - "
-                       "sign it before `adb install`, or pass --no-sign to make this explicit.")
+                       "sign it before `adb install`, or set `signing.sign: false` to make this "
+                       "explicit.")
 
         if signer is None:
             result.signed = False
             shutil.copyfile(aligned, out_apk)
         else:
-            ks = keystore or KeystoreInfo(path=os.path.join(
-                os.path.expanduser("~"), ".sopack", "debug.keystore"))
+            ks = keystore or KeystoreInfo(path=DEFAULT_KEYSTORE_PATH)
             ensure_keystore(ks)
             sign_cmd = signer + [
                 "sign",

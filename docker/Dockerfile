@@ -92,11 +92,17 @@ RUN set -eu; \
 #                dies on failure, so without it `Host phases 1-4 PASS` never prints and
 #                artifact_generation.sh refuses to bundle.
 #   lief         what sopack does all its ELF surgery with.
+#   pyyaml       sopack's config file parser. Every setting except the input and output APK
+#                lives in config.yaml, so this is as hard a runtime requirement as lief - and
+#                it must be HERE, not left to pip: the entrypoint runs `pip install -e` inside
+#                a --system-site-packages venv, so a dependency missing from this layer sends
+#                that install to PyPI and an offline run dies there. Keep in step with
+#                pyproject.toml's `dependencies`.
 #   setuptools   the build backend for `pip install -e` and for the bundle's own wheel. Present
 #                explicitly because artifact_generation.sh tries an ISOLATED wheel build first,
 #                which would otherwise want to download it.
 RUN pip3 install --no-cache-dir --break-system-packages \
-        pytest 'lief>=1.0' 'setuptools>=68' wheel
+        pytest 'lief>=1.0' 'pyyaml>=6' 'setuptools>=68' wheel
 
 # ---- Android NDK r29 --------------------------------------------------------------------
 # Pinned to 29.0.14206865, which Google's own repository2-3.xml maps to android-ndk-r29-linux.zip.

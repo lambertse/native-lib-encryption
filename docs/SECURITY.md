@@ -16,14 +16,14 @@ The implementation of each measure is in
 | Metadata record whitened with a key derived from the stub's own code | ✅ shipped (device-confirmed) | No key and no magic in the file; recovery requires reversing the stub |
 | No magic at rest - the packer patches by known offset | ✅ shipped | Nothing to `grep` for; a pack-time guard proves it |
 | String hygiene - the `sopack` tag is obfuscated | ✅ shipped | The packer's name is absent from a `strings` dump |
-| The `--cipher wbaes` artifacts are stripped at pack time | ✅ shipped (host-verified) | Removes the single largest shortcut: named functions and the SDK's whole API |
+| The `cipher: wbaes` artifacts are stripped at pack time | ✅ shipped (host-verified) | Removes the single largest shortcut: named functions and the SDK's whole API |
 | Section-header stripping | ❌ removed | Incompatible with Android 14+ bionic; also low value once the key is unrecoverable |
 
 Confirmed end-to-end on-device (Android 16, arm64, a real Flutter app): the packed library
 decrypts and the app runs, with no SELinux `avc` denial, and neither `SOPK` nor `sopack`
 appears in the shipped library.
 
-With `--cipher wbaes` you additionally get **no portable key in the binary at all** - the
+With `cipher: wbaes` you additionally get **no portable key in the binary at all** - the
 long-term AES key is sealed into a white-box and never reconstructed at runtime. See the
 ceiling below for what that does and does not buy.
 
@@ -43,7 +43,7 @@ ceiling below for what that does and does not buy.
   server-derived key - are described in `technical/ARCHITECTURE.md` §9e; both leave the
   clean, prebuilt-blob architecture and are not the default.
 
-### The `--cipher wbaes` ceiling specifically
+### The `cipher: wbaes` ceiling specifically
 
 The white-box is Chow-style AES, academically broken by BGE-class attacks. It protects
 against **static** analysis, not dynamic. Key wrapping removes the "a portable key ships in
@@ -82,7 +82,7 @@ generalise to the others.
 
 - **The APK is re-signed with a generated key**, so the packed app has a *different signing
   identity* from your original. It cannot be shipped as an update to the original listing
-  unless you sign it with your own keystore (`--keystore`), and any service that pins your
+  unless you sign it with your own keystore (`signing.keystore.path`), and any service that pins your
   certificate will reject it.
 - **Integrity/tamper checks in the app may fire.** The libraries have been modified after
   build; an app that checksums its own natives, or a DRM/anti-tamper SDK, can notice. See

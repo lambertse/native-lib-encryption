@@ -182,7 +182,7 @@ No load bias is ever needed. This is why `decinfo.h` stores `delta_text` /
 
 Failures "fail open": if a syscall fails the stub jumps to the chain/return path rather
 than crashing, so a mis-encrypted library degrades instead of hard-crashing during
-diagnosis. (`--log` turns on staged `logd` diagnostics so you can see which stage ran.)
+diagnosis. (`logging.stub-log` turns on staged `logd` diagnostics so you can see which stage ran.)
 
 ### 4d. Two subtle stub correctness requirements
 
@@ -305,12 +305,14 @@ instead of on the device; it is deliberately loader-aware now.
 Source: `sopack/apk.py`, driven by `sopack/cli.py`.
 
 1. Unzip the APK; for each **selected** `lib/<abi>/<name>.so`, run Component 2. Selection
-   is either the explicit `--lib`/`--libs` list (by full path or bare basename → all ABIs)
-   or, when that list is omitted, **every** `lib/<abi>/*.so` in the input APK. Exclusion
-   patterns (`--exclude-lib` plus the built-in `libsopk_*` / `libflutter`) are checked
-   *before* selection, so they override an explicit `--lib` too. `libsopk_*` is
-   unconditional: those are sopack's own injected provider and thin helpers, and
-   auto-select on an already-packed APK would otherwise encrypt the decryptor.
+   is either the explicit `libraries.include` list (by full path or bare basename → all
+   ABIs) or, when that list is omitted, **every** `lib/<abi>/*.so` in the input APK.
+   Exclusion patterns (`libraries.exclude`, which ships listing `libsopk_*`,
+   `libvosWrapperEx` and `libflutter`) are checked *before* selection, so they override a
+   name in `libraries.include` too. The first two are **also** prepended unconditionally by
+   `build_excludes`, so deleting them from a config is a no-op: those are sopack's own
+   injected provider and thin helpers, and auto-select on an already-packed APK would
+   otherwise encrypt the decryptor.
    Enumeration reads only the **input** zip's entry list, so helpers added later in the
    same run can never be fed back through Component 2.
    Under auto-select an `InjectError` on one library is demoted to a **skip** (the original
@@ -451,8 +453,8 @@ gives an analyst nothing. See [`static-analysis-hardening.md`](./static-analysis
 The logcat **tag** `"sopack"` is the one constant that would name the packer in a `strings`
 dump (which scans raw bytes, section table or not). It is stored XOR-obfuscated in
 `stub_log.h` and decoded on-stack, so the name never appears in a packed lib. The staged
-`--log` debug labels (`A:entry`, …) remain in cleartext - they are generic markers, only
-emitted under `--log`, and not a reliable packer fingerprint; fuller message obfuscation is
+The staged debug labels (`A:entry`, …) remain in cleartext - they are generic markers, only
+emitted under `logging.stub-log`, and not a reliable packer fingerprint; fuller message obfuscation is
 a straightforward extension of the same helper.
 
 ### 9e. The ceiling, and two ways to break it (not the default)
@@ -501,7 +503,7 @@ stub/                 the injected runtime stub (C)
   stub.c              sopk_entry: mmap/decrypt/mremap-onto-base/mprotect/flush/chain
   syscalls.h          per-ABI raw syscalls, page-size probe, memcpy, I-cache flush
   stub_cipher.h       ChaCha20 / XOR - mirror of cipher.py
-  stub_log.h          freestanding logd writer (the --log confirmation line)
+  stub_log.h          freestanding logd writer (the logging.stub-log confirmation line)
   decinfo.h           the 128-byte injector↔stub contract
   stub.ld             link at vaddr 0 → flat R+X image
   build_stubs.sh      NDK/LLVM build → flat blobs + offsets; fails on any relocation
@@ -514,13 +516,13 @@ docs/                 this documentation
 
 ---
 
-## 11. `--cipher wbaes` - the white-box key-wrap mode
+## 11. `cipher: wbaes` - the white-box key-wrap mode
 
 *For the boundary with the whitebox-cryptography SDK itself - the API surface consumed vs refused,
 the artifact flow, the version contract and the upgrade checklist - see
 [`wbc-integration.md`](./wbc-integration.md). This section is the reasoning behind it.*
 
-An alternative to §4's freestanding stub, selected with `--cipher wbaes`. Everything in
+An alternative to §4's freestanding stub, selected with `cipher: wbaes`. Everything in
 §§1–2 still applies (`execmem` not `execmod`, no W+X, I-cache flush, 16 KB pages); what
 changes is *where the decryptor lives* and *where the key lives*.
 
@@ -707,16 +709,16 @@ device.
 Where the key comes from, how it is embedded, and how it is recovered at load. Everything below
 is drawn from the code; §§4–5 and §11 argue *why* each step exists.
 
-**There are two key paths, not three.** `--cipher xor` and `--cipher chacha20` share one path
+**There are two key paths, not three.** `cipher: xor` and `cipher: chacha20` share one path
 completely - same `sopk_decinfo`, same whitening, same stub, same delivery; only the bulk
-primitive differs. Call that **stub mode**. `--cipher wbaes` is the other. Both use the same
+primitive differs. Call that **stub mode**. `cipher: wbaes` is the other. Both use the same
 16-byte nonce block convention (12-byte ChaCha20 nonce ‖ 4-byte little-endian counter), so the
 nonce is never a point of difference.
 
 ### 12a. Stub mode - pack time (how the key is embedded)
 
 ```
-HOST - sopack pack --cipher chacha20|xor
+HOST - sopack pack, cipher: chacha20|xor
 ─────────────────────────────────────────────────────────────────────────────────
   cipher.gen_key_nonce()
     ├── key32   = urandom(32)
@@ -782,7 +784,7 @@ DEVICE - bionic runs DT_INIT before DT_INIT_ARRAY
 ### 12c. `wbaes` mode - pack time (how the key is embedded)
 
 ```
-HOST - sopack pack --cipher wbaes            (provision.py:provision_text)
+HOST - sopack pack, cipher: wbaes            (provision.py:provision_text)
 ─────────────────────────────────────────────────────────────────────────────────
   gen_wbaes_params() ──▶ kek16, sk32, wrap_iv16, nonce16
   passphrase = token_hex(16)        seed = randbits(64)

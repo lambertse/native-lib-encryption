@@ -14,7 +14,7 @@ Start here if you want to pack an APK.
 - **[SECURITY.md](./SECURITY.md)** - what this actually protects, the honest ceiling, and
   what is deliberately left visible. Read it before describing sopack to anyone else.
 - **[TROUBLESHOOTING.md](./TROUBLESHOOTING.md)** - concrete failure modes (SIGILL at load,
-  missing logcat line, signing/tamper issues, the `--cipher wbaes` fail codes, toolchain
+  missing logcat line, signing/tamper issues, the `cipher: wbaes` fail codes, toolchain
   errors) with causes and fixes.
 
 ## Changing sopack
@@ -26,7 +26,7 @@ stub, or the white-box integration; you do not need them to use the tool.
   constraints that shape the design, the three components (runtime stub, ELF injector, APK
   repackager), the reasoning and hard-won insights behind each decision, and the key
   lifecycle in both cipher modes.
-- **[technical/WBAES.md](./technical/WBAES.md)** - everything about `--cipher wbaes`.
+- **[technical/WBAES.md](./technical/WBAES.md)** - everything about `cipher: wbaes`.
   Part I is the boundary with the **whitebox-cryptography** SDK: the version contract, what
   sopack consumes and refuses, the artifact flow, and what an upstream change breaks. Part II
   is the six-phase build-and-verify procedure. Read it before using or upgrading that mode -

@@ -52,7 +52,7 @@ Easiest is the per-cipher wrapper, which also runs the tests and prints the pack
 ./scripts/build_chacha20.sh --ndk /path/to/Android/sdk/ndk/<version> --api 24
 ```
 
-For `--cipher wbaes` the equivalent is `./scripts/build_wbaes.sh`, which additionally builds
+For `cipher: wbaes` the equivalent is `./scripts/build_wbaes.sh`, which additionally builds
 the white-box artifacts and **both** per-ABI skeletons (the thin helper and the shared
 provider) - see [technical/WBAES.md](./technical/WBAES.md). It needs the
 whitebox-cryptography SDK and an NDK; `--host-only` runs the parts that do not.
@@ -101,38 +101,62 @@ export SOPACK_APKSIGNER_JAR="$ANDROID_SDK_ROOT/build-tools/34.0.0/lib/apksigner.
 
 ## 4. Pack an APK
 
+The command line carries only the input and output APK; everything else is in a YAML config.
+
 ```bash
-sopack pack in.apk \
-    -o out.apk \
-    --exclude-lib 'libc++_shared,libmy*' \
-    --cipher chacha20 \
-    --log \
-    --keystore "$HOME/.sopack/debug.keystore"
+sopack init-config              # writes ./config.yaml, every key at its default
 ```
 
-`--cipher chacha20` is spelled out here because the **default is `wbaes`**, which needs the
-per-ABI artifacts `./scripts/build_wbaes.sh` builds. `--log` is a stub-cipher option, so the
-two go together. `--verify` is the default and is omitted.
+```yaml
+# config.yaml
+cipher: chacha20
+libraries:
+  exclude: [libc++_shared, 'libmy*']
+logging:
+  stub-log: true
+signing:
+  keystore:
+    path: ${HOME}/.sopack/debug.keystore
+```
 
-- **Library selection is optional.** Omit `--lib`/`--libs` and every `lib/<abi>/*.so` in
-  the APK is encrypted, for the ABIs `--abi` selects.
-- `--lib` names the libraries to encrypt explicitly. It is **repeatable and/or
-  comma-separated** (`--lib a.so,b.so`, `--lib a.so --lib b.so`, or a mix). A bare basename
-  (`libapp.so`) matches that library in **every** selected ABI; a full path
-  (`lib/arm64-v8a/libapp.so`) targets one ABI. For many libraries you can instead use
-  `--libs libs.txt` (one entry per line; `#` comments allowed).
-- **Failure semantics differ between the two.** A library that cannot be injected aborts
-  the pack when you named it explicitly, but is **skipped with a warning** under
-  auto-select (it then ships in cleartext). Either way the run prints a per-ABI summary of
-  what was injected, skipped, and not selected - check it before shipping.
-- `--exclude-lib` - fnmatch globs against the basename, `.so` suffix optional; repeatable
-  and/or comma-separated. **Exclusion always wins**, including over an explicit `--lib`.
-  Applied on top of two built-in sets: `libsopk_*` (sopack's own injected provider and thin
-  helpers - **never** removable, they are what performs the decryption) and `libflutter`
-  (excluded by policy; `--no-default-exclude` turns that one off).
-- `--abi` - defaults to **`arm64-v8a` alone**, the only ABI protected in practice. Pass
-  `--abi all` for all three, or a comma list such as `--abi arm64-v8a,x86_64`.
-- `--cipher` - `wbaes` (**default**), `chacha20`, or `xor`. The latter two use the
+```bash
+sopack pack in.apk -o out.apk   # picks up ./config.yaml
+```
+
+`cipher: chacha20` is spelled out there because the **default is `wbaes`**, which needs the
+per-ABI artifacts `./scripts/build_wbaes.sh` builds. `logging.stub-log` is a stub-cipher option,
+so the two go together. `signing.verify` is on by default and is omitted.
+
+sopack reads `--config PATH` if you pass one, else `./config.yaml`, else its built-in defaults;
+a missing `./config.yaml` is not an error, so a bare `sopack pack in.apk -o out.apk` works. An
+**unknown or misplaced key is an error**, at every nesting level, so a typo or a key written
+under the wrong section fails loudly instead of being silently ignored.
+
+Every key, with its default:
+
+- `libraries.include` - **optional.** Leave it out (or null) and every `lib/<abi>/*.so` in the
+  APK is encrypted, for the ABIs `abis:` selects. A list names them explicitly, matched exactly
+  like `exclude` below: a bare basename (`libapp`) matches that library in **every** selected
+  ABI, a full path (`lib/arm64-v8a/libapp.so`) targets one ABI, fnmatch globs work, and the
+  trailing `.so` is **optional** - `libapp`, `libapp.so` and `lib/arm64-v8a/libapp.so` all
+  select the same library. An **empty list is an error**, not a request for auto-select - see
+  the next point for why the two cannot be conflated.
+- **Failure semantics differ between the two modes.** A library that cannot be injected aborts
+  the pack when you named it explicitly, but is **skipped with a warning** under auto-select (it
+  then ships in cleartext). Either way the run prints a per-ABI summary of what was injected,
+  skipped, and not selected - check it before shipping.
+- `libraries.exclude` - fnmatch globs against the basename, `.so` suffix optional.
+  **Exclusion always wins**, including over a name in `include`. Every generated config spells
+  the list out rather than hiding it behind a toggle, and it ships with three entries:
+  `libsopk_*` and `libvosWrapperEx` (**also enforced in code** - deleting them from your config
+  is a no-op; the first is sopack's own provider and thin helpers, i.e. what performs the
+  decryption, the second is the already-self-protected V-Key/V-OS wrapper) and `libflutter`
+  (policy only - see §7 Reminders; delete it and it gets packed). An empty list is
+  allowed here, unlike `include: []`, because it can only narrow protection back to the two
+  enforced patterns.
+- `abis` - defaults to **`arm64-v8a` alone**, the only ABI protected in practice. Use
+  `abis: all` for all three, or list them (`abis: [arm64-v8a, x86_64]`).
+- `cipher` - `wbaes` (**default**), `chacha20`, or `xor`. The latter two use the
   freestanding stub and need no build step, but ship the raw key in the binary (whitened).
   `wbaes` is white-box AES-128 key wrapping via injected helpers: it ships no portable key,
   but it has prerequisites the other modes do not - whitebox-cryptography >= 3.0.0 (the
@@ -140,27 +164,31 @@ two go together. `--verify` is the default and is omitted.
   the thin helper `sopk_rt_<abi>.so` **and** the shared white-box provider
   `sopk_wb_<abi>.so`. `./scripts/build_wbaes.sh` produces all of them in one command; read
   [technical/WBAES.md](./technical/WBAES.md) before using this mode.
-- There is **no `--wb-keygen`**. `provision.find_wb_keygen` probes, in order:
-  `vendor/wbc/bin/wb_keygen` (what `build_wbaes.sh` installs), the portable bundle beside an
-  installed venv, `$SOPACK_WBKEYGEN`, then `PATH`. The env var deliberately ranks *below* the
-  local build, so a stale export cannot beat the keygen the build just verified.
-- `--no-verify` - skip the post-signing `apksigner` certificate dump. Verification is **on by
-  default**. `--verify` still exists for explicitness; the two are last-flag-wins, so
-  `--no-verify --verify` verifies.
-- `--min-sdk` - minimum SDK passed through to `apksigner`.
-- `--allow-helper-log` - permit packing a *tracing* wbaes skeleton (built with
+- There is **no `--wb-keygen` flag and no config key for one**. `provision.find_wb_keygen`
+  probes, in order: `vendor/wbc/bin/wb_keygen` (what `build_wbaes.sh` installs), the portable
+  bundle beside an installed venv, `$SOPACK_WBKEYGEN`, then `PATH`. The env var deliberately
+  ranks *below* the local build, so a stale export cannot beat the keygen the build just
+  verified - a config key would re-open that ordering for no gain.
+- `signing.verify` - **true by default**; print the signer certificate after signing. Set it
+  false to skip the post-signing `apksigner` certificate dump.
+- `signing.sign` - **true by default**. False leaves the output UNSIGNED for a later signing
+  step, and skips generating a debug keystore.
+- `signing.min-sdk` - minimum SDK passed through to `apksigner`.
+- `signing.keystore.path` - auto-generated on first use (self-signed, password `sopack`).
+  Reuse the same file to keep a stable signing identity across rebuilds. Null means
+  `~/.sopack/debug.keystore`. `alias`, `store-pass` and `key-pass` sit beside it, and
+  `${VAR}` is expanded from the environment **in this block only** so a committed config need
+  not hold a real password - an unset variable is an error rather than an empty password.
+- `logging.allow-helper-log` - permit packing a *tracing* wbaes skeleton (built with
   `-DSOPK_RT_LOG`). Warns on every pack; the result is **not shippable**. Only for a first
   device bring-up.
-- `--log` - the stub emits a logcat confirmation on the device (see §5). Omit for a
-  silent stub. (Stub ciphers only - for `wbaes` tracing, see `--allow-helper-log` above.)
-- `--keystore` - auto-generated on first use (self-signed, password `sopack`). Reuse
-  the same file to keep a stable signing identity across rebuilds. Defaults to
-  `~/.sopack/debug.keystore`.
-- `--verify` - print the signer certificate after signing.
+- `logging.stub-log` - the stub emits a logcat confirmation on the device (see §5). Leave it
+  false for a silent stub. (Stub ciphers only - for `wbaes` tracing, see
+  `logging.allow-helper-log` above.)
 
 The injector runs a **self-verification** on every library (round-trip decrypt, vaddr
 stability, 16 KB congruence, correct hook target, no `TEXTREL`) and aborts with a clear
-error rather than emitting a silently-broken `.so`. For `--cipher wbaes` it additionally
+error rather than emitting a silently-broken `.so`. For `cipher: wbaes` it additionally
 checks, after all libraries are done, that every thin helper's provider was emitted - a
 per-library check cannot see that, and a missing provider fails on every device launch.
 
@@ -185,15 +213,15 @@ apksigner verify --print-certs out.apk        # or: java -jar "$SOPACK_APKSIGNER
 ```bash
 adb install -r out.apk
 adb logcat -s sopack:I
-#   expect (with --log):  I sopack : native .text decrypted OK
+#   expect (logging.stub-log: true):  I sopack : native .text decrypted OK
 adb logcat | grep -iE 'avc: denied|SIGSEGV|SIGILL'   # must stay empty
 ```
 
 One `sopack` line appears per encrypted library that actually loads (normally just the
-one for the device's ABI). No line ⇒ either you didn't pass `--log`, the device loaded
+one for the device's ABI). No line ⇒ either `logging.stub-log` was false, the device loaded
 a different (unencrypted) ABI, or decryption didn't run.
 
-For `--cipher wbaes` the tags are different - `sopk_rt` (each thin helper) and `sopk_wb`
+For `cipher: wbaes` the tags are different - `sopk_rt` (each thin helper) and `sopk_wb`
 (the shared provider) - and a release build logs **nothing** at all; it fails closed with
 an abort instead. Use `adb logcat -s sopk_rt sopk_wb DEBUG`, and see
 [technical/WBAES.md](./technical/WBAES.md) Phase 6 for the full device procedure.
@@ -206,7 +234,7 @@ Neither is on the critical path for a single pack, and both are easy to miss.
 
 ### `scripts/device_test.sh` - the whole corpus, on a real device
 
-Packs every APK in `test_apks/` with `--cipher wbaes`, installs and launches each one, and
+Packs every APK in `test_apks/` with `cipher: wbaes`, installs and launches each one, and
 reports whether the injected helper actually decrypted what the packer claims it encrypted.
 The pass criterion is deliberately stricter than "no crash": a library that was packed but
 whose helper constructor never ran produces **no crash and no message**, so the script
@@ -220,7 +248,8 @@ it injected, and calls a mismatch `WARN`.
 ./scripts/device_test.sh --dry-run              # preflight only, touch no device
 ```
 
-It builds `--trace` skeletons, so the APKs it produces need `pack --allow-helper-log` and log
+It builds `--trace` skeletons, so the APKs it produces need `logging.allow-helper-log: true`
+in the pack config - which the harness writes for itself - and log
 the target name, `.text` address and size. **They are diagnostic builds; do not ship them.**
 Results land in `output/testrun/`, one directory per APK plus a `summary.md`.
 
@@ -269,7 +298,8 @@ the machine with no toolchain to diagnose it.
 
 If you last ran `device_test.sh`, `sopack/stubs/` holds its **`--trace`** skeletons and this
 script refuses them - they log the target `.text` address and size, and `sopack pack` rejects
-them without `--allow-helper-log`. Both scripts write to the same paths, so the refusal is
+them without `logging.allow-helper-log: true`. Both scripts write to the same paths, so the
+refusal is
 expected, not a bug: re-run `./scripts/build_wbaes.sh` (release is the default) first, or drop
 `--skip-build` and let the generator do it.
 
@@ -277,7 +307,7 @@ On the receiving machine:
 
 ```bash
 cd /path/to/bundle && ./install.sh
-./venv/bin/sopack pack app.apk --cipher wbaes -o packed.apk --verify
+./venv/bin/sopack pack app.apk -o packed.apk --config ./config.yaml
 ```
 
 `install.sh` verifies the checksums (**before** it installs anything - the wheel is inside the

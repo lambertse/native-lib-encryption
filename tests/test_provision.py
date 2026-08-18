@@ -143,9 +143,10 @@ def test_pack_key_never_exposes_the_long_term_key():
 
 # ---- find_wb_keygen: discovery, not configuration ---------------------------------------
 #
-# `sopack pack` has no --wb-keygen flag and --cipher wbaes is the default, so the probe order
-# below IS the user interface. If it regresses, the tool stops working with no flag to fall
-# back on, which is why these are pinned rather than left to integration.
+# `sopack pack` has no --wb-keygen flag AND no config key for one, and `cipher: wbaes` is the
+# default, so the probe order below IS the user interface. If it regresses, the tool stops
+# working with nothing to fall back on, which is why these are pinned rather than left to
+# integration.
 
 
 def _exe(path, body=b"#!/bin/sh\nexit 0\n"):
@@ -224,7 +225,7 @@ def test_not_found_names_the_build_script_and_never_the_removed_flag(isolated_pr
     msg = str(e.value)
     assert "--wb-keygen" not in msg
     assert "build_wbaes.sh" in msg
-    assert "--cipher chacha20" in msg          # the no-white-box escape hatch
+    assert "cipher: chacha20" in msg           # the no-white-box escape hatch
 
 
 def test_bundle_probe_requires_a_sibling_manifest(monkeypatch, tmp_path):

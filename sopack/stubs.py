@@ -15,9 +15,9 @@ _STUB_DIR = Path(__file__).resolve().parent / "stubs"
 # Map APK lib/<abi> directory names to our stub ABI keys (identical here, but explicit).
 SUPPORTED_ABIS = ("arm64-v8a", "armeabi-v7a", "x86_64")
 
-# Packed when --abi is omitted. arm64-v8a is the only ABI protected in practice (see
+# Packed when `abis:` is omitted. arm64-v8a is the only ABI protected in practice (see
 # CLAUDE.md "Only arm64-v8a is protected in practice, by deliberate scope choice"), so the
-# others must be opted into explicitly. `--abi all` spells out SUPPORTED_ABIS.
+# others must be opted into explicitly. `abis: all` spells out SUPPORTED_ABIS.
 DEFAULT_ABIS = ("arm64-v8a",)
 
 
@@ -52,7 +52,7 @@ def load_stub(abi: str) -> Stub:
                 decinfo_off=int(meta["decinfo_off"]))
 
 
-# ---- wbaes helper skeleton (--cipher wbaes) ---------------------------------------
+# ---- wbaes helper skeleton (cipher: wbaes) ----------------------------------------
 def helper_skeleton_path(abi: str) -> Path:
     """Path to the user-built white-box helper skeleton for `abi`.
 
@@ -66,14 +66,14 @@ def helper_skeleton_path(abi: str) -> Path:
     if not p.exists():
         raise StubMissingError(
             f"wbaes helper skeleton for {abi} not found ({p.name} in {_STUB_DIR}).\n"
-            f"  --cipher wbaes is the default, and it needs per-ABI artifacts that are built, "
+            f"  cipher: wbaes is the default, and it needs per-ABI artifacts that are built, "
             f"not committed. Either:\n"
             f"    * run ./scripts/build_wbaes.sh --abi {abi}   (needs the NDK; builds the "
             f"pinned whitebox-cryptography submodule), or\n"
             f"    * install from a portable bundle (artifacts/install.sh), which carries them, "
             f"or\n"
-            f"    * pass --cipher chacha20 to pack without a white-box.\n"
-            f"  Note a bundle carries ONE ABI's skeletons, so --abi all needs a build per ABI.")
+            f"    * set `cipher: chacha20` in your config to pack without a white-box.\n"
+            f"  Note a bundle carries ONE ABI's skeletons, so `abis: all` needs a build per ABI.")
     return p
 
 
@@ -93,12 +93,12 @@ def provider_skeleton_path(abi: str) -> Path:
         raise StubMissingError(
             f"wbaes white-box provider skeleton for {abi} not found ({p.name} in "
             f"{_STUB_DIR}).\n"
-            f"  --cipher wbaes is the default, and it needs per-ABI artifacts that are built, "
+            f"  cipher: wbaes is the default, and it needs per-ABI artifacts that are built, "
             f"not committed. Either:\n"
             f"    * run ./scripts/build_wbaes.sh --abi {abi}   (needs the NDK; builds the "
             f"pinned whitebox-cryptography submodule), or\n"
             f"    * install from a portable bundle (artifacts/install.sh), which carries them, "
             f"or\n"
-            f"    * pass --cipher chacha20 to pack without a white-box.\n"
-            f"  Note a bundle carries ONE ABI's skeletons, so --abi all needs a build per ABI.")
+            f"    * set `cipher: chacha20` in your config to pack without a white-box.\n"
+            f"  Note a bundle carries ONE ABI's skeletons, so `abis: all` needs a build per ABI.")
     return p

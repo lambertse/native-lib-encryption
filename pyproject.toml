@@ -14,6 +14,12 @@ dependencies = [
     # 1.0.0 is verified clean on all three wbaes artifacts (target, thin helper, shared provider)
     # for that same library. See docs/TROUBLESHOOTING.md §16 KB.
     "lief>=1.0",
+    # The config file parser. Everything except the input and output APK is configured in
+    # YAML now (sopack/config.py), so this is a hard runtime requirement, not an extra.
+    # Two build paths pre-stage sopack's dependencies so they need no network at run time -
+    # docker/Dockerfile's system pip layer and the portable bundle's install.sh - and both
+    # name their packages explicitly. Adding a dependency here means adding it there too.
+    "pyyaml>=6",
 ]
 
 [project.scripts]

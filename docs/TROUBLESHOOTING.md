@@ -3,7 +3,8 @@
 Concrete failure modes seen with sopack, what causes each, and how to confirm/fix.
 Background for all of these is in [`technical/ARCHITECTURE.md`](./technical/ARCHITECTURE.md).
 
-The single most useful diagnostic is packing with **`--log`** and reading logcat:
+The single most useful diagnostic is packing with **`logging.stub-log: true`** in your config
+and reading logcat:
 
 ```bash
 adb logcat -s sopack:I
@@ -16,7 +17,7 @@ The stub emits staged lines (`A:entry`, `B:…`, `C:mmap…`, `D:decrypt…`, `E
 
 ## `error: could not find a host wb_keygen` on a fresh checkout
 
-`--cipher wbaes` is the **default**, and it needs artifacts that are built rather than
+`cipher: wbaes` is the **default**, and it needs artifacts that are built rather than
 committed. Nothing is wrong; the build step has not been run:
 
 ```bash
@@ -34,7 +35,7 @@ Three ways out, in order of preference:
 
 - run the build above (needs the NDK, macOS or Linux/x86_64 for O-MVLL, and network once);
 - install from a portable bundle (`artifacts/install.sh`), which carries all of it prebuilt;
-- pack with **`--cipher chacha20`**, which needs no build at all but ships the key inside the
+- pack with **`cipher: chacha20`**, which needs no build at all but ships the key inside the
   library (whitened). This is the right answer for a quick test, not for a release.
 
 **A plain `pip install .` from a checkout cannot work with the default cipher**, even after
@@ -80,7 +81,7 @@ If you're on an old build, re-pack with current sopack. (`_self_verify` now asse
 is only correct when the injected segment loads at a **page-aligned** vaddr. Different
 LIEF versions place the segment at different alignments; a non-page-aligned placement
 made `adrp` mis-address the key/flags → garbage decrypt (and, because the flags were
-misread, no `--log` line, so it looked like the stub never ran).
+misread, no stub-log line, so it looked like the stub never ran).
 
 **Status:** fixed. The arm64 stub is built with **`-mcmodel=tiny`** (emits `adr`,
 byte-relative, alignment-independent), and `build_stubs.sh` fails if any `adrp` remains.
@@ -140,7 +141,7 @@ though such a build would be correct - see the gaps in
 step by step, what the decryptor's page window does to a 4 KB-aligned library and why the
 resulting crash lands far from the cause.
 
-**Note the default cipher reports this differently.** Only `--cipher wbaes` names the input;
+**Note the default cipher reports this differently.** Only `cipher: wbaes` names the input;
 `chacha20`/`xor` raise a bare `LOAD seg align 4096 not multiple of 16384` for the identical
 cause. If you see that, check the input's `readelf -lW` before suspecting the packer.
 
@@ -175,7 +176,7 @@ larger libraries while smaller ones pack cleanly. This is the same hazard that m
 `add(seg)` is normally safe, but not on every LIEF version.
 
 Observed on a macOS host with LIEF **`0.17.0`** packing a 1.66 MB arm64 library
-(`libvosWrapperEx.so`, `--cipher wbaes`). On LIEF **`1.0.0`**, same file and same sopack commit,
+(`libvosWrapperEx.so`, `cipher: wbaes`). On LIEF **`1.0.0`**, same file and same sopack commit,
 all three artifacts come out clean - target (2 LOADs in, 3 out, all `0x4000`), thin helper
 (6 LOADs), and provider (4 LOADs), every one `0x4000`-aligned and congruent. The provider was
 checked with a *synthetic* region of representative size (~455 KB blob) rather than a real seal,
@@ -195,7 +196,8 @@ segments, so four printed lines means you ran it on the same file twice, not tha
 output.
 
 **Workarounds if `>=1.0` still fails:** report it with the table row it named, exclude that library
-(`--exclude-lib libfoo`, or leave it out of `--lib`), or pack it only for a device class that does
+(add it to `libraries.exclude`, or leave it out of `libraries.include`), or pack it only for a
+device class that does
 not require 16 KB pages. Under auto-select this failure is already demoted to a per-library skip -
 the library then ships in cleartext, which the run summary calls out.
 
@@ -208,7 +210,7 @@ hardware, which Play requires 64-bit apps to support - the failure is the guard 
 
 Not necessarily a failure. Check, in order:
 
-1. **Did you pass `--log`?** Without it the stub is silent by design.
+1. **Is `logging.stub-log: true` in your config?** Without it the stub is silent by design.
 2. **Which ABI loaded?** The device loads one ABI. If you only encrypted `arm64-v8a`
    but the device pulled `armeabi-v7a`, it loaded the *unencrypted* copy - nothing to
    report. Encrypt the ABI your device uses (or all of them).
@@ -258,20 +260,23 @@ the re-sign."
 
 ## `error: no .so entries matched the requested list; nothing to encrypt`
 
-The names you passed to `--lib`/`--libs` didn't match any `lib/<abi>/<name>.so` in the APK.
+The names in `libraries.include` didn't match any `lib/<abi>/<name>.so` in the APK.
 
-- If your `requested=[...]` shows a single element containing commas, you passed a
-  comma list to a build without comma support - either update sopack (current `--lib`
-  splits on commas) or repeat the flag: `--lib a.so --lib b.so`.
+- The trailing `.so` is optional and fnmatch globs work, so `libapp`, `libapp.so` and
+  `lib/arm64-v8a/libapp.so` are equivalent. (Before this was fixed, `include` required an
+  exact string while `exclude` two lines below it did not, so a bare `libapp` matched
+  nothing and produced exactly this error.)
+- If one entry contains commas, you wrote a comma list where YAML wants a list. Each name
+  is its own `- ` item; commas are part of the name.
 - Confirm the exact names/ABIs present:
 
   ```bash
   python3 -c "import zipfile;[print(n) for n in zipfile.ZipFile('in.apk').namelist() if n.startswith('lib/') and n.endswith('.so')]"
   ```
 - A bare basename matches every selected ABI; make sure the library actually ships for
-  the ABI you passed to `--abi`. **`--abi` defaults to `arm64-v8a` alone** - if the library
-  is only present for another ABI, pass `--abi all` or name that ABI.
-- Dropping `--lib`/`--libs` entirely encrypts every `lib/<abi>/*.so` and sidesteps the
+  an ABI in `abis:`. **`abis:` defaults to `arm64-v8a` alone** - if the library is only
+  present for another ABI, use `abis: all` or name that ABI.
+- Removing `libraries.include` entirely encrypts every `lib/<abi>/*.so` and sidesteps the
   question.
 
 ---
@@ -283,10 +288,10 @@ reasons are printed above the error.
 
 - `excluded by 'libsopk_*'` on **every** entry means you are re-packing an already-packed
   APK. Pack the original.
-- `abi not selected` on every entry means the APK ships no `arm64-v8a` libraries; pass
-  `--abi all` or the ABI it does ship.
-- `excluded by '...'` from your own `--exclude-lib` - loosen the glob. Note it also
-  overrides an explicit `--lib`.
+- `abi not selected` on every entry means the APK ships no `arm64-v8a` libraries; use
+  `abis: all` or name the ABI it does ship.
+- `excluded by '...'` from your own `libraries.exclude` - loosen the glob. Note it also
+  overrides a name in `libraries.include`.
 - Everything failing to inject points at a shared cause; read the individual messages and
   see the per-library sections above.
 
@@ -294,7 +299,7 @@ reasons are printed above the error.
 
 ## A library I expected to be encrypted shipped in cleartext
 
-Under auto-select (no `--lib`/`--libs`) an injection failure is a **warning, not an error** -
+Under auto-select (no `libraries.include`) an injection failure is a **warning, not an error** -
 the original library is written back unchanged so the pack still produces a working APK.
 Check the run's summary:
 
@@ -304,11 +309,12 @@ Skipped (selected but could not be injected - these ship in CLEARTEXT):
 ```
 
 Look the reason up in this document. To make that failure fatal instead, name the library
-explicitly with `--lib libfoo.so` - explicit selection never degrades to a skip.
+explicitly in `libraries.include` - explicit selection never degrades to a skip.
 
-Also check the `Not selected:` block - `libflutter` and `libsopk_*` are excluded by default
-(`--no-default-exclude` drops the former; the latter is unconditional), and anything outside
-`--abi` is listed as `abi not selected`.
+Also check the `Not selected:` block. Every generated config ships `libraries.exclude` listing
+`libsopk_*`, `libvosWrapperEx` and `libflutter`, so those appear here by default - delete
+`libflutter` from your config to pack it, but note the other two are enforced in code and stay
+excluded whatever the config says. Anything outside `abis:` is listed as `abi not selected`.
 
 ---
 
@@ -335,7 +341,7 @@ explicit `(long)` cast. Rebuild with `bash stub/build_stubs.sh`.
 
 ---
 
-# `--cipher wbaes` failures
+# `cipher: wbaes` failures
 
 This mode **fails closed**: instead of degrading, every failure path calls `abort()`. That is
 deliberate - the helper has no fallback, so returning would leave the target running encrypted

@@ -10,7 +10,7 @@ dead ends.
 
 ---
 
-## 1. One KEK / one blob / one shared white-box provider (`--cipher wbaes`) - **SHIPPED**
+## 1. One KEK / one blob / one shared white-box provider (`cipher: wbaes`) - **SHIPPED**
 
 Landed as the **v3 provider split** (commit `ed4aa23`). This entry is kept for the measurement and
 for the shapes it rules out; there is nothing left to do here.
@@ -38,7 +38,7 @@ alone accounts for roughly **3.7 MB → 991 KB**.
 
 **The N = 1 caveat is still live.** The win is per *additional* library; the first one still costs
 ~950 KB. Protecting a single library per ABI is the case where this mode's footprint is hardest to
-justify, and `--cipher chacha20` (which adds no files at all, at the cost of shipping the key
+justify, and `cipher: chacha20` (which adds no files at all, at the cost of shipping the key
 whitened in the binary) remains the honest alternative there.
 
 **The shape to avoid.** Earlier drafts of `CLAUDE.md` named the fix as "one helper carrying N
@@ -121,7 +121,7 @@ cleartext `.text`, so an analyst after the *algorithm* reads the x86_64 build an
 the encryption. This is the single largest gap between what the tool does and what "the code is
 encrypted" sounds like, and it is worth stating in any threat-model conversation.
 
-Note `--cipher wbaes` on x86_64 also needs a provider built for that ABI. Since improvement 1
+Note `cipher: wbaes` on x86_64 also needs a provider built for that ABI. Since improvement 1
 shipped there is one KEK per **(pack, ABI)**, so that provider must be sealed with its own key and
 must **not** share arm64's long-term key.
 

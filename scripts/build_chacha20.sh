@@ -36,7 +36,10 @@ while [ "$#" -gt 0 ]; do
         --ndk)        NDK_ARG="$2"; shift 2 ;;
         --api)        API="$2"; shift 2 ;;
         --skip-tests) SKIP_TESTS=1; shift ;;
-        -h|--help)    sed -n '2,28p' "$0"; exit 0 ;;
+        # 2..22 is the header comment block, ending the line before `set -euo pipefail`.
+        # Adjust if the header grows, or --help truncates / starts printing shell code - the
+        # range said 28, which printed `set -euo pipefail` and the next six lines of script.
+        -h|--help)    sed -n '2,22p' "$0"; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
@@ -85,18 +88,23 @@ cat <<EOF
 
   cd "$SOPACK"
   mkdir -p output
-  python3 -m sopack.cli pack <your.apk> \\
-    --lib "libfoo.so,libbar.so" \\
-    --cipher chacha20 \\
-    --abi arm64-v8a \\
-    -o output/packed.apk \\
-    --log \\
-    --verify
+  python3 -m sopack.cli init-config          # writes ./config.yaml, every key at its default
 
-  Quote the --lib list: it is ONE argv word, so an unquoted space after a comma makes
-  argparse reject the second name.
-  --log makes the stub emit a logcat confirmation line; drop it for a silent stub.
+  # then set these in it - the defaults are wbaes and every lib/<abi>/*.so:
+  #   cipher: chacha20
+  #   libraries:
+  #     include:
+  #       - libfoo.so
+  #       - libbar.so
+  #   logging:
+  #     stub-log: true                       # a logcat confirmation line on decrypt
 
-Unlike --cipher wbaes, the key ships inside each packed library (whitened, not plaintext).
+  python3 -m sopack.cli pack <your.apk> -o output/packed.apk
+
+  The command line carries only the input and output APK; everything else lives in the config
+  file, which the pack picks up from the current directory. Leave \`libraries.include\` out
+  entirely to encrypt every lib/<abi>/*.so instead of naming them.
+
+Unlike cipher wbaes, the key ships inside each packed library (whitened, not plaintext).
 See docs/technical/ARCHITECTURE.md §9 for what that does and does not buy you.
 EOF

@@ -265,12 +265,12 @@ Three gaps, in the order they hurt:
    `_self_verify` (chacha20/xor, `elf_inject.py:1556-1564`) does neither - it checks every LOAD
    on every ABI and raises a bare `LOAD seg align 4096 not multiple of 16384`. Same library,
    same cause, an error that sends the reader hunting for a packer bug. It also means that
-   **under `--abi all`** an `armeabi-v7a` or `x86_64` input can be rejected over a device class
-   that cannot run it - 16 KB page hardware is arm64-only. (The `--abi` default of `arm64-v8a`
+   **under `abis: all`** an `armeabi-v7a` or `x86_64` input can be rejected over a device class
+   that cannot run it - 16 KB page hardware is arm64-only. (The `abis:` default of `arm64-v8a`
    alone keeps that out of the way in normal use, which shrinks the blast radius without fixing
    it.) A known gap, recorded in `CLAUDE.md` as *"an intent the stub path does not yet
    implement"*.
-3. **`--abi` cannot express "4 KB devices only".** The device-class distinction the error message
+3. **`abis:` cannot express "4 KB devices only".** The device-class distinction the error message
    invokes has no representation anywhere in the tool.
 
 None of that is a reason to weaken the check. §4 is: the guard is refusing to emit an artifact

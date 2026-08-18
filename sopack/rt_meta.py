@@ -1,4 +1,4 @@
-"""Pack/parse the two `--cipher wbaes` metadata regions. MUST match stub/sopk_rt.h exactly
+"""Pack/parse the two `cipher: wbaes` metadata regions. MUST match stub/sopk_rt.h exactly
 (packed, little-endian).
 
 Two artifacts, two regions:

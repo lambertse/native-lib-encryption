@@ -89,9 +89,11 @@ fi
 #    writes to /out is not root-owned - and a non-root uid cannot write to
 #    /usr/lib/python3/dist-packages. The failure would be a bare permission error naming neither
 #    Docker nor sopack.
-#    --system-site-packages so lief and pytest come from the image (both are baked in) instead of
-#    being re-fetched; only sopack is installed here. Editable, so the bundler reads the mounted
-#    checkout - which is the whole point of mounting it.
+#    --system-site-packages so lief, pyyaml and pytest come from the image (all three are baked
+#    into the Dockerfile's pip layer) instead of being re-fetched; only sopack is installed here.
+#    This is why every sopack dependency has to be in that layer: the `pip install -e` below
+#    resolves them, so one that is missing sends it to PyPI and an offline run dies right there.
+#    Editable, so the bundler reads the mounted checkout - which is the whole point of mounting it.
 #    Putting the venv first on PATH is what makes this reach the scripts: build_wbaes.sh and
 #    artifact_generation.sh both invoke plain `python3`/`python3 -m pip`.
 say "installing sopack (editable) into a venv"
@@ -100,8 +102,8 @@ python3 -m venv --system-site-packages "$VENV" || die "python3 -m venv failed"
 export PATH="$VENV/bin:$PATH"
 "$VENV/bin/pip" install --quiet --no-cache-dir -e "$SOPACK" \
     || die "pip install -e $SOPACK failed"
-python3 -c 'import sopack, lief' \
-    || die "sopack/lief not importable from $VENV after install"
+python3 -c 'import sopack, lief, yaml' \
+    || die "sopack/lief/pyyaml not importable from $VENV after install"
 
 # 3. Generate. --out is under the mount and never $SOPACK/artifacts: artifact_generation.sh does
 #    `rm -rf` on its --out, and a checkout mounted from a Mac usually has a working bundle there.

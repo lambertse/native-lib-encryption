@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build_wbaes.sh - get `--cipher wbaes` from a clean checkout to a packable state, running
+# build_wbaes.sh - get `cipher: wbaes` from a clean checkout to a packable state, running
 # Phases 1-4 of docs/technical/WBAES.md and every one of their PASS checks. It stops before
 # packing (that needs YOUR APK and lib names) and prints the Phase-5 command to run next.
 #
@@ -31,7 +31,8 @@
 #                   This is the DEFAULT - a tracing helper logs the target name, .text address
 #                   and size to logcat, and `sopack pack` refuses to pack one.
 #   --trace         opt into the tracing build for on-device Phase 6 verification. The result
-#                   needs `sopack pack --allow-helper-log` and is NOT shippable.
+#                   needs `logging.allow-helper-log: true` in the pack config, and is
+#                   NOT shippable.
 #   --omvll         configure the Android build WITH the O-MVLL obfuscation plugin. This is the
 #                   DEFAULT - the provider is the artifact whose static analysis matters most.
 #                   WBC fetches and configures the plugin itself; it only loads on macOS.
@@ -76,7 +77,9 @@ while [ "$#" -gt 0 ]; do
         # 2..46 is the header comment block; it ends at the "SOPACK is this script's own
         # repo" line, immediately before `set -euo pipefail`. Widen this if the header grows,
         # or --help starts printing shell code.
-        -h|--help)    sed -n '2,46p' "$0"; exit 0 ;;
+        # 2..47 is the header comment block, ending the line before `set -euo pipefail`.
+        # Adjust if the header grows, or --help truncates / starts printing shell code.
+        -h|--help)    sed -n '2,47p' "$0"; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
@@ -329,7 +332,7 @@ print("    blob header: magic=%s version=%d tier=%d" % blob_header(blob))
     || die "$HOST_KEYGEN accepted --kdf but did not produce a v4 light-tier blob (above).
        That is a 3.0.0-or-newer tool behaving unexpectedly - do not pack with it."
 # Copy it where sopack looks for it unaided. provision.find_wb_keygen probes
-# vendor/wbc/bin/wb_keygen FIRST, so from here on `sopack pack` needs no --wb-keygen flag and no
+# vendor/wbc/bin/wb_keygen FIRST, so from here on `sopack pack` needs no flag, no config key and no
 # $SOPACK_WBKEYGEN - which is why this script no longer exports one. `install -m 0755` rather
 # than cp: the exec bit is the whole point, and a plain cp inherits the source's mode only by
 # luck.
@@ -747,17 +750,21 @@ cat <<EOF
 
   cd "$SOPACK"
   mkdir -p output
-  python3 -m sopack.cli pack <your.apk> \\
-    --lib "libfoo.so,libbar.so" \\
-    --abi $ABI \\
-    -o output/packed.apk
+  python3 -m sopack.cli pack <your.apk> -o output/packed.apk
 
-  No --cipher, no --wb-keygen, no --verify: wbaes and --verify are the defaults, and the
-  keygen this phase just built is found at vendor/wbc/bin/wb_keygen. Omit --lib as well to
-  pack every lib/$ABI/*.so in the APK.
+  The command line carries only the input and output APK. Everything else comes from
+  ./config.yaml if you have one - and with no config at all the defaults are already right
+  here: cipher wbaes, abis [$ABI], signature verification on, and every lib/$ABI/*.so in the
+  APK selected. The keygen this phase just built is found at vendor/wbc/bin/wb_keygen; there
+  is no flag and no config key for it.
 
-  Quote the --lib list: it is ONE argv word, so an unquoted space after a comma makes
-  argparse reject the second name.
+  To narrow it to specific libraries, or point at your own keystore:
+
+    python3 -m sopack.cli init-config       # writes ./config.yaml, fully commented
+    #   libraries:
+    #     include:
+    #       - libfoo.so
+    #       - libbar.so
 
 Then verify the packed APK and go to device, per docs/technical/WBAES.md Phases 5-6.
 EOF

@@ -98,21 +98,25 @@ docker run --rm -it --platform linux/amd64 -v "$PWD/out/bundle:/bundle" rockylin
 ```
 
 That is the check that actually exercises the static keygen on a foreign distro. It needs network
-for pip to fetch `lief`.
+for pip to fetch `lief` and `pyyaml`.
 
 ## Install on the target machine
 
 ```bash
 mkdir -p ~/sopack-bundle && tar xzf sopack-bundle-*.tar.gz -C ~/sopack-bundle
 ~/sopack-bundle/install.sh
-~/sopack-bundle/venv/bin/sopack pack your.apk -o packed.apk
+~/sopack-bundle/venv/bin/sopack pack your.apk -o packed.apk --config ~/sopack-bundle/config.yaml
 ```
+
+The bundle ships a `config.yaml` pinned to the ABI (and, on a `--allow-foreign-host` bundle, the
+cipher) it was built for; everything except the input and output APK is configured there. Edit it,
+or write your own with `sopack init-config`.
 
 The target needs **python3 ≥ 3.9 with `venv`** (on Debian/Ubuntu that is a separate
 `python3-venv` package, and `install.sh` dies with a clear message without it), a **JDK**
-(`keytool` runs on the first pack even without `--keystore`), **`apksigner`**, and **network
-once** so pip can fetch `lief`. It needs no NDK, no cmake, no whitebox-cryptography, and no
-sopack checkout.
+(`keytool` runs on the first pack even without a configured keystore), **`apksigner`**, and
+**network once** so pip can fetch `lief` and `pyyaml`. It needs no NDK, no cmake, no
+whitebox-cryptography, and no sopack checkout.
 
 ## Two things worth knowing before you run it
 

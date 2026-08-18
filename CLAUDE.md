@@ -21,7 +21,7 @@ it explains the constraints that force nearly every design decision.
 ## Commands
 
 ```bash
-pip install -e .                            # install the CLI (pulls in LIEF)
+pip install -e .                            # install the CLI (pulls in LIEF + PyYAML)
 
 # One entry point per cipher mode - each gets that mode to a packable state and prints the
 # pack command to run next. Prefer these over the raw steps: they turn every PASS signal in
@@ -31,7 +31,7 @@ pip install -e .                            # install the CLI (pulls in LIEF)
 ./scripts/build_wbaes.sh                    # wbaes: Phases 1-4 of docs/technical/WBAES.md
 ./scripts/build_wbaes.sh --host-only        #   Phases 1-3 only; no NDK/cmake/ninja needed
 ./scripts/build_wbaes.sh --trace            #   opt into -DSOPK_RT_LOG tracing (NOT shippable:
-                                            #   needs `pack --allow-helper-log`). Release,
+                                            #   needs `logging.allow-helper-log: true`). Release,
                                             #   stripped, is the DEFAULT.
 ./scripts/build_wbaes.sh --no-omvll         #   unobfuscated Android lib; --omvll is the DEFAULT
                                             #   and now works on macOS AND Linux/x86_64 (the
@@ -72,42 +72,88 @@ bash stub/build_stubs.sh [API_LEVEL]        # default API 24 -> sopack/stubs/*.b
                                             #   opt-out from O-MVLL. For a Linux/x86_64 bundle
                                             #   built in a container, see docker/README.md.
 
-# Pack an APK
-sopack pack in.apk -o out.apk \
-    [--lib libfoo.so,libbar.so] [--libs libs.txt] \
-    [--exclude-lib GLOB,...] [--no-default-exclude] \
-    [--abi arm64-v8a,... | all] [--cipher wbaes|chacha20|xor] [--min-sdk N] [--log] \
-    [--allow-helper-log] \
-    [--keystore PATH --ks-alias A --ks-pass P --key-pass P] [--no-verify] [--no-sign]
-# LIBRARY SELECTION IS OPTIONAL. Omit --lib/--libs -> every lib/<abi>/*.so in the input APK,
-# for the ABIs --abi selects. --lib is repeatable and/or comma-separated; --libs is a file,
-# one .so per line. See "Library selection" below for the exclusion rules and for why
-# auto-select SKIPS an un-injectable library where an explicitly named one ABORTS.
-# --abi DEFAULTS TO arm64-v8a ALONE (stubs.DEFAULT_ABIS) - the only ABI protected in
-# practice. `--abi all` = SUPPORTED_ABIS. This changed: it used to default to all three.
-# --cipher DEFAULTS TO wbaes, the white-box AES-128 KEY-WRAP mode (see "wbaes mode" below): the
-# long-term key is sealed into a white-box blob and never reconstructed at runtime, so no
-# portable key ships. chacha20/xor are the opt-out (stub cipher, raw key whitened in the
-# binary). This changed: chacha20 used to be the default, because wbaes was unreachable from a
-# clean clone - the WBC submodule is what fixed that.
-# --verify DEFAULTS ON; pass --no-verify to skip the post-signing apksigner dump.
+# Pack an APK. THE COMMAND LINE CARRIES ONLY THE INPUT AND OUTPUT APK - everything else is in
+# a YAML config (sopack/config.py). This changed: every setting used to be a flag.
+sopack pack in.apk -o out.apk [--config PATH]
+sopack init-config [-o PATH]                # write a commented config.yaml ('-' = stdout)
+# CONFIG LOOKUP: --config PATH (must exist, else error) -> ./config.yaml -> built-in defaults.
+# A missing ./config.yaml is NOT an error, so a bare pack still works; the CLI prints which of
+# the three it used. A ./config.yml near-miss IS an error rather than a silent fall-through.
+# config.sample.yaml at the repo root is the commented reference and is byte-identical to
+# config.SAMPLE_YAML (a test pins both directions). Every key in it is its DEFAULT, so an
+# unedited config packs exactly like no config.
+#
+# The schema, and what each key replaced:
+#   cipher: wbaes                     DEFAULTS TO wbaes, the white-box AES-128 KEY-WRAP mode
+#                                     (see "wbaes mode" below): the long-term key is sealed into
+#                                     a white-box blob and never reconstructed at runtime, so no
+#                                     portable key ships. chacha20/xor are the opt-out (stub
+#                                     cipher, raw key whitened in the binary). This changed:
+#                                     chacha20 used to be the default, because wbaes was
+#                                     unreachable from a clean clone - the WBC submodule fixed
+#                                     that.
+#   abis: [arm64-v8a]                 DEFAULTS TO arm64-v8a ALONE (stubs.DEFAULT_ABIS) - the only
+#                                     ABI protected in practice. `abis: all` = SUPPORTED_ABIS.
+#                                     This changed: it used to default to all three. Validation
+#                                     lives in config.py, NOT the CLI (argparse never had
+#                                     `choices` for --abi, so the move could have dropped it).
+#   libraries.include:                LIBRARY SELECTION IS OPTIONAL. Absent or null -> every
+#                                     lib/<abi>/*.so in the input APK, for the ABIs `abis:`
+#                                     selects. Entries match through _match_lib_pattern, the
+#                                     SAME matcher as libraries.exclude: bare basename, full
+#                                     APK path, fnmatch glob, trailing .so optional.
+#                                     An EMPTY LIST IS AN ERROR - see "Library selection" below
+#                                     for why, and for why auto-select SKIPS an un-injectable
+#                                     library where an explicitly named one ABORTS.
+#   libraries.exclude:                fnmatch globs on the basename, trailing .so optional.
+#                                     DEFAULTS to config.DEFAULT_EXCLUDES =
+#                                     ("libsopk_*", "libvosWrapperEx", "libflutter") - absent
+#                                     means that list, `[]` means none of it (and unlike
+#                                     `include: []` that is VALID, because it can only narrow
+#                                     protection, never widen the pack). The first two are ALSO
+#                                     enforced in apk.build_excludes, so deleting them from a
+#                                     config is a no-op; libflutter lives only here.
+#                                     `libraries.default-excludes` was REMOVED - config.py
+#                                     gives it a targeted message via _REMOVED_KEYS.
+#   signing.sign: true                false == the old --no-sign.
+#   signing.verify: true              DEFAULTS ON; false skips the post-signing apksigner dump.
+#   signing.min-sdk:                  apksigner minSdkVersion override.
+#   signing.keystore.{path,alias,store-pass,key-pass}
+#                                     path null -> apk.DEFAULT_KEYSTORE_PATH
+#                                     (~/.sopack/debug.keystore), generated on demand. ${VAR} is
+#                                     expanded from the environment IN THIS BLOCK ONLY, and an
+#                                     unset variable is an ERROR - never an empty password, which
+#                                     apksigner would accept and ship. `$${VAR}` escapes.
+#                                     Unlike the old --keystore gate, the CLI builds a
+#                                     KeystoreInfo unconditionally, so an alias or password set
+#                                     without a path now applies instead of being ignored.
+#   logging.stub-log: false           the old --log.
+#   logging.allow-helper-log: false   the old --allow-helper-log.
+#
+# AN UNKNOWN OR MISPLACED KEY IS AN ERROR, at every nesting level, and only the dash spelling is
+# accepted. This is the guard that replaces argparse: `--ciper xor` used to fail, so `ciper: xor`
+# must not quietly pack with the default cipher. Duplicate keys are rejected too (yaml.safe_load
+# silently keeps the last). Removed flags get a targeted message naming their config key
+# (cli._REMOVED_FLAGS) rather than argparse's bare "unrecognized arguments".
+#
 # SIGNING IS BEST-EFFORT. With no apksigner reachable, sopack WARNS and leaves the output
 # unsigned rather than aborting - the pack itself is done by then, and a pipeline that signs with
-# its own production key later still wants the artifact. --no-sign makes that explicit (and skips
-# generating ~/.sopack/debug.keystore). apksigner is resolved BEFORE the keystore for that reason:
-# probing the other way round generated a key pair and only then found nothing to sign with.
-# RepackResult.signed carries this, --verify is skipped when false, and the CLI's last line says
-# the APK cannot be installed as-is. Alignment is unaffected: signing preserves it, so signing
-# later is equivalent.
-# THERE IS NO --wb-keygen. provision.find_wb_keygen probes, in order: vendor/wbc/bin/wb_keygen
-# (what build_wbaes.sh installs), the portable bundle beside an installed venv, $SOPACK_WBKEYGEN,
-# then PATH. Note the env var ranks BELOW the local build on purpose - a stale export must not
-# beat the keygen build_wbaes.sh just gated.
+# its own production key later still wants the artifact. `signing.sign: false` makes that explicit
+# (and skips generating ~/.sopack/debug.keystore). apksigner is resolved BEFORE the keystore for
+# that reason: probing the other way round generated a key pair and only then found nothing to
+# sign with. RepackResult.signed carries this, verify is skipped when false, and the CLI's last
+# line says the APK cannot be installed as-is. Alignment is unaffected: signing preserves it, so
+# signing later is equivalent.
+# THERE IS NO --wb-keygen, AND NO CONFIG KEY FOR IT EITHER. provision.find_wb_keygen probes, in
+# order: vendor/wbc/bin/wb_keygen (what build_wbaes.sh installs), the portable bundle beside an
+# installed venv, $SOPACK_WBKEYGEN, then PATH. Note the env var ranks BELOW the local build on
+# purpose - a stale export must not beat the keygen build_wbaes.sh just gated. A config key would
+# re-open "where does it rank?" against that order; the omission is deliberate, not an oversight.
 # wbaes still needs whitebox-cryptography >= 3.0.0 and a per-ABI helper skeleton in
 # sopack/stubs/ built from the CURRENT stub/sopk_rt.c. Both come from ./scripts/build_wbaes.sh
 # or from a portable bundle; a plain `pip install .` from a checkout carries NEITHER (the
 # skeletons are gitignored and not package data), so use `pip install -e .` + build_wbaes.sh,
-# install a bundle, or pass --cipher chacha20.
+# install a bundle, or set `cipher: chacha20`.
 # Note: section-header stripping was researched and REMOVED - modern Android bionic
 # (Android 14+) requires a section table to exist and rejects a stripped lib at load
 # (confirmed on-device). Whitening (below) is the load-safe hardening. See
@@ -119,7 +165,8 @@ python -m pytest tests/test_cipher.py       # ChaCha20/XOR + the wbaes key-wrap 
 python -m pytest tests/test_metadata.py     # decinfo layout vs decinfo.h
 python -m pytest tests/test_rt_meta.py      # both region layouts vs stub/sopk_rt.h (wbaes)
 python -m pytest tests/test_provision.py    # the blob-header gate: v>=4 + light KDF tier
-python -m pytest tests/test_lib_select.py   # auto-select, exclusions, --abi default, fail-soft
+python -m pytest tests/test_config.py       # the YAML config: sample, defaults, every rejection
+python -m pytest tests/test_lib_select.py   # auto-select, exclusions, the CLI surface, fail-soft
 python -m pytest tests/test_wbaes.py        # wbaes guards, the strip, and real injection
                                            #   (2 tests skip w/o a host wb_keygen)
 python -m pytest tests/test_integration.py -k init_array   # a single test by name
@@ -151,7 +198,7 @@ APKs. Do not merge them back, and do not reintroduce `assets/`.
   ABI-specific, so it is generated per machine and never committed - which is exactly why
   `build_wbaes.sh` symbol-checks the archive for `wbc_blob_kdf_tier` before the copy rather than
   trusting whatever is there. `bin/wb_keygen` is the **first** thing `provision.find_wb_keygen`
-  probes, and that is what removed the need for a `--wb-keygen` flag.
+  probes, and that is what removed the need for a `--wb-keygen` flag (and for a config key).
 - **`artifacts/`** - the portable pack bundle, an **output** of `scripts/artifact_generation.sh`.
   Regenerate it; never edit it in place. It carries the Android artifacts (host-neutral),
   `bin/wb_keygen` (the only host-specific file), and **the tool itself** as a `py3-none-any`
@@ -180,7 +227,9 @@ offline. It exists because a bundle that installs on Linux must be generated on 
 
 ## Architecture (the parts that span files)
 
-Three components + a thin CLI (`sopack/cli.py`):
+Three components + a thin CLI (`sopack/cli.py`) + the config layer (`sopack/config.py`, which
+owns every user-facing default; `apk.repackage`'s own signature defaults are library API and are
+left alone, so the long-standing `wbaes`/`chacha20` skew between the two is simply unreachable):
 
 1. **Runtime stub** - `stub/stub.c`, compiled per ABI by `stub/build_stubs.sh` into flat,
    relocation-free blobs shipped in `sopack/stubs/`. Freestanding (raw syscalls, no
@@ -197,7 +246,7 @@ Three components + a thin CLI (`sopack/cli.py`):
 
 3. **APK repackager** - `sopack/apk.py`. unzip → inject each **selected** `lib/<abi>/*.so` →
    libs written STORED + 16 KB-aligned → `apksigner` self-sign with a generated keystore.
-   For `--cipher wbaes` it also **adds** files into `lib/<abi>/` (STORED + 16 KB) - the only
+   For `cipher: wbaes` it also **adds** files into `lib/<abi>/` (STORED + 16 KB) - the only
    add-file path in the tool: one thin helper per protected library, plus **one**
    `libsopk_wb.so` per ABI. It also seals ONE white-box key per ABI before the entry loop and
    asserts pack-level closure afterwards (every staged thin helper's provider is present) -
@@ -206,21 +255,35 @@ Three components + a thin CLI (`sopack/cli.py`):
 ### Library selection (`apk.py:_classify` / `build_excludes`)
 
 `repackage(..., wanted_libs)` takes `None` to mean **auto-select every `lib/<abi>/*.so`**, or a
-list for explicit selection. `None` and `[]` are NOT interchangeable - `cli.py` rejects an empty
-`--libs` file rather than silently widening the scope to the whole APK.
+list for explicit selection. `None` and `[]` are NOT interchangeable - `config.py` rejects
+`libraries.include: []` rather than silently widening the scope to the whole APK (it used to be
+`cli.py` rejecting an empty `--libs` file; the invariant is the same one).
 
-- **Exclusion is checked before selection**, so `--exclude-lib` overrides an explicit `--lib`.
+- **Exclusion is checked before selection**, so `libraries.exclude` overrides a name in
+  `libraries.include`.
   Patterns are fnmatch globs on the basename with an **optional `.so`** (`libflutter` matches
   `libflutter.so` but not `libflutterx.so`); full APK paths also match.
-- `ALWAYS_EXCLUDE_PATTERNS = ("libsopk_*",)` is **unconditional** - not removable by
-  `--no-default-exclude` and not overridable by naming one in `--lib`. Those are the tool's own
-  injected artifacts (`rt_meta.PROVIDER_SONAME` + the `libsopk_rt_<target>.so` thin helpers), and
-  auto-select on an already-packed APK would otherwise feed the *decryptor* through `inject_so`.
-  The `apk.py` collision guard does not cover this: it guards the *add-entry* path, not inject.
-- `DEFAULT_EXCLUDE_PATTERNS = ("libflutter",)` is **user preference, not a technical
-  workaround.** Do not annotate it with the old `DT_INIT_ARRAY`-hijack SIGILL - that root cause
-  is fixed (`DT_INIT-hijack`/`DT_INIT-inplace` are the only strategies `master` emits).
-  `--no-default-exclude` drops this list only.
+- **The exclusion list is visible DATA in the config, but two entries are enforced in code.**
+  `config.DEFAULT_EXCLUDES = ("libsopk_*", "libvosWrapperEx", "libflutter")` is what every
+  generated config ships, so a reader can see what is skipped without running a pack. Of those,
+  `ALWAYS_EXCLUDE_PATTERNS = ("libsopk_*", "libvosWrapperEx")` is **also** prepended by
+  `build_excludes` unconditionally - not overridable by naming one in `libraries.include`, and
+  not removable by deleting it from a config. The two entries are there for **different**
+  reasons and the old single-sentence comment was untrue of the tuple it sat above:
+  - `libsopk_*` - the tool's own injected artifacts (`rt_meta.PROVIDER_SONAME` + the
+    `libsopk_rt_<target>.so` thin helpers). Auto-select on an already-packed APK would otherwise
+    feed the *decryptor* through `inject_so`. The `apk.py` collision guard does not cover this:
+    it guards the *add-entry* path, not inject. This one is a correctness invariant.
+  - `libvosWrapperEx` - the V-Key/V-OS wrapper, already self-protected, so packing it buys
+    nothing and risks tripping its own integrity checks. (Added in `ac9b1e8` with **no** recorded
+    rationale; this is the reconstruction, from its presence in `test_apks/vsa.apk` and its
+    byte-identical passthrough in the committed `vsa-encrypted.apk`.)
+- `libflutter` is **user preference, not a technical workaround**, and lives ONLY in
+  `config.DEFAULT_EXCLUDES` - delete it from a config and it gets packed. Do not annotate it with
+  the old `DT_INIT_ARRAY`-hijack SIGILL - that root cause is fixed (`DT_INIT-hijack`/
+  `DT_INIT-inplace` are the only strategies `master` emits). `DEFAULT_EXCLUDE_PATTERNS` in
+  `apk.py` and the `default-excludes` toggle are **gone**; `repackage()` no longer knows about
+  libflutter at all, so a direct library call must pass it in `exclude_libs`.
 - **Fail-soft is scoped to auto-select.** An `InjectError` is demoted to a skip (original entry
   written back verbatim, recorded in `RepackResult.failed`) *only* when `wanted_libs is None`; an
   explicitly named library re-raises, prefixed with the APK entry name. The rationale is
@@ -234,7 +297,7 @@ list for explicit selection. `None` and `[]` are NOT interchangeable - `cli.py` 
 - Enumeration reads only `zin.infolist()` of the **input** APK, so helpers added after the entry
   loop can never be re-selected within a run.
 
-### `--cipher wbaes` mode (white-box AES-128 key wrapping) - the alternative to the stub
+### `cipher: wbaes` mode (white-box AES-128 key wrapping) - the alternative to the stub
 
 Requires **whitebox-cryptography >= 3.0.0**. Removes the "raw key ships in the binary"
 weakness: the long-term AES-128 key is sealed offline into a white-box blob (diffused into
@@ -312,7 +375,7 @@ Pieces:
   removes every non-`SHF_ALLOC` section (`_strip_nonalloc`, raw surgery - LIEF regenerates
   `.symtab` on write and leaves a multi-MB hole; see docs/technical/HARDENING.md §Method 5)
   and refuses a skeleton that imports `__android_log_print`/needs `liblog.so` unless
-  `--allow-helper-log` is passed, which warns on every pack. On the reference (pre-split, so
+  `logging.allow-helper-log: true` is set, which warns on every pack. On the reference (pre-split, so
   provider-sized) artifact a default build ships **~2.3 MB of DWARF** inside **2,785,024 bytes
   (~2.7 MB) of total non-ALLOC sections** - naming every function plus the host build paths;
   that is what let a static-analysis report reconstruct the whole design in an hour. Quote
@@ -330,9 +393,9 @@ Pieces:
   entry loop, since it cannot be produced per target). No stub / decinfo / DT_INIT surgery - so
   this mode also handles `INIT_ARRAY`-only libs for free.
 
-Only `arm64-v8a` is protected in practice, by deliberate scope choice - and since the `--abi`
+Only `arm64-v8a` is protected in practice, by deliberate scope choice - and since the `abis:`
 default is now `stubs.DEFAULT_ABIS = ("arm64-v8a",)`, that is also what the tool does unless the
-user passes `--abi all`. The other ABIs ship cleartext `.text`, so an analyst after the *algorithm*
+user sets `abis: all`. The other ABIs ship cleartext `.text`, so an analyst after the *algorithm*
 reads the x86_64 build and never touches the encryption. State the value accordingly: this raises
 device-level attack cost on arm64; it does not keep algorithms secret. The CLI's per-ABI summary
 exists to keep that visible rather than letting a bare "Injected N libraries" imply full coverage.
@@ -377,12 +440,51 @@ target and only the *provider* is shared. See `docs/technical/ARCHITECTURE.md` �
 
 ### Invariants that will break things silently if violated
 
+- **An unknown or misplaced config key must be an ERROR, at every nesting level.** This is the
+  guard that replaces argparse, and it is the failure mode the whole config design has to
+  prevent: `--ciper xor` used to be an argparse error, so `ciper: xor` must not quietly pack
+  with the default cipher, and a `verify: false` written at the top level instead of under
+  `signing:` must not be silently ignored. A user who believes they turned something off and
+  did not is worse off than one who got a typo message. `config._check_keys` validates each
+  mapping against that level's key set, accepts **only** the dash spelling (taking `store_pass`
+  too would mean keeping both working forever), and the strict YAML loader rejects duplicate
+  keys - `yaml.safe_load` keeps the last of a repeated key and says nothing. `tests/test_config.py`
+  parametrizes stale names, flattened keys, right-key-wrong-section and underscore spellings.
+
+- **The config's exclude list is VISIBILITY; `apk.build_excludes` is the enforcement point.**
+  `libsopk_*` and `libvosWrapperEx` are written into every generated config so a reader can see
+  them, and prepended unconditionally by `build_excludes` so deleting them there is a no-op. Keep
+  both halves: dropping the code half means a minimal hand-written config (or `exclude: []`,
+  which is legal) silently packs sopack's own decryptor on a re-pack; dropping the config half
+  puts the list back in hiding, which is what this design existed to end. `build_excludes`
+  de-duplicates precisely because the two halves overlap by design.
+  `tests/test_config.py` pins that `Config.default().libraries.exclude` stays a superset of
+  `ALWAYS_EXCLUDE_PATTERNS`, so the visible list cannot drift from the enforced one.
+
+- **`libraries.include` absent/null is not `include: []`.** Absent or null means auto-select
+  every `lib/<abi>/*.so`; an empty list is an ERROR. The two are not interchangeable downstream
+  (`apk.repackage` branches on `wanted_libs is None`) and the failure contracts differ: under
+  auto-select an un-injectable library is skipped with a warning and ships in cleartext, while
+  an explicitly named one aborts the pack. Widening the scope on an empty list would silently
+  swap one for the other. YAML makes these easy to collapse in a dataclass; do not.
+  `exclude: []` is the mirror image and is **valid** - it can only narrow protection back to the
+  enforced minimum, never widen the pack. Absent is not `[]` there either: absent means the
+  documented default list, so a config that never mentions `exclude` still skips libflutter.
+
+- **`config.SAMPLE_YAML` is a module constant, never package data.**
+  `scripts/artifact_generation.sh` stages the portable wheel with `cp "$SOPACK"/sopack/*.py`,
+  so a `sopack/config.sample.yaml` would silently not reach the wheel and `sopack init-config`
+  would fail on exactly the toolchain-less machine the bundle exists for. Gate 7 would not
+  catch it either - its "and nothing else" clause is scoped to `sopack/stubs/*.so`. The repo-root
+  `config.sample.yaml` is a pinned copy of the constant, and a test asserts both that they are
+  byte-identical and that the sample parses to exactly `Config.default()`.
+
 - **Cross-language contracts must stay byte-identical.** Change one side, change the
   other, and re-run the KAT/layout tests:
   - `sopack/cipher.py` ⇄ `stub/stub_cipher.h` (ChaCha20/XOR **and** the whitening
     `sopk_whiten_key` + `SOPK_WHITEN_NONCE` + `WHITEN_SPAN`).
   - `sopack/metadata.py` ⇄ `stub/decinfo.h` (the 128-byte `sopk_decinfo` struct).
-  - `sopack/rt_meta.py` ⇄ `stub/sopk_rt.h` (`--cipher wbaes` only): the **96-byte** v3
+  - `sopack/rt_meta.py` ⇄ `stub/sopk_rt.h` (`cipher: wbaes` only): the **96-byte** v3
     `sopk_rt_region` (`'SRTT'`, in each thin helper) **and** the **24-byte** `sopk_wb_region`
     (`'SRTW'`, in the shared provider). `tests/test_rt_meta.py` pins both layouts, both build
     markers, and that a foreign region version is rejected. **The magic is the drift gate, not
@@ -416,7 +518,7 @@ target and only the *provider* is shared. See `docs/technical/ARCHITECTURE.md` �
   exports nothing (precisely the helper skeleton) the bucket array is empty and the walk reads
   past it - it reported 10 symbols for a 20-symbol `.so` and hid three unresolved `wbc_*`.
 
-- **An injection must never change the target's dynamic symbol names.** `--cipher wbaes`
+- **An injection must never change the target's dynamic symbol names.** `cipher: wbaes`
   supersedes `.dynstr` with an appended copy and repoints `DT_STRTAB` at it, so the copy has to
   be the table `.dynsym`'s `st_name` offsets actually index. **LIEF rebuilds `.dynstr` with the
   strings sorted during `write()` and rewrites every `st_name` to match**, so a copy taken
@@ -498,7 +600,7 @@ target and only the *provider* is shared. See `docs/technical/ARCHITECTURE.md` �
   check this before touching either, rather than assuming which one is right. The
   `DEFAULT_ABIS` change shrank the blast radius (non-arm64 libs are no longer packed by
   default) and auto-select's fail-soft turns a hit into a per-library skip rather than a dead
-  pack, but neither is a fix - `--abi all` still runs the unconditional check.
+  pack, but neither is a fix - `abis: all` still runs the unconditional check.
 
 ## Environment note
 
@@ -540,3 +642,17 @@ both varied, so treat the version as the leading suspect, not a proven sole caus
 error appears, check
 `lief.__version__` before looking for a packer bug - the error prints it. Three different
 artifacts reach that check (target / thin helper / shared provider) and the message names which.
+
+**sopack has exactly two dependencies, and adding one is a three-file change.** `lief>=1.0` and
+`pyyaml>=6` (`pyproject.toml`). Two build paths deliberately pre-stage them so they need no
+network at run time, and both name their packages explicitly - a dependency added to
+`pyproject.toml` alone breaks them:
+
+- `docker/Dockerfile`'s system `pip3 install` layer. `docker-entrypoint.sh` creates the venv with
+  `--system-site-packages` and then runs `pip install -e`, so a package missing from that layer
+  sends that install to PyPI and an **offline run dies there** - after the ~2.5 GB of NDK layers.
+  Prove it with `docker run --rm --network none`; without `--network none` the check silently
+  passes by downloading.
+- the bundle's generated `install.sh` (`scripts/artifact_generation.sh`), whose post-install probe
+  imports each one by name. That probe exists because a dependency pip failed to resolve is
+  otherwise invisible until the first pack, on the machine least equipped to diagnose it.

@@ -1,4 +1,4 @@
-"""Library selection: auto-select, exclusion patterns, --abi default, fail-soft skips.
+"""Library selection: auto-select, exclusion patterns, the `abis:` default, fail-soft skips.
 
 These cover the selection layer only - they never build a real ELF. The end-to-end tests
 that do live in test_integration.py / test_wbaes.py.
@@ -10,9 +10,9 @@ import zipfile
 
 import pytest
 
-from sopack import apk, cli
-from sopack.apk import (ALWAYS_EXCLUDE_PATTERNS, DEFAULT_EXCLUDE_PATTERNS,
-                        _classify, _match_lib_pattern, build_excludes)
+from sopack import apk, cli, config
+from sopack.apk import (ALWAYS_EXCLUDE_PATTERNS, _classify, _match_lib_pattern,
+                        build_excludes)
 from sopack.elf_inject import InjectError, InjectResult
 from sopack.stubs import DEFAULT_ABIS, SUPPORTED_ABIS
 
@@ -71,11 +71,43 @@ def test_explicit_selection_still_matches_basename_or_full_path():
     assert _explicit("libapp.so", ["libother.so"]) == (False, "not requested")
 
 
+@pytest.mark.parametrize("spelling", [
+    "libapp", "libapp.so", "lib/arm64-v8a/libapp.so", "libap*",
+])
+def test_include_matches_exactly_like_exclude(spelling):
+    """`include` and `exclude` sit two lines apart in the config, so they MUST accept the
+    same spellings. `include: [libapp]` used to match nothing (exact set membership) while
+    `exclude: [libflutter]` worked - the pack then aborted with "no .so entries matched",
+    which names the list but not the reason."""
+    assert _explicit("libapp.so", [spelling])[0] is True
+
+
+@pytest.mark.parametrize("so", ["libapp2.so", "libappx.so", "libotherapp.so"])
+def test_a_bare_include_name_is_not_a_prefix_match(so):
+    """The optional-.so rule must not turn `libapp` into `libapp*` - that would silently
+    pack neighbours the user never named, which for an explicit list is the whole point."""
+    assert _explicit(so, ["libapp"])[0] is False
+
+
+def test_exclusion_still_beats_an_include_glob():
+    """Widening `include` must not become a way around the enforced patterns."""
+    ex = build_excludes()
+    assert _explicit("libsopk_wb.so", ["libsopk*"], ex)[0] is False
+    assert _explicit("libsopk_wb.so", ["*"], ex)[0] is False
+
+
 # ---- 3-5. exclusion ---------------------------------------------------------------
 def test_sopack_artifacts_are_never_selected():
-    """The provider and thin helpers must never be fed back through inject_so."""
+    """The provider and thin helpers must never be fed back through inject_so.
+
+    The `[]` case is the one that matters now that the exclusion list is user-editable
+    YAML: `libraries.exclude: []` is a VALID config (unlike `include: []`), and it is
+    exactly the shape a user reaches for when they want to pack everything. It must still
+    be impossible to select sopack's own decryptor - build_excludes prepends
+    ALWAYS_EXCLUDE_PATTERNS whatever the caller passes.
+    """
     for so in ("libsopk_wb.so", "libsopk_rt_libapp.so"):
-        for ex in (build_excludes(), build_excludes(no_default_exclude=True)):
+        for ex in (build_excludes(), build_excludes([]), build_excludes(["libfoo"])):
             assert _auto(so, ex)[0] is False
             # ... not even when named explicitly.
             assert _explicit(so, [so], ex)[0] is False
@@ -86,99 +118,84 @@ def test_exclusion_beats_explicit_lib():
     assert _explicit("libapp.so", ["libapp.so"], ex) == (False, "excluded by 'libapp'")
 
 
-def test_default_exclude_applies_to_both_modes():
-    ex = build_excludes()
+def test_a_pattern_applies_to_both_modes():
+    # Passed literally rather than sourced from the config layer: this module tests the
+    # selection layer on its own. That the shipped default still CONTAINS libflutter is a
+    # config-layer fact, pinned in test_config.py.
+    ex = build_excludes(["libflutter"])
     assert _auto("libflutter.so", ex) == (False, "excluded by 'libflutter'")
     assert _explicit("libflutter.so", ["libflutter.so"], ex)[0] is False
 
 
-def test_no_default_exclude_re_enables_libflutter_only():
-    ex = build_excludes(no_default_exclude=True)
-    assert ex == ALWAYS_EXCLUDE_PATTERNS
-    assert _auto("libflutter.so", ex) == (True, "")
-    assert _auto("libsopk_wb.so", ex)[0] is False
+def test_build_excludes_always_prepends_the_enforced_patterns():
+    """Enforced in code, not merely written in the shipped config - so a hand-written
+    config that omits them is still safe."""
+    assert build_excludes() == ALWAYS_EXCLUDE_PATTERNS
+    assert build_excludes([]) == ALWAYS_EXCLUDE_PATTERNS
+    assert build_excludes(["a", "b"]) == ALWAYS_EXCLUDE_PATTERNS + ("a", "b")
 
 
-def test_build_excludes_order_and_content():
-    assert build_excludes() == ALWAYS_EXCLUDE_PATTERNS + DEFAULT_EXCLUDE_PATTERNS
-    assert build_excludes(["a", "b"]) == (ALWAYS_EXCLUDE_PATTERNS
-                                          + DEFAULT_EXCLUDE_PATTERNS + ("a", "b"))
+def test_build_excludes_deduplicates():
+    """Every generated config lists the enforced patterns, so they arrive twice. Without
+    the de-dupe the CLI's `excluding:` line names each of them twice, which reads as a bug."""
+    ex = build_excludes(list(ALWAYS_EXCLUDE_PATTERNS) + ["libflutter"])
+    assert ex == ALWAYS_EXCLUDE_PATTERNS + ("libflutter",)
+    assert len(ex) == len(set(ex))
 
 
 # ---- 6. CLI plumbing --------------------------------------------------------------
-def test_split_list_handles_repeats_commas_and_blanks():
-    assert cli._split_list(["a.so, b.so", "", "c.so ,, d.so"]) == \
-        ["a.so", "b.so", "c.so", "d.so"]
-    assert cli._split_list(None) == []
-    assert cli._split_list([" , "]) == []
-
-
-def _abis(argv):
-    args = cli.build_parser().parse_args(["pack", "in.apk", "-o", "out.apk"] + argv)
-    if args.abi == "all":
-        return SUPPORTED_ABIS
-    return tuple(args.abi.split(",")) if args.abi else DEFAULT_ABIS
-
-
-def test_abi_default_is_arm64_only():
-    assert DEFAULT_ABIS == ("arm64-v8a",)
-    assert _abis([]) == DEFAULT_ABIS
-    assert _abis(["--abi", "all"]) == SUPPORTED_ABIS
-    assert _abis(["--abi", "arm64-v8a,x86_64"]) == ("arm64-v8a", "x86_64")
-
-
-def _parse(argv):
-    return cli.build_parser().parse_args(["pack", "in.apk", "-o", "out.apk"] + argv)
-
-
-def test_cipher_defaults_to_wbaes():
-    """The protected mode is the one you get by default. chacha20/xor ship the raw key
-    (whitened) in the binary, so leaving them as the default meant the tool's whole point was
-    opt-in. Reachable from a clean clone only because build_wbaes.sh builds the pinned
-    whitebox-cryptography submodule - see scripts/build_wbaes.sh."""
-    assert _parse([]).cipher == "wbaes"
-    assert _parse(["--cipher", "chacha20"]).cipher == "chacha20"
-
-
-def test_verify_defaults_on_and_no_verify_turns_it_off():
-    """--verify costs one apksigner call and catches a broken signature before the APK leaves
-    the machine. store_false rather than BooleanOptionalAction: the latter needs 3.9, which is
-    exactly this project's floor."""
-    assert _parse([]).verify is True
-    assert _parse(["--no-verify"]).verify is False
-    assert _parse(["--verify"]).verify is True
-    # Last flag wins, so an explicit --verify after --no-verify is not silently ignored.
-    assert _parse(["--no-verify", "--verify"]).verify is True
-
-
-def test_wb_keygen_flag_is_gone():
-    """Removed, not deprecated: provision.find_wb_keygen probes vendor/wbc/bin/ and the
-    portable bundle itself, so there is nothing left to point at. A stale --wb-keygen in a
-    script must fail loudly rather than being silently accepted and ignored."""
-    with pytest.raises(SystemExit):
-        _parse(["--wb-keygen", "/some/wb_keygen"])
-    assert not hasattr(_parse([]), "wb_keygen")
-
-
-def test_unsupported_abi_still_rejected():
+# Everything except the input and output APK moved into the YAML config; the parsing and
+# validation assertions that used to live here are in test_config.py now. What is left is
+# the CLI surface itself: what argv still accepts, and what it must refuse.
+def test_pack_surface_is_input_output_and_config_only():
+    """The whole point of the config file. A new flag added here is a regression."""
     args = cli.build_parser().parse_args(
-        ["pack", "in.apk", "-o", "out.apk", "--abi", "mips"])
-    with pytest.raises(SystemExit, match="unsupported ABI"):
-        cli._cmd_pack(args)
+        ["pack", "in.apk", "-o", "out.apk", "--config", "c.yaml"])
+    assert (args.input, args.output, args.config) == ("in.apk", "out.apk", "c.yaml")
+    assert vars(args).keys() == {"cmd", "input", "output", "config", "func"}
 
 
-def test_lib_and_libs_remain_mutually_exclusive():
+@pytest.mark.parametrize("flag,key", sorted(cli._REMOVED_FLAGS.items()))
+def test_removed_flags_fail_loudly_and_name_their_config_key(flag, key, capsys):
+    """A stale flag in a script must FAIL, not be silently accepted and ignored.
+
+    The whole surface moved at once, so argparse's bare "unrecognized arguments: --cipher"
+    would leave the reader to guess the key. Each message names its replacement.
+    """
+    with pytest.raises(SystemExit) as e:
+        cli.main(["pack", "in.apk", "-o", "out.apk", flag, "x"])
+    assert key in str(e.value)
+    # Also caught when glued on with `=`, which argparse accepts for long options.
+    with pytest.raises(SystemExit):
+        cli.main(["pack", "in.apk", "-o", "out.apk", f"{flag}=x"])
+
+
+def test_wb_keygen_is_neither_a_flag_nor_a_config_key():
+    """Removed, not deprecated: provision.find_wb_keygen probes vendor/wbc/bin/ and the
+    portable bundle itself, so there is nothing left to point at. It did not come back as a
+    config key either - a key would re-open "where does it rank?" against that probe order,
+    in which $SOPACK_WBKEYGEN deliberately ranks BELOW a freshly gated local build."""
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(
-            ["pack", "in.apk", "-o", "out.apk", "--lib", "a.so", "--libs", "l.txt"])
+            ["pack", "in.apk", "-o", "out.apk", "--wb-keygen", "/some/wb_keygen"])
+    with pytest.raises(config.ConfigError, match="unknown key"):
+        config.loads("wb-keygen: /some/wb_keygen\n")
 
 
-def test_empty_libs_file_is_an_error_not_auto_select(tmp_path):
-    """`--libs empty.txt` must NOT silently widen the scope to every library."""
-    f = tmp_path / "libs.txt"
-    f.write_text("# only a comment\n\n")
-    with pytest.raises(SystemExit, match="no libraries listed"):
-        cli._read_libs(str(f))
+def test_init_config_writes_a_file_that_parses_to_the_defaults(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["init-config"]) == 0
+    written = tmp_path / "config.yaml"
+    assert written.read_text() == config.SAMPLE_YAML
+    assert config.loads(written.read_text()) == config.Config.default()
+
+
+def test_init_config_refuses_to_clobber(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text("cipher: xor\n")
+    with pytest.raises(SystemExit, match="already exists"):
+        cli.main(["init-config"])
+    assert (tmp_path / "config.yaml").read_text() == "cipher: xor\n"
 
 
 # ---- 7. zero-library errors -------------------------------------------------------
@@ -201,12 +218,13 @@ def test_no_libs_at_all(tmp_path):
 
 def test_everything_excluded_or_out_of_abi(tmp_path):
     src = _mkapk(tmp_path / "in.apk", [
-        "lib/arm64-v8a/libflutter.so",      # default-excluded
-        "lib/arm64-v8a/libsopk_wb.so",      # always-excluded
-        "lib/x86_64/libapp.so",             # outside the default --abi
+        "lib/arm64-v8a/libflutter.so",      # excluded by the caller's list
+        "lib/arm64-v8a/libsopk_wb.so",      # excluded unconditionally, list or no list
+        "lib/x86_64/libapp.so",             # outside the default abis
     ])
     with pytest.raises(RuntimeError, match="none of the 3 lib/<abi>/"):
-        apk.repackage(src, str(tmp_path / "out.apk"), None, logger=lambda *_: None)
+        apk.repackage(src, str(tmp_path / "out.apk"), None,
+                      exclude_libs=["libflutter"], logger=lambda *_: None)
 
 
 # ---- 8. fail-soft under auto-select, hard fail when named -------------------------
@@ -265,8 +283,10 @@ def test_untouched_entries_carry_a_reason(tmp_path, monkeypatch):
     ])
     monkeypatch.setattr(apk, "inject_so", _fake_inject(set()))
     ks = apk.KeystoreInfo(path=str(tmp_path / "ks.jks"))
+    # exclude_libs is explicit: libflutter is a CONFIG-layer default now, so a direct
+    # repackage() call knows nothing about it. Only ALWAYS_EXCLUDE_PATTERNS is implicit here.
     res = apk.repackage(src, str(tmp_path / "out.apk"), None, keystore=ks, min_sdk=24,
-                        logger=lambda *_: None)
+                        exclude_libs=["libflutter"], logger=lambda *_: None)
 
     assert len(res.injected) == 1
     assert dict(res.untouched) == {

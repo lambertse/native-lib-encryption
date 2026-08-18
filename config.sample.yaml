@@ -1,0 +1,74 @@
+# sopack configuration. The command line carries only the input and output APK:
+#   sopack pack in.apk -o out.apk [--config PATH]
+# Lookup order: --config PATH, then ./config.yaml, then these built-in defaults.
+# Every key below is optional; the value shown is the default.
+
+# wbaes  - white-box AES-128 key wrapping (DEFAULT). The long-term key is sealed
+#          and never reconstructed at runtime, so no portable key ships. Needs the
+#          artifacts ./scripts/build_wbaes.sh produces, or a portable bundle.
+# chacha20 / xor - the freestanding stub. No build step, but the raw key ships
+#          inside the binary (whitened at rest).
+cipher: wbaes
+
+# A list, or the string "all" for every supported ABI
+# (arm64-v8a, armeabi-v7a, x86_64). arm64-v8a is the only ABI protected in
+# practice; the others ship their .text in cleartext.
+abis:
+  - arm64-v8a
+
+libraries:
+  # Omit `include`, or leave it null, to encrypt EVERY lib/<abi>/*.so in the APK.
+  # An explicitly empty list ([]) is an error, not a request for auto-select.
+  #
+  # Entries match exactly like `exclude` below: a bare basename (libfoo -> that
+  # library in every selected ABI), a full APK path (lib/arm64-v8a/libfoo.so),
+  # fnmatch globs, and a trailing .so that is OPTIONAL. So `libapp`, `libapp.so`
+  # and `lib/arm64-v8a/libapp.so` all select the same library.
+  include:
+    # - libapp
+
+  # Never encrypt these. Same matching as `include` above: fnmatch globs on the
+  # basename, trailing .so optional, full APK paths too - so "libflutter" matches
+  # libflutter.so but not libflutterx.so. Exclusion ALWAYS wins over `include`.
+  #
+  # An empty list ([]) is fine here - unlike `include`, it can only narrow
+  # protection back to the two entries sopack enforces, never widen the pack.
+  exclude:
+    # sopack's own injected artifacts: the shared white-box provider and the
+    # per-target thin helpers. These are the code that does the DECRYPTING, so
+    # packing them would break every APK you re-pack. Listed here so you can see
+    # them - sopack re-applies this pattern either way, and deleting the line
+    # changes nothing.
+    - libsopk_*
+    # The V-Key/V-OS wrapper: already self-protected, so packing it buys nothing
+    # and risks tripping its own integrity checks. Also enforced regardless.
+    - libvosWrapperEx
+    # The stock public Flutter engine. Excluded by POLICY, not necessity: it is
+    # public code, so encrypting it costs load time and fragility while
+    # protecting nothing of yours - encrypt libapp.so (your Dart snapshot)
+    # instead. This one is a plain entry: delete it and libflutter.so gets
+    # packed like anything else.
+    - libflutter
+    # Add your own below.
+    # - libc++_shared
+    # - libmy*
+
+signing:
+  sign: true            # false == the old --no-sign: leave the APK UNSIGNED
+  verify: true          # print the signer certificates after signing
+  min-sdk:              # override apksigner minSdkVersion if manifest detection fails
+
+  keystore:
+    # null -> ~/.sopack/debug.keystore, generated on demand
+    path:
+    alias: sopack
+    # ${VAR} expands from the environment, so a committed config need not hold a
+    # real password. A referenced variable that is not set is an error.
+    store-pass: sopack
+    key-pass:           # null -> same as store-pass
+
+logging:
+  stub-log: false       # the old --log: the stub emits a logcat line on decrypt
+  # Permit a wbaes helper skeleton built with -DSOPK_RT_LOG. Such a build leaks the
+  # target name, .text address and size to logcat: the result is NOT shippable.
+  allow-helper-log: false

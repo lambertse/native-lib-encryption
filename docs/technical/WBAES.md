@@ -1,4 +1,4 @@
-# `--cipher wbaes` - the WBC integration, and how to verify it
+# `cipher: wbaes` - the WBC integration, and how to verify it
 
 Everything about the white-box AES-128 key-wrap mode: how sopack is wired to the
 **whitebox-cryptography (WBC) SDK** (Part I - the boundary: what it consumes, what it
@@ -180,7 +180,7 @@ runs in two modes (`is_thin`) and **the expectations invert** between them.
   `SHF_ALLOC` section, because the packer strips everything else and its own guard is a
   byte-scan.
 - **Not a tracing build.** A `-DSOPK_RT_LOG` artifact logs the target soname, `.text` RVA and
-  size, and a final "OK" to logcat. Refused unless `--allow-helper-log`, which warns on every
+  size, and a final "OK" to logcat. Refused unless `logging.allow-helper-log: true`, which warns on every
   pack.
 - **Strip.** Every non-`SHF_ALLOC` section is removed from both emitted artifacts - on a
   default (unstripped) build that is the whole symbol table plus megabytes of DWARF (§ Phase 4).
@@ -618,7 +618,8 @@ that zeroed `e_shoff`, and Android 14+ refuses to load the result.
 
 For the **Phase 6** tracing build, add `-DSOPK_RT_LOG -llog` (the `-D` may sit anywhere on the
 line - the driver collects defines globally - but `-llog` must come after the source). Such an
-artifact must then be packed with `sopack pack --allow-helper-log`, because it logs the target
+artifact must then be packed with `logging.allow-helper-log: true` in the config, because it
+logs the target
 soname and the `.text` address and size to logcat; the packer refuses it otherwise, and the
 result is not shippable.
 
@@ -696,19 +697,25 @@ APK=path/to/your.apk
 OUT=output/vsa-encrypted.apk
 TGT=libso1.so                   # the lib you check below
 
-python3 -m sopack.cli pack "$APK" \
-  --lib "libso1.so,libso2.so" \
-  --abi arm64-v8a \
-  -o "$OUT"
+python3 -m sopack.cli pack "$APK" -o "$OUT"
 ```
 
-`--cipher wbaes` and `--verify` are the **defaults**, so neither appears above, and there is no
-`--wb-keygen`: Phase 1 installed the keygen at `vendor/wbc/bin/wb_keygen`, which
-`provision.find_wb_keygen` probes first.
+To narrow the pack to specific libraries instead of every `lib/arm64-v8a/*.so`, write a config
+first (`python3 -m sopack.cli init-config`) and set:
 
-**Quote the `--lib` list.** It is comma-separated but must be ONE argv word: unquoted
-`--lib libso1.so, libso2.so` shell-splits, and argparse rejects the second name with
-`error: unrecognized arguments: libso2.so`.
+```yaml
+libraries:
+  include:
+    - libso1.so
+    - libso2.so
+```
+
+The command line carries only the input and output APK; the rest is `./config.yaml` (or
+`--config PATH`). `cipher: wbaes`, `abis: [arm64-v8a]` and `signing.verify: true` are the
+**defaults**, so a config that only narrows `libraries.include` is enough - and with no config
+at all this packs every `lib/arm64-v8a/*.so`. There is no `--wb-keygen` and no config key for
+one: Phase 1 installed the keygen at `vendor/wbc/bin/wb_keygen`, which
+`provision.find_wb_keygen` probes first.
 
 Verify the output APK:
 
@@ -775,7 +782,7 @@ depending on it, and the provider's `DT_SONAME` being literally `libsopk_wb.so`;
 around them rather than 1980-01-01 - an outlier there was the *first* thing a static-analysis
 report noticed about a shipped APK, before any disassembly; (7) no `.symtab`/`.debug_*`/host
 paths on either, `.shstrtab` still present; (8) the thin helper is a few KB and the provider
-~470 KB. `--verify` prints a signer cert. No AES key appears anywhere: the long-term key is
+~470 KB. `signing.verify` prints a signer cert. No AES key appears anywhere: the long-term key is
 diffused into the white-box blob (inside the provider), and each session key ships only in
 its wrapped form.
 
@@ -810,7 +817,7 @@ tables, so `readelf --dyn-syms` alone can mislead in either direction.
 **Strongly recommended for the FIRST device test: build both skeletons with tracing** so each
 helper's decrypt is visible in logcat (a release build does not log, so an abort names no
 cause). Add `-DSOPK_RT_LOG -llog` to the Phase-4 lines, rebuild, re-pack with
-`--allow-helper-log`, then:
+`logging.allow-helper-log: true`, then:
 
 ```bash
 adb install -r out.apk

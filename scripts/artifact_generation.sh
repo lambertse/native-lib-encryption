@@ -51,8 +51,8 @@
 #                        libwbcrypto.a phases). Slow.
 #   --allow-foreign-host generate on a host that cannot produce a usable wb_keygen (i.e. neither
 #                        macOS nor Linux), or deliberately cut a keygen-free bundle on one that
-#                        can. bin/wb_keygen is OMITTED and the bundle only supports
-#                        --cipher chacha20/xor.
+#                        can. bin/wb_keygen is OMITTED and the bundle's config.yaml pins
+#                        cipher: chacha20 (xor also works; wbaes cannot).
 #   --allow-unobfuscated-provider
 #                        build libsopk_wb.so WITHOUT O-MVLL. The provider is the artifact whose
 #                        static-analysis resistance matters most, so this is never implied - not
@@ -179,7 +179,7 @@ case "$HOST_OS" in
        wb_keygen)."
         fi
         warn "generating on $HOST_OS/$HOST_ARCH with --allow-foreign-host: bin/wb_keygen is
-      OMITTED, so this bundle supports --cipher chacha20/xor only, NOT wbaes"
+      OMITTED, so this bundle supports cipher chacha20/xor only, NOT wbaes"
         WITH_KEYGEN=0 ;;
 esac
 # --allow-foreign-host on a host that COULD carry a keygen is still honoured - it is the
@@ -187,7 +187,7 @@ esac
 # looks like the gate above fired.
 if [ "$ALLOW_FOREIGN" -eq 1 ] && [ "$WITH_KEYGEN" -eq 1 ]; then
     warn "--allow-foreign-host on $HOST_OS/$HOST_ARCH, which CAN carry a keygen: omitting
-      bin/wb_keygen anyway, so this bundle supports --cipher chacha20/xor only"
+      bin/wb_keygen anyway, so this bundle supports cipher chacha20/xor only"
     WITH_KEYGEN=0
 fi
 info "host: $HOST_OS/$HOST_ARCH   target: $ABI / android-$API"
@@ -270,8 +270,8 @@ say "artifact gates"
 
 # 3. Release-skeleton gate. device_test.sh builds --trace skeletons into these exact paths, so
 #    "the file exists" says nothing about which build it is. A tracing helper logs the target
-#    name, .text address and size at load, and `sopack pack` refuses it without
-#    --allow-helper-log - so bundling one ships something that is either rejected or unsafe.
+#    name, .text address and size at load, and `sopack pack` refuses it unless the config says
+#    logging.allow-helper-log - so bundling one ships something either rejected or unsafe.
 for so in "$SKEL" "$PROV"; do
     if grep -qa '__android_log_print' "$so"; then
         die "$(basename "$so") is a TRACING build (-DSOPK_RT_LOG): it imports
@@ -529,8 +529,13 @@ z = zipfile.ZipFile(whl)
 names = set(z.namelist())
 
 skel_member, prov_member = 'sopack/stubs/sopk_rt_%s.so' % abi, 'sopack/stubs/sopk_wb_%s.so' % abi
+# config.py carries the config loader AND the SAMPLE_YAML that `sopack init-config` writes.
+# It is a .py so the `cp "$SOPACK"/sopack/*.py` staging above picks it up - but a wheel that
+# lost it would still install cleanly and only fail when the receiving machine packs, which is
+# precisely what this gate exists to prevent.
 required = [skel_member, prov_member,
-            'sopack/cli.py', 'sopack/stubs.py', 'sopack/rt_meta.py', 'sopack/provision.py']
+            'sopack/cli.py', 'sopack/config.py', 'sopack/stubs.py', 'sopack/rt_meta.py',
+            'sopack/provision.py']
 for a in ('arm64-v8a', 'armeabi-v7a', 'x86_64'):
     required += ['sopack/stubs/stub_%s.bin' % a, 'sopack/stubs/stub_%s.json' % a]
 
@@ -560,7 +565,7 @@ rm -rf "$OUT"
 mkdir -p "$OUT/stubs" "$OUT/bin"
 
 # All three ABIs' blobs regardless of --abi: they are 6-8 KB, they are committed, and a
-# receiving Mac running `--cipher chacha20 --abi all` needs them. --abi governs the skeletons.
+# receiving Mac with `cipher: chacha20` and `abis: all` needs them. --abi governs the skeletons.
 for f in "$STUBDIR"/stub_*.bin "$STUBDIR"/stub_*.json; do
     [ -f "$f" ] || die "no stub blobs in $STUBDIR - they are committed package data, so this
        means the checkout is incomplete. Run: bash stub/build_stubs.sh $API"
@@ -572,6 +577,88 @@ cp "$SKEL" "$PROV" "$OUT/stubs/"
 # free only if it is already in place. Installing an unverified wheel would defeat that check.
 cp "$WHEEL" "$OUT/"
 WHEEL_NAME="$(basename "$WHEEL")"
+
+# ---- the bundle's own config.yaml -------------------------------------------------------
+# The FULL commented config, not a stub. The receiving machine has no checkout, so a two-key
+# file that says "run sopack init-config to see the rest" is telling the one reader who
+# cannot easily get to the rest. This ships the same file `sopack init-config` writes, with
+# the two bundle-specific values substituted in.
+#
+# Those two, and only those two, cannot be left at their defaults:
+#
+#   abis:   a bundle carries ONE ABI's wbaes skeletons. sopack's default is arm64-v8a, so an
+#           x86_64 bundle left on the defaults fails at pack time with StubMissingError.
+#   cipher: an --allow-foreign-host bundle carries no bin/wb_keygen, so the default wbaes
+#           cannot seal a blob at all.
+#
+# Generated from sopack.config.SAMPLE_YAML rather than copied from the checkout's
+# config.sample.yaml: the receiving machine installs the WHEEL, so the config has to match
+# what the wheel carries, not what happens to be lying in the source tree.
+#
+# Written BEFORE the SHA256SUMS pass below, which sweeps `find . -type f`, so it is covered.
+if [ "$WITH_KEYGEN" -eq 1 ]; then
+    BUNDLE_CIPHER="wbaes"
+    BUNDLE_CIPHER_NOTE="wbaes is the default and this bundle carries bin/wb_keygen, which
+# sopack finds on its own - nothing to export, nothing to configure."
+else
+    BUNDLE_CIPHER="chacha20"
+    BUNDLE_CIPHER_NOTE="NOT the default: this bundle was generated with --allow-foreign-host,
+# so it carries no bin/wb_keygen and cipher: wbaes cannot seal a blob here. Regenerate the
+# bundle on macOS or Linux/x86_64 for white-box support."
+fi
+# Absolute dest, because the generator runs from $SOPACK: `import sopack` resolves from the
+# repo root (the preflight above checks it exactly that way), but --out may be relative and
+# would then land somewhere else entirely.
+BUNDLE_CFG="$(cd "$OUT" && pwd)/config.yaml"
+( cd "$SOPACK" && python3 - "$BUNDLE_CFG" "$BUNDLE_CIPHER" "$ABI" "$BUNDLE_CIPHER_NOTE" <<'PY'
+
+import re, sys
+from sopack.config import SAMPLE_YAML, loads
+
+dest, cipher, abi, cipher_note = sys.argv[1:5]
+
+header = (
+    "# sopack configuration for THIS bundle.\n"
+    "#\n"
+    "#   sopack pack <your.apk> -o packed.apk --config <this file>\n"
+    "#\n"
+    "# This is the complete, commented config - the same file `sopack init-config` writes,\n"
+    "# with two values pinned to what this bundle can actually do (marked BUNDLE-PINNED\n"
+    "# below). Everything else is at its default. Edit any of it.\n"
+    "\n"
+)
+
+# Anchored, and the replacement COUNT is checked: the sample's prose names every cipher and
+# every ABI in comments, and on the default arm64-v8a + keygen bundle the intended values are
+# identical to the sample's own defaults - so a parse-back alone could not tell a working
+# substitution from one that matched nothing. Only the count can.
+text, n = re.subn(r'(?m)^cipher: wbaes$',
+                  '# BUNDLE-PINNED: %s\ncipher: %s' % (cipher_note, cipher),
+                  SAMPLE_YAML)
+if n != 1:
+    sys.exit("ERROR: expected exactly one 'cipher: wbaes' line in SAMPLE_YAML, matched %d.\n"
+             "       sopack/config.py's sample changed shape and this substitution no longer\n"
+             "       finds it - the bundle would ship an unpinned config." % n)
+
+text, n = re.subn(r'(?m)^  - arm64-v8a$', '  - %s' % abi, text)
+if n != 1:
+    sys.exit("ERROR: expected exactly one '  - arm64-v8a' list entry in SAMPLE_YAML, matched "
+             "%d.\n       The abis: block changed shape; the bundle would ship the wrong ABI."
+             % n)
+
+text = header + text
+
+# Parse it back with sopack's own loader: catches a substitution that matched but produced
+# something the packer will reject, which would otherwise surface at first pack.
+cfg = loads(text, dest)
+if cfg.cipher != cipher or list(cfg.abis) != [abi]:
+    sys.exit("ERROR: the generated bundle config parses as cipher=%s abis=%s, wanted %s / [%s]"
+             % (cfg.cipher, list(cfg.abis), cipher, abi))
+
+open(dest, "w").write(text)
+PY
+) || die "could not generate the bundle's config.yaml (see the error above)"
+ok "bundle config.yaml: full sample, cipher=$BUNDLE_CIPHER abis=$ABI ($(grep -c . "$BUNDLE_CFG") non-blank lines)"
 if [ "$WITH_KEYGEN" -eq 1 ]; then
     cp "$WBKEYGEN" "$OUT/bin/wb_keygen"
     chmod +x "$OUT/bin/wb_keygen"
@@ -616,7 +703,7 @@ cat >"$OUT/install.sh" <<'INSTALL_SH'
 #
 # By default it creates a virtualenv beside this script, installs the wheel into it, and then
 # verifies that the install can actually reach its own skeletons. pip needs network once, to
-# fetch lief.
+# fetch sopack's dependencies (lief and pyyaml).
 #
 # Usage:
 #   ./install.sh                 # venv at ./venv, install the wheel, verify
@@ -680,7 +767,7 @@ elif [ "$WANT_OS/$WANT_ARCH" != "$HAVE_OS/$HAVE_ARCH" ] && [ "$NO_KEYGEN" -eq 0 
     die "this bundle's bin/wb_keygen was built on $WANT_OS/$WANT_ARCH and this host is
        $HAVE_OS/$HAVE_ARCH, so it will not execute here. Everything else in the bundle is either
        pure Python or an Android target ELF and is host-neutral: re-run with --no-keygen to
-       install those, then pack with --cipher chacha20 (or build a host wb_keygen from a sopack
+       install those, then pack with cipher: chacha20 (or build a host wb_keygen from a sopack
        checkout with ./scripts/build_wbaes.sh)."
 fi
 
@@ -729,8 +816,8 @@ else
       pip will refuse, and an editable sopack already installed there will shadow this one."
 fi
 
-say "installing $WHEEL (pip fetches lief from PyPI - this step needs network once)"
-# Two calls on purpose. The first resolves dependencies (lief) on a fresh environment. The second
+say "installing $WHEEL (pip fetches lief + pyyaml from PyPI - this step needs network once)"
+# Two calls on purpose. The first resolves dependencies (lief, pyyaml) on a fresh environment. The second
 # forces THESE bytes into place with no download: the wheel version only changes with the git
 # rev, so re-installing a regenerated bundle at the same rev would otherwise be "already
 # satisfied" and leave the OLD skeletons installed - the stale-artifact failure this bundle
@@ -788,8 +875,8 @@ try:
 except Exception as e:
     sys.exit("ERROR: the installed sopack cannot reach its own artifacts: %s" % e)
 
-# The keygen is DISCOVERED, not configured: --cipher wbaes is the default and there is no
-# --wb-keygen flag any more, so provision.find_wb_keygen has to resolve this bundle's
+# The keygen is DISCOVERED, not configured: wbaes is the default cipher and there is neither a
+# --wb-keygen flag nor a config key for it, so provision.find_wb_keygen has to resolve this bundle's
 # bin/wb_keygen on its own (via sys.prefix's parent, guarded by the sibling MANIFEST.txt).
 # If that probe misses, the install still looks perfect and the FIRST PACK fails - on the
 # machine least equipped to debug it. So resolve it here, while the bundle is still in hand.
@@ -798,7 +885,7 @@ if want_keygen == '1':
     try:
         found = find_wb_keygen()
     except Exception as e:
-        sys.exit("ERROR: sopack cannot find this bundle's bin/wb_keygen, so --cipher wbaes\n"
+        sys.exit("ERROR: sopack cannot find this bundle's bin/wb_keygen, so cipher: wbaes\n"
                  "       (the default) would fail at pack time: %s" % e)
     if os.path.realpath(found) != os.path.realpath(os.path.join(bundle, 'bin', 'wb_keygen')):
         sys.exit("ERROR: sopack resolved wb_keygen to %s, not this bundle's %s.\n"
@@ -829,6 +916,17 @@ except Exception as e:
         "       interpreter (Python %d.%d) is newer than any published lief wheel: re-run as\n"
         "       ./install.sh --python /path/to/python3.11"
         % (e, sys.version_info[0], sys.version_info[1]))
+# pyyaml is the other dependency pip resolved just now, and it is not optional: every setting
+# except the input and output APK comes from a config file, so without it `sopack pack` cannot
+# read its own configuration. Same class of failure as lief - invisible until the first pack.
+try:
+    import yaml
+except Exception as e:
+    sys.exit(
+        "ERROR: pyyaml did not install: %s\n"
+        "       sopack reads all of its settings from a YAML config file, so it cannot pack\n"
+        "       without it. Re-run install.sh with network available." % e)
+
 if want_lief not in ('', 'unknown', lief.__version__):
     print("    WARN: lief %s here, %s on the machine that generated this bundle. The >=1.0 floor\n"
           "          is what matters (0.17.0 emitted 4 KB-aligned LOAD segments sopack refuses)."
@@ -842,10 +940,10 @@ PY
 if [ "$NO_KEYGEN" -eq 1 ] || [ ! -f "$HERE/bin/wb_keygen" ]; then
     cat <<EOF
 
-==> Installed. This bundle has no usable wb_keygen here, so --cipher is REQUIRED: the default
-    (wbaes) cannot seal a blob without one. Pack with a stub cipher instead:
+==> Installed. This bundle has no usable wb_keygen here, so it cannot seal a white-box blob.
+    Its config.yaml already pins cipher: chacha20 for that reason - pack with it:
 
-  $SOPACK_CMD pack <your.apk> --cipher chacha20 --abi $(man abi) -o packed.apk
+  $SOPACK_CMD pack <your.apk> -o packed.apk --config "$HERE/config.yaml"
 
   The raw key then ships in the binary (whitened), not sealed in a white-box.
 
@@ -856,18 +954,20 @@ fi
 chmod +x "$HERE/bin/wb_keygen"
 cat <<EOF
 
-==> Installed. Pack - wbaes and --verify are the defaults, and sopack finds this bundle's
-    bin/wb_keygen on its own (the probe above just confirmed it):
+==> Installed. Pack - this bundle's config.yaml pins cipher: wbaes and abis: [$(man abi)], and
+    sopack finds this bundle's bin/wb_keygen on its own (the probe above just confirmed it):
 
-  $SOPACK_CMD pack <your.apk> --abi $(man abi) -o packed.apk
+  $SOPACK_CMD pack <your.apk> -o packed.apk --config "$HERE/config.yaml"
 
-  Omit --abi too if $(man abi) is what you want; it is the default. Omit --lib (as here) to
-  pack every lib/$(man abi)/*.so in the APK. Add --no-verify to skip the signature dump.
+  Everything except the input and output APK is configured in that file, and it selects every
+  lib/$(man abi)/*.so in the APK by default. It is the COMPLETE commented config - every option
+  is in there with an explanation, so open it rather than hunting for docs. Edit it to name
+  libraries, add exclusions, point at your own keystore or turn the signature dump off.
 
-  This bundle carries wbaes skeletons for $(man abi) ONLY. The stub blobs cover all three
-  ABIs, so --cipher chacha20 --abi all works, but '--abi all' on the DEFAULT cipher would
-  fail with a StubMissingError at pack time - regenerate the bundle per ABI if you need
-  another.
+  This bundle carries wbaes skeletons for $(man abi) ONLY, which is why config.yaml pins that
+  ABI. The stub blobs cover all three, so a chacha20/xor config can widen \`abis:\`, but wbaes
+  on another ABI fails with a StubMissingError at pack time - regenerate the bundle per ABI if
+  you need another.
   See README.md in this bundle for the tools you still need on this machine (JDK, apksigner).
 EOF
 INSTALL_SH
@@ -879,15 +979,20 @@ chmod +x "$OUT/install.sh"
 # cipher at all. Now that wbaes IS the default, that would be a recipe that fails on the first
 # try, so the two cases diverge here.
 if [ "$WITH_KEYGEN" -eq 1 ]; then
-    KEYGEN_RECIPE_SUFFIX=""
-    KEYGEN_RECIPE_NOTE="\`--cipher wbaes\` and \`--verify\` are the defaults, and sopack locates
-this bundle's \`bin/wb_keygen\` itself - nothing to export, no flag to pass."
+    KEYGEN_RECIPE_NOTE="This bundle's \`config.yaml\` pins \`cipher: wbaes\` and \`abis: [$ABI]\`;
+signature verification is on by default. sopack locates this bundle's \`bin/wb_keygen\` itself -
+nothing to export, nothing to configure."
 else
-    KEYGEN_RECIPE_SUFFIX=" --cipher chacha20"
-    KEYGEN_RECIPE_NOTE="**\`--cipher chacha20\` is required here.** This bundle was generated with
-\`--allow-foreign-host\`, so it carries no \`bin/wb_keygen\` and the default cipher (\`wbaes\`)
-cannot seal a blob. Regenerate the bundle on macOS or Linux/x86_64 for white-box support."
+    KEYGEN_RECIPE_NOTE="**This bundle's \`config.yaml\` pins \`cipher: chacha20\`, and that is not
+optional here.** It was generated with \`--allow-foreign-host\`, so it carries no
+\`bin/wb_keygen\` and the default cipher (\`wbaes\`) cannot seal a blob. Regenerate the bundle on
+macOS or Linux/x86_64 for white-box support."
 fi
+# Each recipe below passes --config with ITS OWN path to the bundle's config.yaml rather than
+# relying on the ./config.yaml lookup: the user unpacks the bundle somewhere and packs from
+# wherever they happen to be, so the CWD is not the bundle. That is why this is spelled out per
+# recipe instead of being one shared suffix variable - the three recipes reach the bundle by
+# three different paths.
 
 # The provider's obfuscation state is a property of the shipped artifact, so it belongs in the
 # bundle's own README rather than only in the generating repo's logs.
@@ -920,7 +1025,7 @@ Generated from sopack \`$SOPACK_REV\` for \`$ABI\` / android-$API.
 
 \`\`\`bash
 cd /path/to/this/bundle && ./install.sh
-./venv/bin/sopack pack <your.apk> -o packed.apk${KEYGEN_RECIPE_SUFFIX}
+./venv/bin/sopack pack <your.apk> -o packed.apk --config ./config.yaml
 \`\`\`
 
 ${KEYGEN_RECIPE_NOTE}
@@ -933,7 +1038,7 @@ The virtualenv is not tidiness: Homebrew's \`python3\` on macOS is externally ma
 so installing the wheel into it directly fails with \`error: externally-managed-environment\`.
 Useful flags: \`--python PATH\` (build the venv from a specific interpreter), \`--no-venv\`
 (install into \`python3 -m pip\` anyway), \`--no-keygen\` (skip \`bin/wb_keygen\` on a host that
-cannot run it - you still get \`--cipher chacha20\`).
+cannot run it - you still get \`cipher: chacha20\`).
 
 ## What you still need on this machine
 
@@ -941,9 +1046,9 @@ cannot run it - you still get \`--cipher chacha20\`).
 |---|---|---|
 | Python >= 3.9 with \`venv\` | runs the tool; \`install.sh\` builds the venv with it | **yes** |
 | **Network, once** | \`pip\` fetches \`lief\` while installing the wheel. Nothing else is downloaded | **yes**, at install time only |
-| A **JDK** (\`keytool\`, \`java\`) | \`keytool\` runs on your **first pack even without \`--keystore\`** - sopack generates \`~/.sopack/debug.keystore\`. \`java\` is needed when apksigner resolves to a \`.jar\` | **yes**, every cipher |
-| \`apksigner\` | signs the repackaged APK, and backs \`--verify\` | **yes**. Found on PATH, under \`\$ANDROID_SDK_ROOT\`/\`\$ANDROID_HOME\` \`build-tools/*\`, or via \`\$SOPACK_APKSIGNER_JAR\` |
-| \`bin/wb_keygen\` (in this bundle) | seals the white-box blob at pack time | \`--cipher wbaes\` (the DEFAULT) only. Found automatically - it sits beside the venv \`install.sh\` creates, and sopack probes there |
+| A **JDK** (\`keytool\`, \`java\`) | \`keytool\` runs on your **first pack even with no keystore configured** - sopack generates \`~/.sopack/debug.keystore\`. \`java\` is needed when apksigner resolves to a \`.jar\` | **yes**, every cipher |
+| \`apksigner\` | signs the repackaged APK, and backs \`signing.verify\` | **yes**. Found on PATH, under \`\$ANDROID_SDK_ROOT\`/\`\$ANDROID_HOME\` \`build-tools/*\`, or via \`\$SOPACK_APKSIGNER_JAR\` |
+| \`bin/wb_keygen\` (in this bundle) | seals the white-box blob at pack time | \`cipher: wbaes\` (the DEFAULT) only. Found automatically - it sits beside the venv \`install.sh\` creates, and sopack probes there |
 | \`zipalign\` | 16 KB alignment of the output APK | optional - sopack falls back to a pure-Python aligner |
 | \`openssl\` | fast ChaCha20 / AES-CTR | optional - pure-Python fallback runs at ~0.6 MB/s, so a multi-MB \`.text\` is slow but correct |
 
@@ -959,10 +1064,11 @@ machine, and their output travels inside the wheel.
 | Path | Host-neutral? | What |
 |---|---|---|
 | \`$WHEEL_NAME\` | yes | **the tool**, pure Python. Carries the \`$ABI\` skeletons + all three ABIs' stub blobs as package data - which is why its version carries the \`+$WHEEL_LOCAL\` local tag naming the ABI, API level and sopack revision it was cut from. \`pip show sopack\` on this machine reads it back |
-| \`stubs/stub_*.bin\`, \`stubs/stub_*.json\` | yes | freestanding stub blobs for all three ABIs (\`--cipher chacha20\`/\`xor\`), as loose copies |
+| \`stubs/stub_*.bin\`, \`stubs/stub_*.json\` | yes | freestanding stub blobs for all three ABIs (\`cipher: chacha20\`/\`xor\`), as loose copies |
 | \`stubs/sopk_wb_$ABI.so\` | yes | the shared white-box provider, one per ABI. Obfuscation: **$PROVIDER_OBFUSCATION** |
 | \`stubs/sopk_rt_$ABI.so\` | yes | the thin per-target helper skeleton the packer clones |
 | \`bin/wb_keygen\` | **no** | host provisioning tool, $HOST_OS/$HOST_ARCH; linkage **$KEYGEN_LINKAGE** |
+| \`config.yaml\` | yes | **the pack settings, fully commented.** Every option with an explanation - this file is the documentation. Two values are pinned to this bundle (\`cipher: $BUNDLE_CIPHER\`, \`abis: [$ABI]\`), marked BUNDLE-PINNED; the rest is at its default. Edit it in place |
 | \`MANIFEST.txt\` | - | provenance; \`install.sh\` reads it back |
 | \`SHA256SUMS\` | - | integrity, over every file including the wheel |
 
@@ -973,7 +1079,7 @@ copy lives inside \`venv/\` where nobody looks.
 Both skeletons are **release** builds: no logcat tracing, so a failure at load is a silent
 SIGABRT by design. If a packed app crashes on device, rebuild with
 \`./scripts/build_wbaes.sh --trace\` on the generating machine and pack with
-\`--allow-helper-log\` to find out why - do not ship that build.
+\`logging.allow-helper-log: true\` in your config to find out why - do not ship that build.
 
 ${PROVIDER_NOTE}
 
@@ -1014,14 +1120,14 @@ if [ -n "$TARBALL" ]; then
 
   mkdir -p ~/sopack-bundle && tar xzf $(basename "$TARBALL") -C ~/sopack-bundle
   ~/sopack-bundle/install.sh
-  ~/sopack-bundle/venv/bin/sopack pack <your.apk> -o packed.apk${KEYGEN_RECIPE_SUFFIX}
+  ~/sopack-bundle/venv/bin/sopack pack <your.apk> -o packed.apk --config ~/sopack-bundle/config.yaml
 EOF
 else
     cat <<EOF
 
   # copy $(basename "$OUT")/ across, then:
   ./$(basename "$OUT")/install.sh
-  ./$(basename "$OUT")/venv/bin/sopack pack <your.apk> -o packed.apk${KEYGEN_RECIPE_SUFFIX}
+  ./$(basename "$OUT")/venv/bin/sopack pack <your.apk> -o packed.apk --config ./$(basename "$OUT")/config.yaml
 EOF
 fi
 cat <<EOF
@@ -1036,7 +1142,7 @@ EOF
 if [ "$WITH_KEYGEN" -eq 0 ]; then
     cat <<EOF
 
-  This bundle has NO wb_keygen (--allow-foreign-host on a $HOST_OS builder), so it supports
-  --cipher chacha20/xor only. Re-generate it on macOS for wbaes.
+  This bundle has NO wb_keygen (--allow-foreign-host on a $HOST_OS builder), so its config.yaml
+  pins cipher: chacha20. Re-generate it on macOS for wbaes.
 EOF
 fi

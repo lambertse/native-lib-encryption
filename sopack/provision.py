@@ -1,4 +1,4 @@
-"""Host-side provisioning for `--cipher wbaes` (wbcrypto 3.0.0 key wrapping).
+"""Host-side provisioning for `cipher: wbaes` (wbcrypto 3.0.0 key wrapping).
 
 The white-box never touches bulk data - it runs at well under 1 MB/s, and 2.0.0 deleted
 the bulk entry points (`wbc_crypt_ctr`, `wbc_encrypt_ecb`) to make that unexpressible. It
@@ -228,11 +228,11 @@ def find_wb_keygen(explicit: str | None = None) -> str:
             bad.append(f"{cand}: {reason}")
             continue
         return cand
-    msg = ("could not find a host wb_keygen, which --cipher wbaes needs to seal the white-box "
+    msg = ("could not find a host wb_keygen, which `cipher: wbaes` needs to seal the white-box "
            "blob. Run ./scripts/build_wbaes.sh - it builds one from the pinned "
            "whitebox-cryptography submodule and installs it at vendor/wbc/bin/wb_keygen. If "
            "you installed from a portable bundle, run its install.sh instead. To pack without "
-           "a white-box at all, pass --cipher chacha20.")
+           "a white-box at all, set `cipher: chacha20` in your config.")
     if bad:
         msg += "\n  Candidates found but not runnable here:\n    " + "\n    ".join(bad)
     raise FileNotFoundError(msg)

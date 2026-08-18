@@ -225,15 +225,15 @@ static inline void sopk_logcat(const char *msg) {
 }
 ```
 
-The staged `--log` debug labels (`A:entry`, …) remain in cleartext: they are generic
-markers, emitted only under `--log`, and not a reliable packer fingerprint. Extending the
+The staged debug labels (`A:entry`, …) remain in cleartext: they are generic
+markers, emitted only under `logging.stub-log`, and not a reliable packer fingerprint. Extending the
 same helper to obfuscate them is straightforward if wanted.
 
 ---
 
 ## Method 5 - Strip the wbaes helper (symbols, DWARF, host paths)
 
-Applies to `--cipher wbaes` only: the injected helper `libsopk_rt_<target>.so` is a normal,
+Applies to `cipher: wbaes` only: the injected helper `libsopk_rt_<target>.so` is a normal,
 dynamically-linked `.so`, so unlike the freestanding stub blob it *has* a symbol table to leak.
 
 A static-analysis report on a shipped APK reconstructed the entire design - key hierarchy, load

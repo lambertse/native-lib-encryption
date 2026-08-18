@@ -43,6 +43,10 @@ libvosWrapperEx-arm64.so
 test_apks/
 vendor/
 artifacts/
+# ...and out/, which is the same thing produced by the CONTAINER: docker/README.md bind-mounts
+# it as the bundle destination, so a docker run leaves out/bundle/ and out/sopack-bundle-*.tar.gz
+# behind. Generated, host-specific, never committed - exactly like artifacts/.
+out/
 # ...and the tarball --tar writes NEXT TO the bundle (never inside it - an archive created in
 # the directory it is archiving self-includes).
 sopack-bundle-*.tar.gz
@@ -51,3 +55,13 @@ sopack-bundle-*.tar.gz
 # tests run on a bare clone (see tests/test_wbaes.py).
 !tests/fixtures/
 !tests/fixtures/**
+
+# A user's own pack settings, which `sopack init-config` writes here and which are per-machine
+# (keystore paths) or secret (passwords, when they are not ${VAR} references). config.sample.yaml
+# is the committed one.
+#
+# Ignoring it also closes a silent-capture hole: sopack falls back to ./config.yaml when no
+# --config is passed, and scripts/device_test.sh packs from inside `cd "$SOPACK"`. A stray
+# config.yaml at the repo root - the natural place to run init-config, right beside the sample -
+# would otherwise be picked up by every harness run without saying so.
+/config.yaml

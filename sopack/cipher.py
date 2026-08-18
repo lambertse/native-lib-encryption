@@ -312,7 +312,7 @@ def aes128_ctr(data: bytes, key: bytes, iv: bytes) -> bytes:
 
 
 def gen_wbaes_params() -> tuple[bytes, bytes, bytes, bytes]:
-    """Fresh per-library key material for `--cipher wbaes` (key wrapping):
+    """Fresh per-library key material for `cipher: wbaes` (key wrapping):
 
         kek      - 16-byte AES-128 long-term key; sealed into the white-box, then discarded
         sk       - 32-byte session key; drives the ChaCha20 over `.text`, then discarded
