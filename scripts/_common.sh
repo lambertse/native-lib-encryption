@@ -54,6 +54,67 @@ ask_path() {
     done
 }
 
+# ---- host-binary portability -------------------------------------------------------------
+# elf_needed FILE - print this ELF's DT_NEEDED sonames, one per line; nothing when it is
+# statically linked. Used on Linux by build_wbaes.sh (to decide a cached wb_keygen is stale)
+# and by artifact_generation.sh gate 4 (to refuse bundling a non-portable one). One definition
+# because those two must agree on what "static" means, or the build produces a keygen the
+# bundler then rejects.
+#
+# Exit status 2 means "could not tell" (no readelf/objdump), which is NOT the same as "static"
+# and callers must not conflate them - silently treating unknown as static is how a
+# glibc-floored binary would reach the target machine.
+elf_needed() {
+    if have readelf; then
+        readelf -d "$1" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'
+    elif have objdump; then
+        objdump -p "$1" 2>/dev/null | awk '$1 == "NEEDED" { print $2 }'
+    else
+        return 2
+    fi
+}
+
+# elf_machine FILE - print the ELF e_machine number (62 = x86-64, 183 = AArch64), or nothing if
+# FILE is not a little-endian ELF. Read straight out of the header rather than parsed from
+# `readelf -h`, whose wording varies between binutils and LLVM ("Advanced Micro Devices X86-64"
+# vs "X86-64"); the number is the stable thing.
+elf_machine() {
+    [ "$(od -An -tx1 -j0 -N4 "$1" 2>/dev/null | tr -d ' \n')" = "7f454c46" ] || return 0
+    # EI_DATA (byte 5): 1 = little-endian. od interprets multi-byte values host-endian, so bail
+    # rather than misreport on a big-endian object. Nothing sopack targets is big-endian.
+    [ "$(od -An -tu1 -j5 -N1 "$1" 2>/dev/null | tr -d ' \n')" = "1" ] || return 0
+    od -An -tu2 -j18 -N2 "$1" 2>/dev/null | tr -d ' \n'
+}
+
+# host_elf_machine - the e_machine this host runs natively, or nothing if we cannot say.
+#
+# This exists because "the binary executed, so it is the right architecture" IS NOT TRUE, and the
+# way it fails is silent. Docker Desktop on Apple Silicon runs a linux/amd64 container on an
+# aarch64 kernel, so an aarch64 ELF inside that container runs perfectly while `uname -m` reports
+# x86_64. A wb_keygen built in that state seals blobs happily on the builder and is a dead file on
+# the actual x86_64 target - after every gate has gone green.
+host_elf_machine() {
+    case "$(uname -m)" in
+        x86_64|amd64)   echo 62 ;;
+        aarch64|arm64)  echo 183 ;;
+        armv7l|armv6l)  echo 40 ;;
+        i386|i686)      echo 3 ;;
+        riscv64)        echo 243 ;;
+        ppc64le)        echo 21 ;;
+        s390x)          echo 22 ;;
+    esac
+}
+
+# elf_machine_name NUM - a human name for the numbers above, for error messages.
+elf_machine_name() {
+    case "$1" in
+        62)  echo "x86-64" ;;   183) echo "AArch64" ;;  40) echo "ARM" ;;
+        3)   echo "i386" ;;     243) echo "RISC-V" ;;   21) echo "ppc64le" ;;
+        22)  echo "s390x" ;;    "")  echo "not an ELF" ;;
+        *)   echo "EM_$1" ;;
+    esac
+}
+
 # ---- the whitebox-cryptography dependency ------------------------------------------------
 # WBC is a PINNED GIT SUBMODULE at third_party/whitebox-cryptography. It used to arrive out of
 # band, which meant three scripts each guessed a different default and none of them recorded

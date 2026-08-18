@@ -32,7 +32,7 @@ pip install -e .
 
 Three ways out, in order of preference:
 
-- run the build above (needs the NDK, macOS for O-MVLL, and network once);
+- run the build above (needs the NDK, macOS or Linux/x86_64 for O-MVLL, and network once);
 - install from a portable bundle (`artifacts/install.sh`), which carries all of it prebuilt;
 - pack with **`--cipher chacha20`**, which needs no build at all but ships the key inside the
   library (whitened). This is the right answer for a quick test, not for a release.

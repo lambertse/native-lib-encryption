@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 #
-# artifact_generation.sh - build the portable pack bundle in artifacts/: everything a SECOND macOS
+# artifact_generation.sh - build the portable pack bundle in artifacts/: everything a SECOND
 # machine needs to run `sopack pack`, and nothing it does not.
 #
 # The split that makes this possible: of the artifacts sopack needs, only ONE is host-specific.
 # The stub blobs and both wbaes skeletons are Android target ELFs - they do not care what packed
-# them - so they travel. `wb_keygen` is a native host binary and does not, which is why this
-# script refuses to run anywhere but macOS unless you pass --allow-foreign-host.
+# them - so they travel. `wb_keygen` is a native host binary and does not, so the bundle is
+# pinned to the OS/arch that generated it and install.sh refuses a mismatched host.
+#
+# Generation works on macOS and on Linux - the two OSes that can build a native wb_keygen. On
+# Linux it is linked STATICALLY (build_wbaes.sh does that), which is what lets a bundle built on
+# Debian install on a RHEL-ish target; gate 4 below refuses to ship one that is not. Any other
+# OS needs --allow-foreign-host, which omits the keygen and yields a chacha20/xor-only bundle.
+#
+# Separately, and not the same constraint: cross-building the SKELETONS needs an x86_64 host
+# (there is no linux-aarch64 NDK toolchain, and O-MVLL's Linux plugin is x86_64-only). That is
+# build_wbaes.sh's problem, and it does not arise under --skip-build.
 #
 # Scope is PACK-ONLY. The receiving machine runs sopack; it does not rebuild skeletons, so it
 # needs no NDK, no cmake/ninja and no whitebox-cryptography checkout. artifacts/README.md spells
@@ -40,8 +49,16 @@
 #                        valid) blobs - i.e. a dirty tree you did not ask for.
 #   --force              passed to build_wbaes.sh (redoes the cached host wb_keygen and Android
 #                        libwbcrypto.a phases). Slow.
-#   --allow-foreign-host generate on a non-macOS host. bin/wb_keygen is then OMITTED and the
-#                        bundle only supports --cipher chacha20/xor.
+#   --allow-foreign-host generate on a host that cannot produce a usable wb_keygen (i.e. neither
+#                        macOS nor Linux), or deliberately cut a keygen-free bundle on one that
+#                        can. bin/wb_keygen is OMITTED and the bundle only supports
+#                        --cipher chacha20/xor.
+#   --allow-unobfuscated-provider
+#                        build libsopk_wb.so WITHOUT O-MVLL. The provider is the artifact whose
+#                        static-analysis resistance matters most, so this is never implied - not
+#                        by the host, not by a missing plugin. It exists as the escape hatch for
+#                        a host where the plugin will not load, and it is recorded in
+#                        MANIFEST.txt as `provider-obfuscation: none`.
 #   --tar                also write ../sopack-bundle-<abi>-<host>-<rev>.tar.gz next to --out.
 #
 # SOPACK is this script's own repo - never asked for.
@@ -68,6 +85,7 @@ SKIP_BUILD=0
 REBUILD_STUBS=0
 FORCE=0
 ALLOW_FOREIGN=0
+ALLOW_UNOBF=0
 MAKE_TAR=0
 # 2: the bundle carries sopack-*.whl and MANIFEST.txt gained a `wheel:` field. A format-1 bundle
 # installed itself by copying into an existing editable checkout, which no longer exists as a
@@ -86,11 +104,12 @@ while [ "$#" -gt 0 ]; do
         --rebuild-stubs)      REBUILD_STUBS=1; shift ;;
         --force)              FORCE=1; shift ;;
         --allow-foreign-host) ALLOW_FOREIGN=1; shift ;;
+        --allow-unobfuscated-provider) ALLOW_UNOBF=1; shift ;;
         --tar)                MAKE_TAR=1; shift ;;
-        # 2..47 is the header comment block; it ends at the "SOPACK is this script's own repo"
+        # 2..64 is the header comment block; it ends at the "SOPACK is this script's own repo"
         # line, immediately before `set -euo pipefail`. Widen this if the header grows, or
         # --help starts printing shell code.
-        -h|--help)            sed -n '2,47p' "$0"; exit 0 ;;
+        -h|--help)            sed -n '2,64p' "$0"; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
@@ -135,19 +154,40 @@ if [ -e "$OUT" ]; then
 fi
 
 # ---- gate 2: host gate -----------------------------------------------------------------
+# The bundle is pinned to the host that generated it, because bin/wb_keygen is a native binary
+# and sopack/provision.py:_host_incompatible_reason refuses a foreign one BY FILE MAGIC on the
+# receiving machine (an ELF on a Mac, a Mach-O on Linux). That check is symmetric, and so is
+# install.sh's host-os/host-arch comparison - so the question here is not "is this macOS?" but
+# "can this host produce a wb_keygen someone can actually use?".
+#
+# Two OSes can: macOS, and Linux (where build_wbaes.sh links it statically, so it has no glibc
+# floor and installs on any distro). Deliberately not narrowed to Linux/x86_64: the arch that
+# matters is the one the RECEIVING machine runs, install.sh checks it, and an aarch64 Linux host
+# bundling for an aarch64 Linux pack host is perfectly coherent. What aarch64 Linux cannot do is
+# cross-build the skeletons - Google ships no linux-aarch64 NDK toolchain - but that is Phase 4's
+# problem and build_wbaes.sh says so precisely, and it does not arise under --skip-build.
 HOST_OS="$(uname -s)"
 HOST_ARCH="$(uname -m)"
 WITH_KEYGEN=1
-if [ "$HOST_OS" != "Darwin" ]; then
-    if [ "$ALLOW_FOREIGN" -eq 0 ]; then
-        die "this host is $HOST_OS, and a wbaes-capable bundle can only be generated on macOS.
-       bin/wb_keygen is a native binary, and sopack/provision.py:_host_incompatible_reason
-       hard-refuses an ELF wb_keygen on a darwin pack host - so an ELF one bundled here would
-       be dead weight the receiving Mac rejects by file magic. Run this on the Mac, or pass
-       --allow-foreign-host to build a chacha20/xor-only bundle (no wb_keygen)."
-    fi
-    warn "generating on $HOST_OS with --allow-foreign-host: bin/wb_keygen is OMITTED, so this
-      bundle supports --cipher chacha20/xor only, NOT wbaes"
+case "$HOST_OS" in
+    Darwin|Linux) ;;
+    *)
+        if [ "$ALLOW_FOREIGN" -eq 0 ]; then
+            die "this host is $HOST_OS/$HOST_ARCH, and a wbaes-capable bundle can only be
+       generated on macOS or Linux - the two OSes that can build a usable native wb_keygen.
+       Generate there, or pass --allow-foreign-host to build a chacha20/xor-only bundle (no
+       wb_keygen)."
+        fi
+        warn "generating on $HOST_OS/$HOST_ARCH with --allow-foreign-host: bin/wb_keygen is
+      OMITTED, so this bundle supports --cipher chacha20/xor only, NOT wbaes"
+        WITH_KEYGEN=0 ;;
+esac
+# --allow-foreign-host on a host that COULD carry a keygen is still honoured - it is the
+# documented way to cut a deliberately keygen-free bundle - but say so, because otherwise it
+# looks like the gate above fired.
+if [ "$ALLOW_FOREIGN" -eq 1 ] && [ "$WITH_KEYGEN" -eq 1 ]; then
+    warn "--allow-foreign-host on $HOST_OS/$HOST_ARCH, which CAN carry a keygen: omitting
+      bin/wb_keygen anyway, so this bundle supports --cipher chacha20/xor only"
     WITH_KEYGEN=0
 fi
 info "host: $HOST_OS/$HOST_ARCH   target: $ABI / android-$API"
@@ -182,16 +222,33 @@ if [ "$SKIP_BUILD" -eq 1 ]; then
     warn "--skip-build: bundling whatever is in sopack/stubs/ right now"
     [ -f "$SKEL" ] || die "no $SKEL - drop --skip-build, or build it first"
     [ -f "$PROV" ] || die "no $PROV - drop --skip-build, or build it first"
+    # A shared object records no obfuscation state, so this branch genuinely cannot tell an
+    # O-MVLL provider from a --no-omvll one. Record that rather than assuming the default held -
+    # same reasoning as build_wbaes.sh's warning when it reuses a cached libwbcrypto.a.
+    PROVIDER_OBFUSCATION="unknown"
 else
     # resolve_wbc already proved this is a usable >= 3.0.0 checkout, header and all - a bare
     # `-d` here would pass on an empty (uninitialised) submodule directory.
     [ -f "$WBC/include/wbcrypto.h" ] || die "no usable whitebox-cryptography at $WBC"
     [ -n "$NDK" ] || die "no Android NDK - pass --ndk PATH or export NDK/ANDROID_NDK_HOME."
-    say "building the wbaes artifacts via build_wbaes.sh (release, obfuscated, $ABI)"
     # --omvll is EXPLICIT even though it is build_wbaes.sh's default. A release bundle is the
     # one artifact that must never accidentally ship an unobfuscated provider, and an explicit
-    # flag keeps that true if that default ever moves again.
-    BUILD_ARGS="--release --omvll --abi $ABI --api $API"
+    # flag keeps that true if that default ever moves again. The opt-out is equally explicit and
+    # only ever comes from the user: nothing here infers it from the host or from a plugin that
+    # failed to load, because "it built" would then quietly mean "it built unobfuscated".
+    if [ "$ALLOW_UNOBF" -eq 1 ]; then
+        warn "--allow-unobfuscated-provider: building libsopk_wb.so WITHOUT O-MVLL. The provider
+      carries the sealed blob and every wbc_* call, so this is the artifact whose static
+      analysis matters most. MANIFEST.txt will record provider-obfuscation: none."
+        say "building the wbaes artifacts via build_wbaes.sh (release, UNOBFUSCATED, $ABI)"
+        OMVLL_ARG="--no-omvll"
+        PROVIDER_OBFUSCATION="none"
+    else
+        say "building the wbaes artifacts via build_wbaes.sh (release, obfuscated, $ABI)"
+        OMVLL_ARG="--omvll"
+        PROVIDER_OBFUSCATION="omvll"
+    fi
+    BUILD_ARGS="--release $OMVLL_ARG --abi $ABI --api $API"
     [ "$FORCE" -eq 1 ] && BUILD_ARGS="$BUILD_ARGS --force"
     # shellcheck disable=SC2086
     if ! ( cd "$SOPACK" && ./scripts/build_wbaes.sh $BUILD_ARGS --wbc "$WBC" --ndk "$NDK" ) \
@@ -225,26 +282,74 @@ for so in "$SKEL" "$PROV"; do
 done
 ok "both skeletons are release builds (no __android_log_print)"
 
-# 4+5. wb_keygen: the one host-specific file, so both its checks are about the RECEIVING Mac.
+# 4+5. wb_keygen: the one host-specific file, so both its checks are about the RECEIVING machine.
 KEYGEN_DESC="omitted (--allow-foreign-host; chacha20/xor only)"
+KEYGEN_LINKAGE="n/a"
 if [ "$WITH_KEYGEN" -eq 1 ]; then
     [ -x "$WBKEYGEN" ] || die "no runnable host wb_keygen at $WBKEYGEN. Run
        ./scripts/build_wbaes.sh (it installs one there), or pass --wb-keygen PATH."
 
-    # 4. Self-containment. A Homebrew libsodium/libomp picked up at link time resolves fine
-    #    HERE and fails with a dyld error on a Mac that does not have it - at first pack, long
-    #    after this script said OK. Only /usr/lib and /System are guaranteed present.
-    if have otool; then
-        FOREIGN="$(otool -L "$WBKEYGEN" | tail -n +2 | awk '{print $1}' \
-                   | grep -v '^/usr/lib/' | grep -v '^/System/' || true)"
-        [ -z "$FOREIGN" ] || die "$WBKEYGEN links libraries outside /usr/lib and /System:
+    # 4. Self-containment: whatever this binary needs at runtime must exist on a machine that has
+    #    only the tool. The failure it prevents is identical on both hosts - a link-time
+    #    dependency that resolves HERE and is missing THERE, surfacing at first pack, long after
+    #    this script said OK - but what counts as safe differs, so the check is per-OS.
+    if [ "$HOST_OS" = "Darwin" ]; then
+        #  macOS: a Homebrew libsodium/libomp picked up at link time fails with a dyld error on a
+        #  Mac that does not have it. Only /usr/lib and /System are guaranteed present. Static
+        #  linking is not the answer here - Apple ships no crt0.o for it.
+        if have otool; then
+            FOREIGN="$(otool -L "$WBKEYGEN" | tail -n +2 | awk '{print $1}' \
+                       | grep -v '^/usr/lib/' | grep -v '^/System/' || true)"
+            [ -z "$FOREIGN" ] || die "$WBKEYGEN links libraries outside /usr/lib and /System:
 $(printf '       %s\n' $FOREIGN)
        Those will not exist on the receiving Mac and dyld fails at first pack. Rebuild it
        statically (the submodule's scripts/gen_blob.sh vendors libsodium; ./scripts/
        build_wbaes.sh --force drives it)."
-        ok "wb_keygen links only system libraries"
+            ok "wb_keygen links only system libraries"
+            KEYGEN_LINKAGE="dynamic (system dylibs only)"
+        else
+            warn "no otool on PATH - cannot check wb_keygen for non-system dylib dependencies"
+            KEYGEN_LINKAGE="dynamic (unverified: no otool)"
+        fi
     else
-        warn "no otool on PATH - cannot check wb_keygen for non-system dylib dependencies"
+        #  Linux: there is no "guaranteed present" set to allow-list. Distros disagree on glibc
+        #  version, and a dynamically linked keygen carries a floor the receiving machine must
+        #  meet - `version GLIBC_2.xx not found` at first pack, on the machine least equipped to
+        #  debug it. build_wbaes.sh links it statically for exactly this reason, so require the
+        #  result: zero DT_NEEDED. That makes this gate STRONGER than the macOS one, not weaker.
+        #  ARCHITECTURE FIRST, and it is not redundant with gate 5 running the thing. Docker
+        #  Desktop on Apple Silicon runs a linux/amd64 container on an aarch64 kernel, so a
+        #  leftover aarch64 keygen in a shared checkout EXECUTES here while `uname -m` reports
+        #  x86_64 - gate 5 passes, MANIFEST records host-arch: x86_64, and the bundle is dead on
+        #  the real x86_64 target. "It ran" is not evidence of anything on an emulated host.
+        KEYGEN_EM="$(elf_machine "$WBKEYGEN")"
+        WANT_EM="$(host_elf_machine)"
+        [ -n "$KEYGEN_EM" ] || die "$WBKEYGEN is not a little-endian ELF, so it cannot be the
+       native host tool this bundle must carry. Rebuild it: ./scripts/build_wbaes.sh --force."
+        if [ -n "$WANT_EM" ] && [ "$KEYGEN_EM" != "$WANT_EM" ]; then
+            die "$WBKEYGEN is built for $(elf_machine_name "$KEYGEN_EM"), but this host reports
+       $HOST_ARCH ($(elf_machine_name "$WANT_EM")). MANIFEST.txt would advertise host-arch:
+       $HOST_ARCH and the bundle would carry a binary the receiving machine cannot execute.
+       The usual cause is a checkout shared with a container or machine of another architecture -
+       build-host/ and vendor/ are gitignored, so they travel with the tree. Fix:
+           rm -rf third_party/whitebox-cryptography/build-host vendor/wbc
+           ./scripts/build_wbaes.sh --force
+       Note this can happen even though the binary RUNS here: an emulated amd64 container on an
+       Apple Silicon host executes aarch64 binaries natively."
+        fi
+        ok "wb_keygen is a native $(elf_machine_name "$KEYGEN_EM") binary"
+
+        NEEDED="$(elf_needed "$WBKEYGEN")" || die "no readelf or objdump on PATH, so the linkage
+       of $WBKEYGEN cannot be checked. Do NOT assume static: a dynamically linked keygen
+       installs fine here and dies on the target. Install binutils and re-run."
+        [ -z "$NEEDED" ] || die "$WBKEYGEN is dynamically linked:
+$(printf '       %s\n' $NEEDED)
+       On Linux the bundle requires a STATIC keygen - the receiving machine is routinely a
+       different distro, and a shared-library dependency (glibc above all) turns into
+       'version GLIBC_2.xx not found' at first pack. build_wbaes.sh builds one statically via a
+       HOST_CXX wrapper; re-run it with --force, and do not set HOST_CXX yourself."
+        ok "wb_keygen is statically linked (no DT_NEEDED) - portable across Linux distros"
+        KEYGEN_LINKAGE="static"
     fi
 
     # 5. CAPABILITY probe, not an existence check - the same reasoning as build_wbaes.sh:188.
@@ -269,7 +374,16 @@ assert_light_blob(open(sys.argv[1], "rb").read(), tool=sys.argv[2])
 ' "$TMP/probe.blob" "$WBKEYGEN" ) \
         || die "$WBKEYGEN accepted --kdf but did not produce a v>=4 light-tier blob (above).
        Do not bundle it."
-    KEYGEN_DESC="$(file -b "$WBKEYGEN" 2>/dev/null || echo 'unknown')"
+    # file(1) is the nicest description but is genuinely absent from slim containers, and
+    # "unknown" in the provenance record of the one host-specific file is a poor consolation.
+    # readelf is already required above on Linux, so derive something equivalent from it.
+    KEYGEN_DESC="$(file -b "$WBKEYGEN" 2>/dev/null || true)"
+    if [ -z "$KEYGEN_DESC" ] && have readelf; then
+        KEYGEN_DESC="$(readelf -h "$WBKEYGEN" 2>/dev/null \
+            | awk -F: '/Class|Type|Machine/ {gsub(/^ +| +$/,"",$2); printf "%s ", $2}')"
+        KEYGEN_DESC="${KEYGEN_DESC% } ($KEYGEN_LINKAGE)"
+    fi
+    [ -n "$KEYGEN_DESC" ] || KEYGEN_DESC="unknown"
     ok "wb_keygen seals a v>=4 light-tier blob: $WBKEYGEN"
 fi
 
@@ -483,7 +597,9 @@ region-version: $REGION_VERSION
 helper-build-marker: $HELPER_MARKER
 provider-build-marker: $PROVIDER_MARKER
 provider-soname: $PROVIDER_SONAME
+provider-obfuscation: $PROVIDER_OBFUSCATION
 wb-keygen: $KEYGEN_DESC
+wb-keygen-linkage: $KEYGEN_LINKAGE
 EOF
 
 # ---- install.sh (runs on the receiving machine) ----------------------------------------
@@ -539,6 +655,19 @@ man() { sed -n "s/^$1: //p" "$HERE/MANIFEST.txt" | head -1; }
        and installed by copying into an existing sopack checkout; regenerate the bundle."
 
 say "bundle $(man sopack-rev), $(man abi) / android-$(man api), built $(man generated-utc)"
+
+# Surface this at INSTALL time, not just in MANIFEST.txt. It is a property of the artifacts the
+# bundle already contains - nothing here can fix it - and the person installing is usually not
+# the person who generated it, so the manifest alone would go unread.
+case "$(man provider-obfuscation)" in
+    none)    warn "this bundle's libsopk_wb.so was built WITHOUT O-MVLL
+      (--allow-unobfuscated-provider). The provider carries the sealed white-box blob and every
+      wbc_* call, so it is the artifact whose static-analysis resistance matters most. Packing
+      works normally; the hardening is weaker. Regenerate on a host where the plugin loads." ;;
+    unknown) warn "this bundle was generated with --skip-build, so whether libsopk_wb.so is
+      obfuscated is unrecorded - a shared object carries no such state. Regenerate without
+      --skip-build if this is a release bundle." ;;
+esac
 
 # 1. Host match. Only bin/wb_keygen is host-specific, so this check is only about that file:
 #    a bundle generated with --allow-foreign-host has none, and installs anywhere.
@@ -757,8 +886,24 @@ else
     KEYGEN_RECIPE_SUFFIX=" --cipher chacha20"
     KEYGEN_RECIPE_NOTE="**\`--cipher chacha20\` is required here.** This bundle was generated with
 \`--allow-foreign-host\`, so it carries no \`bin/wb_keygen\` and the default cipher (\`wbaes\`)
-cannot seal a blob. Regenerate the bundle on macOS for white-box support."
+cannot seal a blob. Regenerate the bundle on macOS or Linux/x86_64 for white-box support."
 fi
+
+# The provider's obfuscation state is a property of the shipped artifact, so it belongs in the
+# bundle's own README rather than only in the generating repo's logs.
+case "$PROVIDER_OBFUSCATION" in
+    omvll) PROVIDER_NOTE="\`libsopk_wb.so\` was built **with O-MVLL**, which is what the default
+generation path does." ;;
+    none)  PROVIDER_NOTE="> **This provider is UNOBFUSCATED.** The bundle was generated with
+> \`--allow-unobfuscated-provider\`, so \`libsopk_wb.so\` was built without O-MVLL. It carries the
+> sealed white-box blob and every \`wbc_*\` call, so it is the artifact whose static-analysis
+> resistance matters most. Packing behaves normally and the white-box still protects the
+> long-term key; what is weaker is how quickly the design can be read off the binary." ;;
+    *)     PROVIDER_NOTE="> **Provider obfuscation is unrecorded.** This bundle was generated with
+> \`--skip-build\`, and a shared object carries no obfuscation state, so nothing can say after
+> the fact whether \`libsopk_wb.so\` went through O-MVLL. Regenerate without \`--skip-build\` if
+> this is a release bundle." ;;
+esac
 
 # Unquoted heredoc so $ABI etc. interpolate; every literal dollar below is escaped.
 cat >"$OUT/README.md" <<EOF
@@ -815,9 +960,9 @@ machine, and their output travels inside the wheel.
 |---|---|---|
 | \`$WHEEL_NAME\` | yes | **the tool**, pure Python. Carries the \`$ABI\` skeletons + all three ABIs' stub blobs as package data - which is why its version carries the \`+$WHEEL_LOCAL\` local tag naming the ABI, API level and sopack revision it was cut from. \`pip show sopack\` on this machine reads it back |
 | \`stubs/stub_*.bin\`, \`stubs/stub_*.json\` | yes | freestanding stub blobs for all three ABIs (\`--cipher chacha20\`/\`xor\`), as loose copies |
-| \`stubs/sopk_wb_$ABI.so\` | yes | the shared white-box provider, one per ABI |
+| \`stubs/sopk_wb_$ABI.so\` | yes | the shared white-box provider, one per ABI. Obfuscation: **$PROVIDER_OBFUSCATION** |
 | \`stubs/sopk_rt_$ABI.so\` | yes | the thin per-target helper skeleton the packer clones |
-| \`bin/wb_keygen\` | **no** | host provisioning tool, $HOST_OS/$HOST_ARCH |
+| \`bin/wb_keygen\` | **no** | host provisioning tool, $HOST_OS/$HOST_ARCH; linkage **$KEYGEN_LINKAGE** |
 | \`MANIFEST.txt\` | - | provenance; \`install.sh\` reads it back |
 | \`SHA256SUMS\` | - | integrity, over every file including the wheel |
 
@@ -829,6 +974,8 @@ Both skeletons are **release** builds: no logcat tracing, so a failure at load i
 SIGABRT by design. If a packed app crashes on device, rebuild with
 \`./scripts/build_wbaes.sh --trace\` on the generating machine and pack with
 \`--allow-helper-log\` to find out why - do not ship that build.
+
+${PROVIDER_NOTE}
 
 To regenerate this bundle: \`./scripts/artifact_generation.sh\` in the sopack repo.
 EOF
@@ -860,7 +1007,7 @@ fi
 
 cat <<EOF
 
-==> Bundle ready. On the target macOS machine - no clone, the tool is in the bundle:
+==> Bundle ready. On the target $HOST_OS/$HOST_ARCH machine - no clone, the tool is in the bundle:
 EOF
 if [ -n "$TARBALL" ]; then
     cat <<EOF

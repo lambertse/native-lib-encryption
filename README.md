@@ -28,7 +28,8 @@ Before the first `wbaes` pack, build the per-ABI artifacts once:
 ```
 git submodule update --init      # the pinned whitebox-cryptography dependency
 pip install -e .
-./scripts/build_wbaes.sh         # needs the Android NDK, macOS for O-MVLL, and network once
+./scripts/build_wbaes.sh         # needs the Android NDK, macOS or Linux/x86_64 for O-MVLL,
+                                 # and network once
 ```
 
 That builds the white-box library and a host `wb_keygen` from the submodule and leaves them

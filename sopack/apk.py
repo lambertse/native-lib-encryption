@@ -136,6 +136,10 @@ class RepackResult:
     # still aborts the whole pack.
     failed: list[tuple[str, str]] = field(default_factory=list)
     output: str = ""
+    # False when the output was left UNSIGNED - either --no-sign, or no apksigner on this
+    # machine. An unsigned APK cannot be installed until something signs it, so the CLI has to
+    # say so rather than letting a successful-looking pack imply an installable artifact.
+    signed: bool = True
 
 
 def build_excludes(exclude_libs=None, no_default_exclude: bool = False) -> tuple[str, ...]:
@@ -188,6 +192,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
               allow_helper_log: bool = False,
               exclude_libs: list[str] | None = None,
               no_default_exclude: bool = False,
+              no_sign: bool = False,
               logger=print) -> RepackResult:
     # `None` means auto-select every lib/<abi>/*.so; an empty list is NOT the same thing
     # (the CLI rejects an empty --libs file rather than silently widening the scope).
@@ -382,18 +387,41 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
         _align_apk(unsigned, aligned, logger=logger)
 
         # self-sign (v2/v3) with apksigner.
-        ks = keystore or KeystoreInfo(path=os.path.join(
-            os.path.expanduser("~"), ".sopack", "debug.keystore"))
-        ensure_keystore(ks)
-        sign_cmd = apksigner_cmd() + [
-            "sign",
-            "--ks", ks.path, "--ks-key-alias", ks.alias,
-            "--ks-pass", f"pass:{ks.store_pass}", "--key-pass", f"pass:{ks.key_pass}",
-        ]
-        if min_sdk is not None:
-            sign_cmd += ["--min-sdk-version", str(min_sdk)]
-        sign_cmd += ["--out", out_apk, aligned]
-        subprocess.run(sign_cmd, check=True)
+        #
+        # Resolve apksigner BEFORE touching the keystore. ensure_keystore shells out to keytool
+        # and writes ~/.sopack/debug.keystore, so probing in the other order generates a 2048-bit
+        # key pair and only then discovers there is nothing to sign with - which is what used to
+        # happen, and it left a keystore behind on a machine that cannot sign at all.
+        signer: list[str] | None = None
+        if no_sign:
+            logger("  skipping signing (--no-sign)")
+        else:
+            try:
+                signer = apksigner_cmd()
+            except FileNotFoundError as e:
+                # Best-effort by design: the packing work is done and the aligned APK is a
+                # legitimate artifact for a pipeline that signs with its own production key
+                # later. Refusing here would throw that away over a missing tool.
+                logger(f"  WARNING: {e}")
+                logger("  WARNING: leaving the output UNSIGNED. It cannot be installed as-is - "
+                       "sign it before `adb install`, or pass --no-sign to make this explicit.")
+
+        if signer is None:
+            result.signed = False
+            shutil.copyfile(aligned, out_apk)
+        else:
+            ks = keystore or KeystoreInfo(path=os.path.join(
+                os.path.expanduser("~"), ".sopack", "debug.keystore"))
+            ensure_keystore(ks)
+            sign_cmd = signer + [
+                "sign",
+                "--ks", ks.path, "--ks-key-alias", ks.alias,
+                "--ks-pass", f"pass:{ks.store_pass}", "--key-pass", f"pass:{ks.key_pass}",
+            ]
+            if min_sdk is not None:
+                sign_cmd += ["--min-sdk-version", str(min_sdk)]
+            sign_cmd += ["--out", out_apk, aligned]
+            subprocess.run(sign_cmd, check=True)
 
     return result
 

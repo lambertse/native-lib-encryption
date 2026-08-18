@@ -130,7 +130,8 @@ def _cmd_pack(args: argparse.Namespace) -> int:
     res = repackage(args.input, args.output, libs, cipher=args.cipher,
                     abis=abis, keystore=ks, min_sdk=args.min_sdk, log=args.log,
                     allow_helper_log=args.allow_helper_log,
-                    exclude_libs=excludes, no_default_exclude=args.no_default_exclude)
+                    exclude_libs=excludes, no_default_exclude=args.no_default_exclude,
+                    no_sign=args.no_sign)
 
     print(f"\nInjected {len(res.injected)} librar{'y' if len(res.injected)==1 else 'ies'}:")
     for ir in res.injected:
@@ -138,12 +139,21 @@ def _cmd_pack(args: argparse.Namespace) -> int:
               f"seg=0x{ir.seg_rva:x} entry=0x{ir.entry_rva:x} via {ir.strategy}")
     _print_summary(res, abis)
 
-    if args.verify:
+    # --verify runs apksigner too, so an unsigned output has nothing to verify and the attempt
+    # would fail for the same reason signing did.
+    if args.verify and res.signed:
         print("\nSignature:")
         print(verify_signature(args.output, min_sdk=args.min_sdk))
     print(f"\nDone: {args.output}")
-    print("Note: re-signed with a new certificate - this is a new app identity "
-          "(cannot update-install over the original).")
+    if res.signed:
+        print("Note: re-signed with a new certificate - this is a new app identity "
+              "(cannot update-install over the original).")
+    else:
+        # Last line of output, because it is the one thing that decides what you can do with
+        # this file. A packed-but-unsigned APK is a normal pipeline artifact, but `adb install`
+        # rejects it with an error that says nothing about signing being skipped here.
+        print("Note: this APK is UNSIGNED and cannot be installed as-is. Sign it before use:")
+        print(f"  apksigner sign --ks <keystore> --out signed.apk {args.output}")
     return 0
 
 
@@ -205,6 +215,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="print signer certs after signing (DEFAULT; --no-verify to skip)")
     pk.add_argument("--no-verify", action="store_false", dest="verify",
                     help="skip the post-signing apksigner verify")
+    pk.add_argument("--no-sign", action="store_true",
+                    help="do not sign the output; leave an UNSIGNED APK for a later signing "
+                         "step. Signing is best-effort anyway - without apksigner sopack warns "
+                         "and leaves it unsigned - but this makes the intent explicit and "
+                         "skips generating a debug keystore")
     pk.set_defaults(func=_cmd_pack)
     return p
 

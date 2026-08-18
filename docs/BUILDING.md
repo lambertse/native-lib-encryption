@@ -28,6 +28,15 @@ Notes:
   arch-matching launcher, point at the jar: `export SOPACK_APKSIGNER_JAR=/path/to/apksigner.jar`.
 - **`zipalign` is optional.** sopack has a built-in Python 16 KB aligner and uses it
   automatically when a runnable `zipalign` isn't found (e.g. on aarch64 hosts).
+- **Pack hosts: macOS or Linux.** Nothing in the packer is macOS-specific
+  (`provision._host_incompatible_reason` accepts a native ELF on Linux and a Mach-O on macOS,
+  symmetrically). What *is* host-specific is `wb_keygen`, so a portable bundle only installs on
+  the OS/arch that generated it — see [§6](#scriptsartifact_generationsh---a-portable-bundle-for-a-second-machine).
+- **Cross-building the wbaes artifacts needs an x86_64 host.** Google publishes no
+  `linux-aarch64` NDK toolchain, and O-MVLL ships its Linux plugin for x86_64 only. On
+  Linux/aarch64 `build_wbaes.sh --host-only` still verifies every Python↔C contract; it just
+  cannot produce the skeletons. NDKs are also **per-host**: a macOS NDK contains only
+  `toolchains/llvm/prebuilt/darwin-x86_64`, so it cannot be reused from a Linux container.
 
 ---
 
@@ -217,12 +226,30 @@ Results land in `output/testrun/`, one directory per APK plus a `summary.md`.
 
 ### `scripts/artifact_generation.sh` - a portable bundle for a second machine
 
-Builds `artifacts/`: everything another macOS machine needs to run `sopack pack`, and nothing
-it does not. Only **one** file in it is host-specific - the stub blobs and both wbaes skeletons
-are Android target ELFs and do not care which machine packed them, and sopack itself is pure
-Python, while `wb_keygen` is a native host binary. That split is the whole reason a bundle is
-possible, and it is why the script refuses to run anywhere but macOS unless you pass
-`--allow-foreign-host` (which drops `wb_keygen` and leaves you a chacha20/xor-only bundle).
+Builds `artifacts/`: everything another machine needs to run `sopack pack`, and nothing it does
+not. Only **one** file in it is host-specific - the stub blobs and both wbaes skeletons are
+Android target ELFs and do not care which machine packed them, and sopack itself is pure Python,
+while `wb_keygen` is a native host binary. That split is the whole reason a bundle is possible,
+and it is why a bundle is **pinned to the OS/arch that generated it**: `install.sh` compares
+`host-os`/`host-arch` from `MANIFEST.txt` against `uname` and refuses a mismatch, and
+`provision._host_incompatible_reason` would reject a foreign keygen by file magic anyway.
+
+Generation works on **macOS and Linux** — the two OSes that can build a usable native keygen. Any
+other host needs `--allow-foreign-host`, which drops `wb_keygen` and leaves a chacha20/xor-only
+bundle. Two Linux-specific notes:
+
+- The keygen is linked **statically** there (`build_wbaes.sh` supplies a `HOST_CXX` wrapper), so
+  it has no glibc floor and a bundle built on Debian installs on a RHEL-ish target. Gate 4
+  **requires** it: zero `DT_NEEDED` or the bundle is refused. The failure that prevents is
+  `version GLIBC_2.xx not found` at first pack, on the machine with no toolchain to debug it.
+- Cross-building the skeletons needs **x86_64**, and O-MVLL's Linux plugin is x86_64-only.
+  [`docker/README.md`](../docker/README.md) has a `linux/amd64` image that does the whole thing
+  with a pinned NDK r29.
+
+`--allow-unobfuscated-provider` builds `libsopk_wb.so` without O-MVLL. It is never implied — not
+by the host, not by a plugin that failed to load — and it is recorded as
+`provider-obfuscation: none` in `MANIFEST.txt`, which `install.sh` warns about, because "it
+built" must not quietly mean "it built unobfuscated".
 
 The bundle carries **the tool as well as its artifacts**: a `py3-none-any` wheel with that ABI's
 skeletons baked in as package data. So the receiving machine clones nothing. The wheel is built
@@ -263,6 +290,10 @@ PATH`, `--no-venv` and `--no-keygen` are the escape hatches.
 That machine needs Python >= 3.9 with `venv`, network once (pip fetches LIEF), a JDK and
 `apksigner` - the generated `artifacts/README.md` lists them - but **no sopack checkout, no NDK,
 no cmake/ninja and no whitebox-cryptography checkout**.
+
+`venv` is worth checking for specifically on Debian/Ubuntu targets: it is a separate
+`python3-venv` package there, and without it `install.sh` fails at the venv step after every
+other check has already passed.
 
 The post-install probe replaces the region-version/build-marker cross-check older bundles ran
 against a receiving *checkout*. Tool and skeletons now ship in one wheel and cannot drift from

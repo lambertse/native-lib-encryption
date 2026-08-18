@@ -33,9 +33,10 @@ pip install -e .                            # install the CLI (pulls in LIEF)
 ./scripts/build_wbaes.sh --trace            #   opt into -DSOPK_RT_LOG tracing (NOT shippable:
                                             #   needs `pack --allow-helper-log`). Release,
                                             #   stripped, is the DEFAULT.
-./scripts/build_wbaes.sh --no-omvll         #   unobfuscated Android lib. REQUIRED on Linux (the
-                                            #   O-MVLL plugin is a Mach-O dylib and only loads
-                                            #   on macOS); --omvll is otherwise the DEFAULT.
+./scripts/build_wbaes.sh --no-omvll         #   unobfuscated Android lib; --omvll is the DEFAULT
+                                            #   and now works on macOS AND Linux/x86_64 (the
+                                            #   submodule pins a plugin for each). Any other
+                                            #   host still needs this flag.
 # WBC comes from the PINNED SUBMODULE at third_party/whitebox-cryptography, which this script
 # initialises on demand - so a clean clone needs no arguments and no out-of-band drop. Override
 # with --wbc/$WBC for a dev working copy (a sibling ../whitebox-cryptography is also honoured).
@@ -63,9 +64,13 @@ bash stub/build_stubs.sh [API_LEVEL]        # default API 24 -> sopack/stubs/*.b
                                             #   decrypted-library COUNT == injected COUNT. Builds
                                             #   --trace skeletons: its output is NOT shippable.
 ./scripts/artifact_generation.sh [--tar]    # build artifacts/: the portable pack bundle for
-                                            #   another macOS machine. --skip-build bundles what
-                                            #   is in sopack/stubs/ already; --allow-foreign-host
-                                            #   drops bin/wb_keygen (chacha20/xor-only bundle).
+                                            #   another machine of THIS host's OS/arch (macOS or
+                                            #   Linux). --skip-build bundles what is in
+                                            #   sopack/stubs/ already; --allow-foreign-host drops
+                                            #   bin/wb_keygen (chacha20/xor-only bundle);
+                                            #   --allow-unobfuscated-provider is the explicit
+                                            #   opt-out from O-MVLL. For a Linux/x86_64 bundle
+                                            #   built in a container, see docker/README.md.
 
 # Pack an APK
 sopack pack in.apk -o out.apk \
@@ -73,7 +78,7 @@ sopack pack in.apk -o out.apk \
     [--exclude-lib GLOB,...] [--no-default-exclude] \
     [--abi arm64-v8a,... | all] [--cipher wbaes|chacha20|xor] [--min-sdk N] [--log] \
     [--allow-helper-log] \
-    [--keystore PATH --ks-alias A --ks-pass P --key-pass P] [--no-verify]
+    [--keystore PATH --ks-alias A --ks-pass P --key-pass P] [--no-verify] [--no-sign]
 # LIBRARY SELECTION IS OPTIONAL. Omit --lib/--libs -> every lib/<abi>/*.so in the input APK,
 # for the ABIs --abi selects. --lib is repeatable and/or comma-separated; --libs is a file,
 # one .so per line. See "Library selection" below for the exclusion rules and for why
@@ -86,6 +91,14 @@ sopack pack in.apk -o out.apk \
 # binary). This changed: chacha20 used to be the default, because wbaes was unreachable from a
 # clean clone - the WBC submodule is what fixed that.
 # --verify DEFAULTS ON; pass --no-verify to skip the post-signing apksigner dump.
+# SIGNING IS BEST-EFFORT. With no apksigner reachable, sopack WARNS and leaves the output
+# unsigned rather than aborting - the pack itself is done by then, and a pipeline that signs with
+# its own production key later still wants the artifact. --no-sign makes that explicit (and skips
+# generating ~/.sopack/debug.keystore). apksigner is resolved BEFORE the keystore for that reason:
+# probing the other way round generated a key pair and only then found nothing to sign with.
+# RepackResult.signed carries this, --verify is skipped when false, and the CLI's last line says
+# the APK cannot be installed as-is. Alignment is unaffected: signing preserves it, so signing
+# later is equivalent.
 # THERE IS NO --wb-keygen. provision.find_wb_keygen probes, in order: vendor/wbc/bin/wb_keygen
 # (what build_wbaes.sh installs), the portable bundle beside an installed venv, $SOPACK_WBKEYGEN,
 # then PATH. Note the env var ranks BELOW the local build on purpose - a stale export must not
@@ -156,6 +169,14 @@ APKs. Do not merge them back, and do not reintroduce `assets/`.
   skeletons byte-for-byte and no others, because a package-data glob that silently misses
   produces a wheel that installs cleanly and only fails at pack time.
   `--tar` writes the archive **beside** the bundle, never inside it.
+  A bundle is **pinned to the OS/arch that generated it** (only `bin/wb_keygen` makes it so), and
+  `install.sh` refuses a mismatched host. `docker/` builds the Linux/x86_64 one.
+
+**`docker/`** is a fifth directory and the odd one out: tracked, but not part of the tool. It is
+a `linux/amd64` builder image for `artifact_generation.sh` - pinned NDK r29 (the version O-MVLL's
+plugin is built against), the static-link toolchain, and the WBC deps baked in so a run is
+offline. It exists because a bundle that installs on Linux must be generated on Linux. See
+`docker/README.md`.
 
 ## Architecture (the parts that span files)
 
@@ -483,6 +504,33 @@ target and only the *provider* is shared. See `docs/technical/ARCHITECTURE.md` Â
 
 Toolchain (NDK/LLVM, JDK, Android SDK build-tools) is **not** bundled. Per standing user
 preference, **ask before installing any package or toolchain, even in auto mode.**
+
+**Two hosts can GENERATE a bundle: macOS and Linux/x86_64.** This used to be macOS-only, and the
+two things that were actually macOS-specific have both been fixed rather than worked around:
+
+- `bin/wb_keygen` is the one host-specific file in a bundle. On Linux `build_wbaes.sh` links it
+  **statically** (a `HOST_CXX` wrapper adding `-static -static-libstdc++ -static-libgcc`, the one
+  seam `gen_blob.sh` leaves open since it refuses `EXTRA_CXXFLAGS`), so it carries no glibc floor
+  and a bundle built on Debian installs on a RHEL-ish target. `artifact_generation.sh` gate 4
+  **requires** this on Linux - zero `DT_NEEDED`, hard fail - which makes it a stronger check than
+  the macOS `otool` allow-list, not a weaker one. Do not make it a warning: "cannot tell" is not
+  "static", and the failure it prevents (`version GLIBC_2.xx not found`) surfaces at first pack on
+  the machine with no toolchain.
+- O-MVLL used to be macOS-only here because the submodule pinned only the Mach-O release. It now
+  pins the **Linux x86_64** plugin too (`omvll_ndk_r29.so`), chosen by `omvll_plugin_path` in
+  `fetch_deps.sh` - one definition, sourced by `build_android.sh`. The plugin is built against
+  **NDK r29**'s clang and loads into nothing else, so the NDK and O-MVLL pins move together.
+
+`docker/` builds the Linux bundle in a `linux/amd64` image; see `docker/README.md`. Not a
+preference: Google publishes no `linux-aarch64` NDK toolchain and the O-MVLL Linux plugin is
+x86_64-only, so both `build_wbaes.sh` and `build_android.sh` refuse aarch64 Linux with a message
+naming the reason. Note also that **NDKs are per-host and cannot be shared**: a macOS NDK contains
+only `toolchains/llvm/prebuilt/darwin-x86_64`, so bind-mounting one into a Linux container fails.
+
+An unobfuscated provider is reachable only via an explicit `--allow-unobfuscated-provider`, never
+inferred from the host or from a plugin that failed to load, and it is recorded in `MANIFEST.txt`
+as `provider-obfuscation: none` so the bundle says what it is. "It built" must never quietly mean
+"it built unobfuscated".
 
 **LIEF >= 1.0 is a hard floor** (`pyproject.toml`), because LIEF - not sopack - chooses where the
 appended segments land. A macOS host on LIEF `0.17.0` emitted a 4 KB-aligned LOAD injecting a

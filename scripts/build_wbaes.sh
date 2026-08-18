@@ -130,25 +130,45 @@ have openssl || warn "no openssl on PATH - the pack-side cipher falls back to pu
 # artifact_generation.sh both grep for - keeps its wording.
 resolve_wbc "$SOPACK"
 
+# Google ships an NDK per host, and the tag is literally "-x86_64" on both: macOS NDKs carry
+# darwin-x86_64 (which runs under Rosetta on Apple Silicon) and Linux NDKs linux-x86_64. There
+# is no linux-aarch64 prebuilt at all, so an aarch64 Linux host has no usable NDK - say that
+# here rather than letting it surface as "wrong NDK layout?" two lines down.
 HOSTTAG="$(uname | tr '[:upper:]' '[:lower:]')-x86_64"
+if [ "$HOST_ONLY" -eq 0 ] && [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" != "x86_64" ]; then
+    die "this is Linux/$(uname -m), and the NDK has no linux-$(uname -m) toolchain - Google
+       publishes linux-x86_64 only. Cross-building the Android artifacts needs an x86_64 Linux
+       host (see docker/README.md), a Mac, or --host-only to stop after Phase 3."
+fi
 if [ "$HOST_ONLY" -eq 0 ]; then
     ask_path NDK "Android NDK root: " valid_ndk \
         "Pass --ndk PATH, export NDK / ANDROID_NDK_HOME, or run with --host-only."
     NDKBIN="$NDK/toolchains/llvm/prebuilt/$HOSTTAG/bin"
-    [ -d "$NDKBIN" ] || die "no toolchain at $NDKBIN (host tag $HOSTTAG) - wrong NDK layout?"
+    # A macOS NDK bind-mounted into a Linux container is the trap this catches: it contains only
+    # prebuilt/darwin-x86_64, whose binaries are Mach-O. Naming the tag is what makes that legible.
+    [ -d "$NDKBIN" ] || die "no toolchain at $NDKBIN (host tag $HOSTTAG) - wrong NDK layout?
+       NDKs are per-host and not interchangeable: if $NDK was installed on a Mac it has only
+       toolchains/llvm/prebuilt/darwin-x86_64 and cannot be used from Linux. Install a Linux NDK."
     CXX="$NDKBIN/clang++"
     READELF="$NDKBIN/llvm-readelf"
     [ -x "$CXX" ] || die "no clang++ at $CXX"
     [ -x "$READELF" ] || die "no llvm-readelf at $READELF"
 
     # O-MVLL is fetched and configured by WBC's build_android.sh (it defaults OMVLL_CONFIG and
-    # OMVLL_PYTHONPATH to in-repo paths), so do NOT duplicate those checks here. The one thing
-    # it cannot fix is the host: the plugin ships as a Mach-O dylib and only LOADS on macOS.
-    if [ "$OMVLL" -eq 1 ] && [ "$(uname -s)" != "Darwin" ]; then
-        die "--omvll (the default) needs macOS: WBC vendors O-MVLL as a Mach-O dylib
-       (third_party/omvll/omvll_ndk_r29.dylib), which will not load into a Linux clang. Pass
+    # OMVLL_PYTHONPATH to in-repo paths), so do NOT duplicate those checks here. What it cannot
+    # fix is a host upstream publishes no plugin for. There are two: macOS (Mach-O dylib) and
+    # Linux/x86_64 (ELF .so), and WBC picks between them itself - so this gate is now only about
+    # refusing the hosts that have neither.
+    if [ "$OMVLL" -eq 1 ]; then
+        case "$(uname -s)/$(uname -m)" in
+            Darwin/*)      ;;
+            Linux/x86_64)  ;;
+            *) die "--omvll (the default) needs macOS or Linux/x86_64: those are the only hosts
+       O-MVLL 1.9.1 publishes a plugin for, and it is dlopen'd into the NDK's clang so a
+       foreign-arch build cannot substitute. This host is $(uname -s)/$(uname -m). Pass
        --no-omvll to build here - but the resulting provider is UNOBFUSCATED and should not be
-       shipped; generate release artifacts on the Mac."
+       shipped; generate release artifacts on a supported host." ;;
+        esac
     fi
     # No PYTHONHOME warning here on purpose: build_android.sh already emits one, and it does so
     # only on the path that actually loads the plugin. Duplicating it in preflight fired twice
@@ -172,7 +192,86 @@ else warn "skeleton TRACING (-DSOPK_RT_LOG -llog) - needs 'pack --allow-helper-l
 
 # ---- Phase 1 - host wb_keygen, and prove the white-box is standard AES-128 --------------
 step 1 "$TOTAL" "Phase 1 - host wb_keygen + FIPS-197 anchor"
+
+# On Linux, link wb_keygen STATICALLY. This is the one artifact in the portable bundle that is a
+# native host binary, and a dynamically linked one carries a glibc floor: the receiving machine
+# is frequently a different distro from the builder, and the failure mode is
+# `/lib64/libc.so.6: version GLIBC_2.xx not found` at FIRST PACK, on the machine least equipped
+# to debug it. Static removes the question rather than managing it.
+#
+# gen_blob.sh deliberately refuses EXTRA_CXXFLAGS/EXTRA_LDFLAGS/ZIG_BIN so no cross toolchain can
+# leak into a provisioning tool, but it does honour HOST_CXX/HOST_AR - so a wrapper is the only
+# seam, and it is the intended one. `-static` is accepted-and-ignored on the compile-only
+# libsodium TUs, so one wrapper covers both uses.
+#
+# Not done on macOS: Apple does not ship a crt0.o for static linking and `ld -static` is
+# unsupported there. The macOS equivalent is gate 4 of artifact_generation.sh, which requires
+# every dylib to come from /usr/lib or /System.
+if [ "$(uname -s)" = "Linux" ] && [ -z "${HOST_CXX:-}" ]; then
+    # `if` rather than `have "$c" && ... && break`: that form leaves the LOOP's exit status at 1
+    # when nothing matches, and under `set -e` a bare compound command failing kills the script
+    # silently - right here, before the die below could explain anything. Same trap as
+    # find_sodium_inc in Phase 3, which carries the long version of this note.
+    HOST_CXX_BASE=""
+    for c in c++ g++ clang++; do
+        if have "$c"; then HOST_CXX_BASE="$(command -v "$c")"; break; fi
+    done
+    [ -n "$HOST_CXX_BASE" ] || die "no host C++ compiler (c++/g++/clang++) on PATH"
+    # A STABLE path, not $TMP. gen_blob.sh keys its libsodium cache on "$CXX|$AR|$(uname -sm)",
+    # so a wrapper at a fresh mktemp path every run would invalidate that cache every run and
+    # rebuild ~120 translation units for nothing.
+    mkdir -p "$WBC/build-host"
+    STATIC_CXX="$WBC/build-host/.sopack-static-c++"
+    cat >"$STATIC_CXX" <<EOF
+#!/bin/sh
+exec "$HOST_CXX_BASE" "\$@" -static -static-libstdc++ -static-libgcc
+EOF
+    chmod +x "$STATIC_CXX"
+    export HOST_CXX="$STATIC_CXX"
+    info "linking wb_keygen statically via $HOST_CXX_BASE (portable across Linux distros)"
+elif [ -n "${HOST_CXX:-}" ]; then
+    warn "HOST_CXX=$HOST_CXX is set, so wb_keygen is built with it as-is. On Linux the bundle
+      gate requires a STATIC keygen (no DT_NEEDED); unset HOST_CXX to get one automatically."
+fi
+
 HOST_KEYGEN="$WBC/build-host/wb_keygen"
+# Cache invalidation, not a gate. build-host/ is gitignored and therefore travels with any copy
+# or bind mount of the tree, so three kinds of wrong thing land there: a MACH-O keygen from a
+# checkout copied off a Mac, a keygen built before the static wrapper existed, and - the nastiest
+# - one built for a DIFFERENT ARCHITECTURE from a container sharing the same checkout.
+#
+# The architecture case is why this checks e_machine and not just "does it run". Docker Desktop on
+# Apple Silicon runs a linux/amd64 container on an aarch64 kernel, so a leftover aarch64 keygen
+# executes fine there while `uname -m` says x86_64: every probe passes and the bundle ships a
+# keygen that is dead on the real x86_64 target. It also poisons Phase 3, because skipping
+# gen_blob.sh leaves the equally stale build-host/libsodium.a in place and the probe link fails
+# with "Relocations in generic ELF (EM: 183)".
+#
+# Rebuilding is the whole fix: gen_blob.sh keys its own libsodium cache on "$(uname -sm)", so once
+# it runs again the archive is rebuilt for this host too.
+if [ "$(uname -s)" = "Linux" ] && [ -x "$HOST_KEYGEN" ] && [ "$FORCE" -eq 0 ] \
+   && [ -n "${STATIC_CXX:-}" ]; then
+    STALE=""
+    KEYGEN_EM="$(elf_machine "$HOST_KEYGEN")"
+    WANT_EM="$(host_elf_machine)"
+    if [ -z "$KEYGEN_EM" ]; then
+        STALE="not an ELF (a macOS build, most likely, from a copied checkout)"
+    elif [ -n "$WANT_EM" ] && [ "$KEYGEN_EM" != "$WANT_EM" ]; then
+        STALE="built for $(elf_machine_name "$KEYGEN_EM"), but this host is
+      $(elf_machine_name "$WANT_EM") - a checkout shared with a container or machine of another
+      architecture"
+    elif [ -n "$(elf_needed "$HOST_KEYGEN")" ]; then
+        STALE="dynamically linked, so it would carry a glibc floor to the target machine"
+    fi
+    if [ -n "$STALE" ]; then
+        info "cached $HOST_KEYGEN is $STALE - rebuilding"
+        rm -f "$HOST_KEYGEN"
+        # The archive is stale for exactly the same reason and is what Phase 3 links against.
+        # gen_blob.sh would rebuild it via its own stamp, but only on the arch change - drop it
+        # here so the static-linkage case is covered too.
+        rm -f "$WBC/build-host/libsodium.a" "$WBC/build-host/.sodium-cc"
+    fi
+fi
 if [ -x "$HOST_KEYGEN" ] && [ "$FORCE" -eq 0 ]; then
     info "reusing $HOST_KEYGEN (use --force to rebuild)"
 else
@@ -353,6 +452,30 @@ else
     # obfuscated build is "pass nothing". Preflight already refused --omvll on a non-Darwin host.
     OMVLL_ARG=""
     [ "$OMVLL" -eq 0 ] && OMVLL_ARG="--no-omvll"
+
+    # Can clang actually LOAD the plugin? Ask the dynamic linker before handing 155 translation
+    # units to ninja. clang reports an unloadable plugin per-TU, so the real failure - one line
+    # about a missing symbol or glibc version - arrives buried in ten identical multi-line
+    # walls. The known instance: the O-MVLL 1.9.1 Linux plugin requires GLIBC_2.38, so it will
+    # not load on Debian bookworm (2.36); the shipped image uses ubuntu:24.04 for that reason.
+    # Only checkable when the plugin is already vendored - build_android.sh fetches it otherwise,
+    # and skipping the check then is fine because a fresh fetch is not the interesting case.
+    OMVLL_PLUGIN="$WBC/third_party/omvll/omvll_ndk_r29.so"
+    if [ "$OMVLL" -eq 1 ] && [ "$(uname -s)" = "Linux" ] && [ -f "$OMVLL_PLUGIN" ] && have ldd; then
+        LDD_OUT="$(ldd "$OMVLL_PLUGIN" 2>&1 || true)"
+        case "$LDD_OUT" in
+            *"not found"*)
+                printf '%s\n' "$LDD_OUT" | grep -F 'not found' >&2
+                die "the O-MVLL plugin cannot be loaded on this host (details above). clang would
+       report this once per translation unit, which is why it is checked here.
+       If it names a GLIBC_ version, this host's glibc is older than the plugin was built
+       against ($(ldd --version | head -1)); build on a newer base - docker/Dockerfile uses
+       ubuntu:24.04 for exactly this. Otherwise pass --no-omvll (and, for a bundle,
+       --allow-unobfuscated-provider) to build without obfuscation." ;;
+        esac
+        ok "the O-MVLL plugin's dynamic dependencies resolve on this host"
+    fi
+
     info "cross-building the runtime library (${OMVLL_ARG:---omvll}) …"
     # shellcheck disable=SC2086
     ( cd "$WBC" && NDK="$NDK" ./scripts/build_android.sh --abi "$ABI" --api "$API" $OMVLL_ARG ) \
