@@ -10,6 +10,8 @@ import zipfile
 
 import pytest
 
+from conftest import mkapk as _mkapk
+
 from sopack import apk, cli, config
 from sopack.apk import (ALWAYS_EXCLUDE_PATTERNS, _classify, _match_lib_pattern,
                         build_excludes)
@@ -199,12 +201,6 @@ def test_init_config_refuses_to_clobber(tmp_path, monkeypatch):
 
 
 # ---- 7. zero-library errors -------------------------------------------------------
-def _mkapk(path, names):
-    with zipfile.ZipFile(path, "w") as z:
-        z.writestr("AndroidManifest.xml", b"stub")
-        for n in names:
-            z.writestr(n, b"\x7fELF-not-really")
-    return str(path)
 
 
 def test_no_libs_at_all(tmp_path):

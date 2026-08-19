@@ -19,6 +19,8 @@ import zipfile
 
 import pytest
 
+from conftest import mkapk
+
 from sopack import apk, cli, config, diag, errors, exitcodes, provision, report, stubs
 from sopack.elf_inject import InjectError
 
@@ -37,11 +39,7 @@ def _isolated_log(tmp_path, monkeypatch):
 
 
 def _apk(path, entries=("lib/arm64-v8a/libfoo.so",)):
-    with zipfile.ZipFile(path, "w") as z:
-        z.writestr("AndroidManifest.xml", b"\x00")
-        for e in entries:
-            z.writestr(e, b"\x7fELF-not-really")
-    return str(path)
+    return mkapk(path, entries)
 
 
 # ---- the table ---------------------------------------------------------------------------

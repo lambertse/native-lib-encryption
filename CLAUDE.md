@@ -4,11 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`sopack` is a **black-box Android `.so` encryptor / APK repackager**. Input: an existing
-APK, optionally narrowed to a list of native library names (omit it and every
-`lib/<abi>/*.so` is selected). Output: a self-signed APK in which each selected
-library's `.text` is encrypted at rest and transparently decrypted at load by an injected
-freestanding stub - **with no access to the library source**. It is an ELF-injection
+`sopack` is a **black-box Android `.so` encryptor / APK + AAB repackager**. Input: an existing
+APK **or Android App Bundle**, optionally narrowed to a list of native library names (omit it and
+every native library is selected). Output: the same container back, with each selected
+library's `.text` encrypted at rest and transparently decrypted at load by an injected
+freestanding stub - **with no access to the library source**. An APK comes back self-signed; an
+**AAB comes back UNSIGNED by design** (see "Container detection" below). It is an ELF-injection
 packer (same class as Tencent Legu). Security value is obfuscation only: the key ships in
 the binary (whitened, not plaintext - see below) and plaintext exists in a readable `R-X`
 mapping at runtime. The stub ships identical in every packed app, so reversing it once
@@ -98,10 +99,15 @@ sopack init-config [-o PATH]                # write a commented config.yaml ('-'
 #                                     lives in config.py, NOT the CLI (argparse never had
 #                                     `choices` for --abi, so the move could have dropped it).
 #   libraries.include:                LIBRARY SELECTION IS OPTIONAL. Absent or null -> every
-#                                     lib/<abi>/*.so in the input APK, for the ABIs `abis:`
+#                                     native library in the input, for the ABIs `abis:`
 #                                     selects. Entries match through _match_lib_pattern, the
 #                                     SAME matcher as libraries.exclude: bare basename, full
-#                                     APK path, fnmatch glob, trailing .so optional.
+#                                     APK path, fnmatch glob, trailing .so optional. For an AAB
+#                                     the MODULE-RELATIVE path matches too, so
+#                                     `lib/arm64-v8a/libapp.so` hits `base/lib/arm64-v8a/
+#                                     libapp.so` - nobody writes the module prefix by hand, and
+#                                     an exclude that silently stops matching is how sopack's own
+#                                     decryptor gets re-packed.
 #                                     An EMPTY LIST IS AN ERROR - see "Library selection" below
 #                                     for why, and for why auto-select SKIPS an un-injectable
 #                                     library where an explicitly named one ABORTS.
@@ -158,6 +164,8 @@ sopack init-config [-o PATH]                # write a commented config.yaml ('-'
 # sign with. RepackResult.signed carries this, verify is skipped when false, and the CLI's last
 # line says the APK cannot be installed as-is. Alignment is unaffected: signing preserves it, so
 # signing later is equivalent.
+# NONE OF THE `signing:` BLOCK APPLIES TO AN AAB - sopack never signs one, and every key in that
+# block is reported as not applicable rather than silently ignored. See "Container detection".
 # THERE IS NO --wb-keygen, AND NO CONFIG KEY FOR IT EITHER. provision.find_wb_keygen probes, in
 # order: vendor/wbc/bin/wb_keygen (what build_wbaes.sh installs), the portable bundle beside an
 # installed venv, $SOPACK_WBKEYGEN, then PATH. Note the env var ranks BELOW the local build on
@@ -181,6 +189,8 @@ python -m pytest tests/test_rt_meta.py      # both region layouts vs stub/sopk_r
 python -m pytest tests/test_provision.py    # the blob-header gate: v>=4 + light KDF tier
 python -m pytest tests/test_config.py       # the YAML config: sample, defaults, every rejection
 python -m pytest tests/test_lib_select.py   # auto-select, exclusions, the CLI surface, fail-soft
+python -m pytest tests/test_container.py    # APK-vs-AAB detection, the two entry patterns, where
+                                           #   a bundle's helpers land, and "never sign an AAB"
 python -m pytest tests/test_wbaes.py        # wbaes guards, the strip, and real injection
                                            #   (2 tests skip w/o a host wb_keygen)
 python -m pytest tests/test_diag.py         # the host log: rotation, retention, redaction,
@@ -192,6 +202,12 @@ python -m pytest tests/test_integration.py -k init_array   # a single test by na
 
 `tests/test_integration.py` builds real `.so` fixtures, injects, and `dlopen`s them - the
 arm64 decrypt-and-run assertions only exercise fully on an aarch64 host.
+
+`tests/conftest.py` holds the two container builders (`mkapk`, `mkaab`); three modules used to
+carry their own near-copy of the first and a fourth wrote a 22-byte empty zip, which stopped being
+a usable stand-in once "is this an APK?" became a question the packer asks. It defines **no autouse
+fixtures** - `test_exitcodes.py` and `test_diag.py` own their `diag`-state teardown per module, and
+an autouse fixture in a conftest would silently change the isolation regime of every other file.
 
 ## Directory layout (one tracked dependency + three gitignored)
 
@@ -262,25 +278,80 @@ left alone, so the long-standing `wbaes`/`chacha20` skew between the two is simp
 2. **ELF injection engine** - `sopack/elf_inject.py` (LIEF). Encrypts `.text`, appends the
    stub as a new R+X `PT_LOAD`, hijacks load-time init, and patches the metadata record.
 
-3. **APK repackager** - `sopack/apk.py`. unzip → inject each **selected** `lib/<abi>/*.so` →
-   libs written STORED + 16 KB-aligned → `apksigner` self-sign with a generated keystore.
-   For `cipher: wbaes` it also **adds** files into `lib/<abi>/` (STORED + 16 KB) - the only
-   add-file path in the tool: one thin helper per protected library, plus **one**
-   `libsopk_wb.so` per ABI. It also seals ONE white-box key per ABI before the entry loop and
-   asserts pack-level closure afterwards (every staged thin helper's provider is present) -
-   a per-target verifier structurally cannot see that.
+3. **APK/AAB repackager** - `sopack/apk.py`, with the format differences isolated in
+   `sopack/container.py`. unzip → inject each **selected** native library → for an APK, libs
+   written STORED + 16 KB-aligned then `apksigner` self-sign with a generated keystore; for an
+   AAB, entry compression preserved, no alignment, no signing.
+   For `cipher: wbaes` it also **adds** files next to each target - the only add-file path in the
+   tool: one thin helper per protected library, plus **one** `libsopk_wb.so` per (module, ABI).
+   It seals ONE white-box key per ABI before the entry loop and asserts pack-level closure
+   afterwards (every staged thin helper's provider is present) - a per-target verifier
+   structurally cannot see that.
+
+### Container detection: one code path, five differences (`sopack/container.py`)
+
+The input may be an **APK or an Android App Bundle**, and which one is **detected from the file's
+contents** - root `BundleConfig.pb` → AAB, root `AndroidManifest.xml` → APK, neither →
+`errors.InputError` (exit 4). **There is no `--aab` flag and no config key**, on purpose:
+`tests/test_lib_select.py` pins the `pack` argparse namespace keyset with `==`, and a flag would
+let a caller *declare* the wrong format when the file already answers the question. Extension is
+consulted for exactly one thing - warning that `-o`'s name disagrees with what the input was.
+
+Only five things differ, all read off the frozen `Container` descriptor, which is what keeps
+`repackage()` a single path rather than five scattered `if is_aab`s:
+
+| | APK | AAB |
+|---|---|---|
+| entry pattern | `lib/<abi>/*.so` | `<module>/lib/<abi>/*.so`, module **required** |
+| added artifacts | `lib/<abi>/` | the target's **own** module dir |
+| injected lib | `ZIP_STORED` | original `compress_type` preserved |
+| 16 KB zip align | yes | skipped |
+| signing | `apksigner` self-sign | **never** |
+
+- **The two entry patterns are separate regexes and must stay that way.** The tempting union,
+  `^(?:([^/]+)/)?lib/…`, would make sopack start selecting `assets/lib/arm64-v8a/*.so` in APKs
+  where it has always ignored them - silently widening what gets encrypted, with no error to
+  notice. `tests/test_container.py` pins both halves (an APK's nested `.so` is not a candidate; a
+  bundle's root-level `lib/<abi>/*.so` is not one either).
+- **STORED + alignment are skipped for an AAB because they are meaningless there, not because
+  they stopped mattering.** A bundle is never installed: bundletool reads it and *generates* the
+  split APKs, choosing their compression and page alignment from `BundleConfig.pb`'s
+  `optimizations.uncompress_native_libraries` (`vsa.aab` already asks for
+  `enabled: true, page_alignment: 16K`). Entry offsets in the bundle's own zip are discarded before
+  any device sees them, and a real bundle's libraries run to ~100 MB uncompressed. sopack
+  deliberately does **not** read or rewrite that setting: either way it moves together with
+  `extractNativeLibs`, so there is no combination where skipping this breaks loading. The ELF's own
+  `p_align` / 16 KB LOAD checks are untouched - that is the part that matters on device.
+- **sopack never signs a bundle**, and this is a decision, not a gap. `apksigner` physically cannot
+  (`ApkFormatException: Missing AndroidManifest.xml` - a bundle's manifest is at
+  `<module>/manifest/` in protobuf), a bundle is JAR-signed, and what Play verifies is the app's
+  **upload key**, which sopack has no business holding. So `RepackResult.signed` is always `False`
+  for an AAB and the CLI's closing note points at `jarsigner`, never `apksigner`. The old
+  `META-INF/*.{SF,RSA,MF}` is **still stripped**: `MANIFEST.MF` carries a SHA-256 digest of every
+  entry, so once a library is rewritten the signature can never verify again, and a stale
+  signature turns "unsigned, go sign it" into a confusing `jarsigner -verify` failure.
+  Verified end to end: `jarsigner -signedjar` on a packed `vsa.aab` → `jar verified`.
+- **`report.json`/`index.jsonl` carry `container`, and `signed` must be read together with it.**
+  `signed: false` used to mean only "degraded"; it now also means "this was a bundle, which is
+  never signed". A batch consumer filtering on `signed == false` to find broken packs flags every
+  AAB otherwise. Added without bumping `SCHEMA` - an added key cannot break a reader that does not
+  look for it, and no existing key changed meaning.
 
 ### Library selection (`apk.py:_classify` / `build_excludes`)
 
-`repackage(..., wanted_libs)` takes `None` to mean **auto-select every `lib/<abi>/*.so`**, or a
-list for explicit selection. `None` and `[]` are NOT interchangeable - `config.py` rejects
-`libraries.include: []` rather than silently widening the scope to the whole APK (it used to be
-`cli.py` rejecting an empty `--libs` file; the invariant is the same one).
+`repackage(..., wanted_libs)` takes `None` to mean **auto-select every native library the
+container's entry pattern matches**, or a list for explicit selection. `None` and `[]` are NOT
+interchangeable - `config.py` rejects `libraries.include: []` rather than silently widening the
+scope to the whole APK (it used to be `cli.py` rejecting an empty `--libs` file; the invariant is
+the same one).
 
 - **Exclusion is checked before selection**, so `libraries.exclude` overrides a name in
   `libraries.include`.
   Patterns are fnmatch globs on the basename with an **optional `.so`** (`libflutter` matches
-  `libflutter.so` but not `libflutterx.so`); full APK paths also match.
+  `libflutter.so` but not `libflutterx.so`); full container paths also match, and for an AAB the
+  **module-relative** path does too (`lib/arm64-v8a/libapp.so` matches
+  `base/lib/arm64-v8a/libapp.so`), because nobody writes the module prefix by hand. The slice is
+  taken at `/lib/`, not `lib/`, so a module named `mylib` is not cut mid-name.
 - **The exclusion list is visible DATA in the config, but two entries are enforced in code.**
   `config.DEFAULT_EXCLUDES = ("libsopk_*", "libvosWrapperEx", "libflutter")` is what every
   generated config ships, so a reader can see what is skipped without running a pack. Of those,
@@ -309,10 +380,18 @@ list for explicit selection. `None` and `[]` are NOT interchangeable - `config.p
   libraries they never considered, and one stripped prebuilt must not kill the run. Zero packed
   libraries is always an error. Every cleartext library must appear in the CLI summary
   (`cli._print_summary`); silent skipping is worse than aborting.
-- **The wbaes provider loop is keyed on `thin_by_abi`, not `pack_keys`.** The white-box key is
+- **The wbaes provider loop is keyed on `thin_by_slot`, not `pack_keys`.** The white-box key is
   sealed lazily *before* `inject_so`, so an ABI whose every target was skipped has a `pack_keys`
   entry and no consumer - emitting its provider would add ~936 KB of dead white-box to the APK.
-- Enumeration reads only `zin.infolist()` of the **input** APK, so helpers added after the entry
+  A **slot is `(module, abi)`** so a multi-module bundle gets one provider per module that actually
+  staged helpers (each module ships as its own split APK, and a thin helper can only `DT_NEEDED`
+  something present alongside it). **`pack_keys` stays keyed on the bare ABI**, and that asymmetry
+  is load-bearing: bionic resolves a `DT_NEEDED` soname once per process, so every copy of
+  `libsopk_wb.so` for an ABI must carry the SAME sealed blob. Sealing per `(module, abi)` would put
+  two KEKs behind one soname and a helper from module A would unwrap against module B's blob →
+  `sopk_fail` → `abort()`, on essentially every launch. `vsa.aab` is base-only, so the
+  multi-module path is covered by a **synthetic two-module fixture only**, not by any real input.
+- Enumeration reads only `zin.infolist()` of the **input**, so helpers added after the entry
   loop can never be re-selected within a run.
 
 ### `cipher: wbaes` mode (white-box AES-128 key wrapping) - the alternative to the stub
@@ -609,7 +688,7 @@ would make precedence depend silently on insertion order.
   `ALWAYS_EXCLUDE_PATTERNS`, so the visible list cannot drift from the enforced one.
 
 - **`libraries.include` absent/null is not `include: []`.** Absent or null means auto-select
-  every `lib/<abi>/*.so`; an empty list is an ERROR. The two are not interchangeable downstream
+  every native library; an empty list is an ERROR. The two are not interchangeable downstream
   (`apk.repackage` branches on `wanted_libs is None`) and the failure contracts differ: under
   auto-select an un-injectable library is skipped with a warning and ships in cleartext, while
   an explicitly named one aborts the pack. Widening the scope on an empty list would silently

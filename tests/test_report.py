@@ -31,9 +31,9 @@ def _built(res, code=exitcodes.OK, error=None, cfg=None):
 # ---- the documented keys -----------------------------------------------------------------
 _REQUIRED = {
     "schema", "run", "tag", "started", "duration_ms", "exit_code", "status", "input", "output",
-    "config_source", "cipher", "abis", "encrypted_count", "failed_count", "not_selected_count",
-    "signed", "encrypted", "failed", "not_selected", "per_abi", "warnings", "environment",
-    "error", "log", "config",
+    "config_source", "container", "cipher", "abis", "encrypted_count", "failed_count",
+    "not_selected_count", "signed", "encrypted", "failed", "not_selected", "per_abi", "warnings",
+    "environment", "error", "log", "config",
 }
 
 

@@ -1,21 +1,26 @@
-# sopack - black-box Android `.so` encryptor / APK repackager
+# sopack - black-box Android `.so` encryptor / APK + AAB repackager
 
-`sopack` takes an **existing APK** and produces a **self-signed APK** in which each
-selected `.so` has its code (`.text`) encrypted at rest and transparently decrypted at
-load time - **without any access to the library source**. By default every
-`lib/<abi>/*.so` in the APK is encrypted; name a specific list in the config file to narrow
-that. It is a black-box ELF-injection packer; see [`docs/`](./docs/) for the
-full design and reasoning.
+`sopack` takes an **existing APK or Android App Bundle** and gives back the same container,
+with each selected `.so` having its code (`.text`) encrypted at rest and transparently
+decrypted at load time - **without any access to the library source**. By default every
+native library is encrypted; name a specific list in the config file to narrow that. The
+format is **detected from the file** - the same `sopack pack` command handles both, with no
+flag to set. An APK comes back **self-signed**; an AAB comes back **unsigned by design**, for
+you to sign with your own upload key (`jarsigner` - `apksigner` cannot read a bundle). It is a
+black-box ELF-injection packer; see [`docs/`](./docs/) for the full design and reasoning.
 
 > ⚠️ **This is obfuscation, not security.** The decryption key ships inside the
 > binary, and plaintext exists in a readable `R-X` mapping at runtime. Any Frida hook
 > or `/proc/self/maps` dump recovers everything. Treat this as anti-static-analysis
 > only. Also: re-signing gives the APK a **new signing identity** - it cannot be
 > installed as an update over the original, and in-app signature checks will see the
-> new certificate. Full threat model: [`docs/SECURITY.md`](./docs/SECURITY.md).
+> new certificate. (A packed AAB keeps whatever identity you sign it with afterwards, so
+> that particular consequence is yours to control.) Full threat model:
+> [`docs/SECURITY.md`](./docs/SECURITY.md).
 
 ```
 sopack pack in.apk -o out.apk [--config PATH]
+sopack pack in.aab -o out.aab [--config PATH]   # same command; the format is detected
 sopack init-config                              # write a commented config.yaml
 ```
 
@@ -106,6 +111,7 @@ sopack/               Python package (the tool)
   cli.py              `sopack pack …` / `sopack init-config`
   config.py           the YAML config: schema, validation, and the sample it writes
   apk.py              unzip → inject → zipalign → apksigner; keystore mgmt
+  container.py        APK-vs-AAB detection and the five things that differ between them
   elf_inject.py       LIEF: encrypt .text, add segment, hijack init, patch metadata
   cipher.py           ChaCha20 / XOR - MUST match stub/stub_cipher.h; plus AES-128-CTR,
                       which is the wbaes key-wrap primitive

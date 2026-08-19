@@ -12,10 +12,11 @@ import logging
 import os
 import subprocess
 import sys
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+
+from conftest import mkapk
 
 from sopack import cli, config, diag, report
 
@@ -33,11 +34,7 @@ def _logfile(**kw):
 
 
 def _apk(path, entries=("lib/arm64-v8a/libfoo.so",)):
-    with zipfile.ZipFile(path, "w") as z:
-        z.writestr("AndroidManifest.xml", b"\x00")
-        for e in entries:
-            z.writestr(e, b"\x7fELF-not-really")
-    return str(path)
+    return mkapk(path, entries)
 
 
 # ---- destination resolution --------------------------------------------------------------

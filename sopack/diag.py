@@ -300,7 +300,9 @@ def _run_id(input_apk: str) -> str:
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     salt = os.urandom(2).hex()
     stem = os.path.basename(input_apk or "no-input")
-    if stem.lower().endswith(".apk"):
+    # Both container extensions, or an `app.aab` run lands in a directory named `…-app_aab`
+    # (the dot is not run-id-safe, so _UNSAFE would rewrite it rather than drop it).
+    if stem.lower().endswith((".apk", ".aab")):
         stem = stem[:-4]
     stem = _UNSAFE.sub("_", stem)[:_STEM_MAX].strip("._-") or "apk"
     return f"{stamp}-{salt}-{stem}"

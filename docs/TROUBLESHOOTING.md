@@ -69,7 +69,7 @@ status is 8 bits, so it cannot carry both a class and a count (and a negative co
 | `1` | `internal-error` | unmodelled failure; treat as a sopack bug | the traceback in `runs/<id>/run.log` |
 | `2` | `usage-error` | bad command line, a removed flag, or `init-config` over an existing file | **stderr only - there is no run record**, because nothing was packed |
 | `3` | `config-error` | config missing, unparseable, or an unknown/misplaced key | the message names the key |
-| `4` | `input-error` | input APK missing, unreadable, or not a zip | |
+| `4` | `input-error` | input missing, unreadable, not a zip, or a zip that is neither an APK nor an AAB | [§neither an APK nor an AAB](#error-file-is-a-zip-but-neither-an-apk-nor-an-android-app-bundle) |
 | `5` | `selection-error` | nothing matched `libraries.include` | [§no .so entries matched](#error-no-so-entries-matched-the-requested-list-nothing-to-encrypt) |
 | `6` | `nothing-encrypted` | the pack ran and protected zero libraries | [§none of the N entries were packed](#error-none-of-the-n-libso-entries-in-this-apk-were-packed) |
 | `7` | `toolchain-error` | missing stub blob or helper skeleton, no `wb_keygen`, sealing failed | [§could not find a host wb_keygen](#error-could-not-find-a-host-wb_keygen-on-a-fresh-checkout) |
@@ -79,7 +79,10 @@ status is 8 bits, so it cannot carry both a class and a count (and a negative co
 
 Note `2` is reserved: `argparse` uses it for a malformed command line, so nothing else may take it.
 An **unsigned but successfully packed** APK is still `0` - signing is best-effort by design; detect
-it with `"signed": false` in the record rather than an exit code.
+it with `"signed": false` in the record rather than an exit code. Read that field together with
+`"container"`: a packed **AAB** is always `"signed": false`, because sopack never signs a bundle
+(see [§My packed AAB is unsigned](#my-packed-aab-is-unsigned)), so on its own the field does not
+distinguish "left unsigned by design" from "signing was skipped or unavailable".
 
 ## The on-device diagnostic
 
@@ -343,7 +346,12 @@ the re-sign."
 
 ## `error: no .so entries matched the requested list; nothing to encrypt`
 
-The names in `libraries.include` didn't match any `lib/<abi>/<name>.so` in the APK.
+The names in `libraries.include` didn't match any native library in the input.
+
+- **If the input is an AAB**, its entries are `<module>/lib/<abi>/<name>.so`. You do **not** need
+  the module prefix - `libapp`, `libapp.so`, `lib/arm64-v8a/libapp.so` and
+  `base/lib/arm64-v8a/libapp.so` all match - so this error means the name itself is wrong, not the
+  shape.
 
 - The trailing `.so` is optional and fnmatch globs work, so `libapp`, `libapp.so` and
   `lib/arm64-v8a/libapp.so` are equivalent. (Before this was fixed, `include` required an
@@ -354,7 +362,9 @@ The names in `libraries.include` didn't match any `lib/<abi>/<name>.so` in the A
 - Confirm the exact names/ABIs present:
 
   ```bash
-  python3 -c "import zipfile;[print(n) for n in zipfile.ZipFile('in.apk').namelist() if n.startswith('lib/') and n.endswith('.so')]"
+  # works for both containers: an APK's libraries are lib/<abi>/*.so, a bundle's are
+  # <module>/lib/<abi>/*.so
+  python3 -c "import zipfile,re,sys;[print(n) for n in zipfile.ZipFile(sys.argv[1]).namelist() if re.search(r'(^|/)lib/[^/]+/[^/]+\.so$', n)]" in.apk
   ```
 - A bare basename matches every selected ABI; make sure the library actually ships for
   an ABI in `abis:`. **`abis:` defaults to `arm64-v8a` alone** - if the library is only
@@ -365,6 +375,9 @@ The names in `libraries.include` didn't match any `lib/<abi>/<name>.so` in the A
 ---
 
 ## `error: none of the N lib/<abi>/*.so entries in this APK were packed`
+
+(For a bundle the same error reads `none of the N <module>/lib/<abi>/*.so entries in this AAB were
+packed` - the wording names the container it actually saw.)
 
 Auto-select found libraries but every one was excluded or failed to inject. The per-library
 reasons are printed above the error.
@@ -377,6 +390,46 @@ reasons are printed above the error.
   overrides a name in `libraries.include`.
 - Everything failing to inject points at a shared cause; read the individual messages and
   see the per-library sections above.
+
+---
+
+## `error: <file> is a zip, but neither an APK nor an Android App Bundle`
+
+sopack classifies the input by its **contents**, not its extension: a root `AndroidManifest.xml`
+means APK, a root `BundleConfig.pb` means AAB. Exit code **4** (`input-error`).
+
+- If you passed a plain zip, an `.apks` (a bundletool *output*, a zip of split APKs), or an
+  extracted-and-rezipped directory that lost its manifest, that is the cause. Pack the original
+  APK or `.aab`.
+- An `.apks` archive is not supported and there is nothing to fix in it: it is already the
+  generated, signed output of `bundletool build-apks`. Pack the `.aab` it came from instead.
+- The name is never consulted, so a correctly-formed bundle named `.apk` (or the reverse) packs
+  fine - you get a warning that `-o`'s extension disagrees, and nothing more.
+
+---
+
+## My packed AAB is unsigned
+
+That is by design, not a failure - the pack's last lines say so, and `report.json` records
+`"container": "aab"` with `"signed": false`. Three reasons:
+
+- `apksigner` cannot read a bundle at all (it wants a root `AndroidManifest.xml`; a bundle's is at
+  `<module>/manifest/` in protobuf form).
+- A bundle is JAR-signed, and what Play verifies on upload is your **upload key**, which sopack
+  does not have.
+- The original signature *is* stripped, and has to be: `META-INF/MANIFEST.MF` carries a SHA-256
+  digest of every entry, so once a library is rewritten it can never verify again.
+
+Sign it yourself:
+
+```bash
+jarsigner -keystore <your-upload-keystore> -signedjar signed.aab out.aab <alias>
+jarsigner -verify signed.aab          # expect "jar verified"
+```
+
+If you are batch-triaging, note that `"signed": false` must be read **together with**
+`"container"`: on an APK it means signing was skipped or unavailable, on an AAB it is the normal
+successful outcome.
 
 ---
 

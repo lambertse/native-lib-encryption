@@ -1,14 +1,27 @@
-"""APK repackaging + self-signing.
+"""APK / AAB repackaging + self-signing.
 
-Flow: for each selected lib/<abi>/*.so inside the APK, inject (encrypt + stub),
-write it back STORED (uncompressed) so it stays page-mappable, strip the old
-signature, then `zipalign -P 16` and `apksigner` with a generated keystore.
+Flow: for each selected native library inside the container, inject (encrypt + stub),
+write it back, strip the old signature, then align and sign.
+
+The container is DETECTED from the input (`container.detect`), never declared - there is no
+`--aab` flag and no config key for it. Only five things differ between the two, all of them read
+off the `Container` descriptor: the entry pattern, where added artifacts go, whether an injected
+library is stored uncompressed, whether the zip is 16 KB-aligned, and whether sopack signs at
+all. See sopack/container.py.
+
+  APK: entries are lib/<abi>/*.so; injected libraries are written STORED (uncompressed) so they
+       stay page-mappable, the zip is `zipalign -P 16`ed, and it is self-signed with `apksigner`
+       using a generated keystore.
+  AAB: entries are <module>/lib/<abi>/*.so; entry compression is preserved and no alignment or
+       signing happens, because bundletool - not sopack - generates the installable APKs from a
+       bundle and makes those choices itself. The output is unsigned BY DESIGN; the operator
+       signs it with `jarsigner` and their own upload key.
 
 Selection is either an explicit list (libraries.include) or, when that list is omitted,
-every lib/<abi>/*.so in the input APK for the selected ABIs. Exclusion patterns always
+every native library in the input for the selected ABIs. Exclusion patterns always
 win over selection; see ALWAYS_EXCLUDE_PATTERNS below.
 
-Re-signing changes the signing identity: the output is effectively a new app and
+Re-signing (APK only) changes the signing identity: the output is effectively a new app and
 cannot be installed as an update over the original.
 """
 from __future__ import annotations
@@ -25,11 +38,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import diag
+from .container import APK as APK_CONTAINER, Container, detect as detect_container
 from .errors import ToolMissingError
 from .elf_inject import InjectError, InjectResult, inject_so
 from .stubs import DEFAULT_ABIS, SUPPORTED_ABIS
-
-_LIB_RE = re.compile(r"^lib/([^/]+)/([^/]+\.so)$")
 
 # Excluded UNCONDITIONALLY: not overridable by naming one in libraries.include, and not
 # removable by leaving them out of libraries.exclude. Patterns are fnmatch globs on the
@@ -184,17 +196,26 @@ class SelectionError(NothingPackedError):
 @dataclass
 class RepackResult:
     injected: list[InjectResult] = field(default_factory=list)
-    # (entry, reason) for every lib/<abi>/*.so we deliberately did not select.
+    # (entry, reason) for every native-library entry we deliberately did not select.
     untouched: list[tuple[str, str]] = field(default_factory=list)
     # (entry, InjectError message) for libraries that were selected but could not be
     # injected. Only ever populated in auto-select mode - an explicitly named library
     # still aborts the whole pack.
     failed: list[tuple[str, str]] = field(default_factory=list)
     output: str = ""
-    # False when the output was left UNSIGNED - either signing.sign: false, or no apksigner on this
-    # machine. An unsigned APK cannot be installed until something signs it, so the CLI has to
-    # say so rather than letting a successful-looking pack imply an installable artifact.
+    # False when the output was left UNSIGNED. THREE different situations produce it and only the
+    # first two are degradations:
+    #   * signing.sign: false          - the caller asked for it
+    #   * no apksigner on this machine - best-effort; the pack itself is done
+    #   * the output is an AAB         - sopack never signs a bundle (see the signing block below)
+    # An unsigned APK cannot be installed until something signs it, so the CLI has to say so
+    # rather than letting a successful-looking pack imply an installable artifact. Consequence for
+    # anyone consuming report.json: `signed: false` is NOT on its own a "this pack went wrong"
+    # signal - read it together with `container`, or every bundle looks like a failure.
     signed: bool = True
+    # Which container this was, as container.Container.kind ("apk" | "aab"). Recorded so the run
+    # report and the CLI's closing advice can differ without re-detecting the format.
+    container: str = APK_CONTAINER.kind
 
 
 def build_excludes(exclude_libs=None) -> tuple[str, ...]:
@@ -210,10 +231,23 @@ def build_excludes(exclude_libs=None) -> tuple[str, ...]:
 
 
 def _match_lib_pattern(entry: str, so: str, pat: str) -> bool:
-    """fnmatch on the basename with an optional .so suffix; full APK paths also match."""
+    """fnmatch on the basename with an optional .so suffix; full paths also match.
+
+    "Full path" means two things for a bundle, and both have to work. The entry there is
+    `base/lib/arm64-v8a/libapp.so`, but every doc, every generated config and every user's muscle
+    memory writes `lib/arm64-v8a/libapp.so` - so the module-relative form is matched too. Without
+    it, moving from an APK to the AAB of the same app would silently stop matching an
+    `include:`/`exclude:` entry that was written as a path, and silently NOT matching an exclude
+    is how sopack's own decryptor would get packed.
+    """
+    # rindex on "/lib/", not index on "lib/": a module named "mylib" would otherwise be sliced
+    # mid-name into "lib/lib/arm64-v8a/…". An APK entry has no leading segment, so rel == entry
+    # and the extra clause below is a no-op there - the APK matcher is unchanged by design.
+    rel = entry[entry.rindex("/lib/") + 1:] if "/lib/" in entry else entry
     return (fnmatch.fnmatch(so, pat)
             or fnmatch.fnmatch(so, pat + ".so")
-            or fnmatch.fnmatch(entry, pat))
+            or fnmatch.fnmatch(entry, pat)
+            or fnmatch.fnmatch(rel, pat))
 
 
 def _classify(entry: str, abi: str, so: str, wanted: set[str] | None,
@@ -225,8 +259,8 @@ def _classify(entry: str, abi: str, so: str, wanted: set[str] | None,
     """
     if abi not in abis:
         # Distinguish "you could widen `abis:` for this" from "sopack has no stub for it":
-        # _LIB_RE matches any <abi> directory name, including lib/x86/ and lib/mips/ that
-        # `abis:` would reject outright.
+        # the entry pattern matches any <abi> directory name, including lib/x86/ and
+        # lib/mips/ that `abis:` would reject outright.
         return False, ("abi not selected" if abi in SUPPORTED_ABIS
                        else "abi not supported by sopack")
     for pat in excludes:
@@ -260,14 +294,20 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
               allow_helper_log: bool = False,
               exclude_libs: list[str] | None = None,
               no_sign: bool = False,
-              logger=print) -> RepackResult:
-    # `None` means auto-select every lib/<abi>/*.so; an empty list is NOT the same thing
+              logger=print,
+              # None means "look at the file". Detection is by content, so a library caller
+              # normally leaves this alone; it exists so cli.py, which has already detected the
+              # format in order to print it, does not have to re-read the central directory of a
+              # 150 MB bundle. Additive, so every existing caller keeps working.
+              container: Container | None = None) -> RepackResult:
+    # `None` means auto-select every native library; an empty list is NOT the same thing
     # (config.py rejects `libraries.include: []` rather than silently widening the scope).
     auto = wanted_libs is None
     wanted = None if auto else set(wanted_libs)
     excludes = build_excludes(exclude_libs)
     abis_set = set(abis)
-    result = RepackResult(output=out_apk)
+    cont = container or detect_container(in_apk)
+    result = RepackResult(output=out_apk, container=cont.kind)
 
     # wbaes preflight: resolve a RUNNABLE host wb_keygen now, so a wrong tool fails before we
     # start injecting (not mid-pack). Also surfaces the Android-vs-host mistake up front.
@@ -281,31 +321,45 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
         aligned = os.path.join(tmp, "aligned.apk")
 
         matched_any = False
-        candidates = 0                        # lib/<abi>/*.so entries seen, any ABI
+        candidates = 0                        # native-library entries seen, any ABI
         seen_names: set[str] = set()          # every entry written (collision guard)
-        # wbaes: (lib/<abi>/name, bytes, target's ZIP date_time)
+        # wbaes: (entry name, bytes, target's ZIP date_time)
         extra_helpers: list[tuple[str, bytes, tuple[int, int, int, int, int, int]]] = []
         # wbaes: ONE long-term key and ONE shared provider per ABI. Sealed lazily on that
         # ABI's first target, then reused for every later target in it - which is what lets a
         # single ~455 KB blob replace N of them.
+        #
+        # Keyed on the BARE ABI even for a multi-module bundle, deliberately. A feature module's
+        # `lib/arm64-v8a/` is a separate provider SLOT (each module becomes its own split APK, so
+        # each needs its own copy of libsopk_wb.so), but every copy for an ABI must carry the SAME
+        # sealed blob: bionic resolves a DT_NEEDED soname once per process, so whichever split's
+        # copy wins has to unwrap every module's thin helpers. Sealing per (module, abi) would put
+        # two different KEKs behind one soname and a helper from module A would unwrap against
+        # module B's blob -> sopk_fail -> abort(), on essentially every launch.
         pack_keys: dict[str, object] = {}
-        # abi -> ZIP date_time to stamp that ABI's provider with (see the helper note below).
-        provider_dates: dict[str, tuple[int, int, int, int, int, int]] = {}
-        # abi -> thin helper sonames staged, for the pack-level closure assertion afterwards.
-        thin_by_abi: dict[str, list[str]] = {}
+        # (module, abi) -> ZIP date_time to stamp that slot's provider with (see the helper note
+        # below). "module" is "" for an APK, which has exactly one slot per ABI.
+        provider_dates: dict[tuple[str, str], tuple[int, int, int, int, int, int]] = {}
+        # (module, abi) -> thin helper sonames staged, for the pack-level closure assertion.
+        thin_by_slot: dict[tuple[str, str], list[str]] = {}
         with zipfile.ZipFile(in_apk, "r") as zin, \
                 zipfile.ZipFile(unsigned, "w") as zout:
             for item in zin.infolist():
                 name = item.filename
-                # Drop the previous signature - we re-sign.
+                # Drop the previous signature. An APK is re-signed below; a bundle is not, and
+                # dropping it there is still right - a JAR signature's MANIFEST.MF holds a
+                # SHA-256 digest of every entry, so once we have rewritten one it can never
+                # verify again, and a stale signature is harder to diagnose than none.
+                # Note this only matches the ROOT META-INF/, so a bundle's
+                # <module>/root/META-INF/*.kotlin_module entries pass through untouched.
                 if name.startswith("META-INF/") and re.search(r"\.(RSA|DSA|EC|SF|MF)$|MANIFEST\.MF$", name):
                     continue
                 data = zin.read(name)
-                m = _LIB_RE.match(name)
+                m = cont.lib_re.match(name)
                 select, why = (False, "")
                 if m:
                     candidates += 1
-                    select, why = _classify(name, m.group(1), m.group(2),
+                    select, why = _classify(name, m["abi"], m["so"],
                                             wanted, abis_set, excludes)
                     # Every selection decision, including the ones _print_summary collapses to a
                     # bare count as terminal noise. "why is this library in cleartext?" is the
@@ -313,7 +367,12 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                     diag.debug(f"select {name}: "
                                + ("YES" if select else f"no ({why})"))
                 if select:
-                    abi = m.group(1)
+                    abi = m["abi"]
+                    # Where this library's sibling artifacts belong: "" for an APK, "base/" (or a
+                    # feature module's name) for a bundle. Taken from the descriptor rather than
+                    # by probing the match, so it lines up with the other four format decisions.
+                    prefix = f"{m['mod']}/" if cont.has_module else ""
+                    slot = (m["mod"] if cont.has_module else "", abi)
                     logger(f"  injecting {name} [{abi}] …")
                     src = os.path.join(tmp, "in.so")
                     dst = os.path.join(tmp, "out.so")
@@ -330,7 +389,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                         pack_keys[abi] = provision_pack(wb_keygen=wb_keygen)
                     try:
                         ir = inject_so(src, dst, abi, cipher=cipher, log=log,
-                                       wb_keygen=wb_keygen, target_name=m.group(2),
+                                       wb_keygen=wb_keygen, target_name=m["so"],
                                        allow_helper_log=allow_helper_log,
                                        pack_key=pack_keys.get(abi))
                     except InjectError as e:
@@ -349,7 +408,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                         result.failed.append((name, str(e)))
                         # `data` is still the pristine zin.read(name) here - it is only
                         # reassigned below, after a successful inject. A raise also stages
-                        # nothing: extra_helpers/thin_by_abi are fed from `ir`, which does
+                        # nothing: extra_helpers/thin_by_slot are fed from `ir`, which does
                         # not exist on this path.
                         zout.writestr(item, data)
                         seen_names.add(name)
@@ -368,14 +427,18 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                     # first thing a static-analysis report noticed about a shipped APK,
                     # before any disassembly.
                     if ir.helper_path and ir.helper_soname:
-                        hname = f"lib/{abi}/{ir.helper_soname}"
+                        hname = f"{prefix}lib/{abi}/{ir.helper_soname}"
                         with open(ir.helper_path, "rb") as hf:
                             extra_helpers.append((hname, hf.read(), item.date_time))
-                        thin_by_abi.setdefault(abi, []).append(ir.helper_soname)
-                        provider_dates.setdefault(abi, item.date_time)
-                    # STORED so the .so stays uncompressed & page-alignable.
+                        thin_by_slot.setdefault(slot, []).append(ir.helper_soname)
+                        provider_dates.setdefault(slot, item.date_time)
                     zi = zipfile.ZipInfo(name, date_time=item.date_time)
-                    zi.compress_type = zipfile.ZIP_STORED
+                    # APK: STORED so the .so stays uncompressed & page-alignable straight out of
+                    # the zip. AAB: keep whatever compression it arrived with - bundletool
+                    # re-packs the library into the split APKs it generates and chooses their
+                    # compression there, so STORED here would only inflate the bundle.
+                    zi.compress_type = (zipfile.ZIP_STORED if cont.store_libs
+                                        else item.compress_type)
                     zi.external_attr = item.external_attr
                     zout.writestr(zi, data)
                     seen_names.add(name)
@@ -386,26 +449,39 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                     zout.writestr(item, data)
                     seen_names.add(name)
 
-            # Emit ONE shared white-box provider per ABI, after the loop - it carries that
+            # Emit ONE shared white-box provider per SLOT, after the loop - it carries that
             # ABI's single sealed blob, so it cannot be produced per target.
             from .elf_inject import emit_provider
             from .rt_meta import PROVIDER_SONAME
-            # Keyed on thin_by_abi, NOT pack_keys: the key is sealed lazily *before*
+            # Keyed on thin_by_slot, NOT pack_keys: the key is sealed lazily *before*
             # inject_so, so an ABI whose every target was skipped (auto-select fail-soft
             # above) has a pack_keys entry but no thin helper. Emitting its provider would
             # add ~936 KB of white-box to the APK with nothing depending on it.
-            for abi in thin_by_abi:
+            #
+            # A slot is (module, abi), so a multi-module bundle gets one provider per module that
+            # actually staged helpers - each module ships as its own split APK and a thin helper
+            # can only DT_NEEDED a library present alongside it. All copies for one ABI carry the
+            # same blob, from the single pack_keys[abi]; see the note where pack_keys is declared
+            # for why that identity is load-bearing rather than merely tidy.
+            for (mod, abi), thin in thin_by_slot.items():
                 pk = pack_keys[abi]
-                pname = f"lib/{abi}/{PROVIDER_SONAME}"
-                ppath = os.path.join(tmp, f"provider-{abi}.so")
-                logger(f"  emitting shared white-box provider for {abi} …")
+                pprefix = f"{mod}/" if mod else ""
+                pname = f"{pprefix}lib/{abi}/{PROVIDER_SONAME}"
+                ppath = os.path.join(tmp, f"provider-{pprefix.rstrip('/') or 'root'}-{abi}.so")
+                # Names the module only when there is one, so an APK pack's output is unchanged
+                # and a bundle's does not print the same ABI twice with nothing to tell the two
+                # lines apart.
+                logger(f"  emitting shared white-box provider for {pprefix}{abi} …")
                 emit_provider(abi, pk, ppath, allow_helper_log=allow_helper_log)
                 with open(ppath, "rb") as pf:
                     extra_helpers.append(
-                        (pname, pf.read(), provider_dates.get(abi, (1980, 1, 1, 0, 0, 0))))
+                        (pname, pf.read(),
+                         provider_dates.get((mod, abi), (1980, 1, 1, 0, 0, 0))))
 
-            # Add the wbaes helpers and providers as NEW STORED entries (the packer's only
-            # add-file path).
+            # Add the wbaes helpers and providers as NEW entries (the packer's only add-file
+            # path), under the same compression policy as an injected library: STORED for an APK
+            # so they are page-mappable in place, DEFLATED for a bundle to match every other
+            # `.so` in it, since bundletool re-packs them into the splits it generates.
             #
             # A collision is handled differently for the two kinds. For a per-target helper it is
             # benign - the soname is derived from the target and prefixed libsopk_rt_, so a clash
@@ -413,20 +489,22 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
             # PROVIDER it is fatal: silently skipping it would leave every thin helper resolving
             # against a pre-existing libsopk_wb.so carrying a FOREIGN blob, so no session key
             # would unwrap and every target would abort on device.
-            provider_names = {f"lib/{abi}/{PROVIDER_SONAME}" for abi in thin_by_abi}
+            provider_names = {f"{mod + '/' if mod else ''}lib/{abi}/{PROVIDER_SONAME}"
+                              for mod, abi in thin_by_slot}
             for hname, hdata, hdate in extra_helpers:
                 if hname in seen_names:
                     if hname in provider_names:
                         raise RuntimeError(
-                            f"{hname} already exists in this APK. It cannot be reused: it would "
-                            "carry a different sealed blob than the one the thin helpers were "
-                            "wrapped against, so every packed library would fail to decrypt. "
-                            "Pack an APK that has not already been packed.")
+                            f"{hname} already exists in this {cont.noun}. It cannot be reused: it "
+                            "would carry a different sealed blob than the one the thin helpers "
+                            "were wrapped against, so every packed library would fail to decrypt. "
+                            f"Pack an {cont.noun} that has not already been packed.")
                     logger(f"  warning: helper {hname} already present; not overwriting")
                     continue
                 logger(f"  adding {hname} …")
                 zi = zipfile.ZipInfo(hname, date_time=hdate)
-                zi.compress_type = zipfile.ZIP_STORED
+                zi.compress_type = (zipfile.ZIP_STORED if cont.store_libs
+                                    else zipfile.ZIP_DEFLATED)
                 zi.external_attr = (0o644 << 16)
                 zout.writestr(zi, hdata)
                 seen_names.add(hname)
@@ -434,8 +512,8 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
             # Pack-level closure. `_self_verify_wbaes` runs per target and structurally cannot
             # see this: every thin helper depends on lib/<abi>/libsopk_wb.so, so if that entry is
             # missing the app fails 100% of the time, inside whatever dlopen'd the target.
-            for abi, thin in thin_by_abi.items():
-                pname = f"lib/{abi}/{PROVIDER_SONAME}"
+            for (mod, abi), thin in thin_by_slot.items():
+                pname = f"{mod + '/' if mod else ''}lib/{abi}/{PROVIDER_SONAME}"
                 if pname not in seen_names:
                     raise RuntimeError(
                         f"{len(thin)} thin helper(s) for {abi} were staged but {pname} was not - "
@@ -452,26 +530,64 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                     f"requested={sorted(wanted)}", result)
             if candidates == 0:
                 raise NothingPackedError(
-                    "this APK has no lib/<abi>/*.so entries at all; nothing to encrypt.", result)
+                    f"this {cont.noun} has no {cont.lib_shape} entries at all; nothing to "
+                    "encrypt.", result)
             raise NothingPackedError(
-                f"none of the {candidates} lib/<abi>/*.so entries in this APK were packed: "
+                f"none of the {candidates} {cont.lib_shape} entries in this {cont.noun} were "
+                f"packed: "
                 f"{len(result.untouched)} excluded or outside `abis:` "
                 f"{','.join(sorted(abis_set))}, {len(result.failed)} could not be injected. "
                 "See the per-library reasons above.", result)
 
-        # Align uncompressed entries to 16 KB pages (native `zipalign` if present and
-        # runnable, else the built-in Python aligner - needed on hosts without an
-        # arch-matching zipalign, e.g. aarch64).
-        _align_apk(unsigned, aligned, logger=logger)
+        # `packed` is the finished zip, whichever of the two temp files that turns out to be.
+        # It has to be a variable rather than the literal `aligned`, because the alignment step is
+        # skipped for a bundle: reading `aligned` unconditionally below would then look for a file
+        # that was never written and fail with FileNotFoundError - reported as an OUTPUT error,
+        # blaming `-o`, after a full rezip of a ~150 MB input.
+        if cont.zipalign:
+            # Align uncompressed entries to 16 KB pages (native `zipalign` if present and
+            # runnable, else the built-in Python aligner - needed on hosts without an
+            # arch-matching zipalign, e.g. aarch64).
+            _align_apk(unsigned, aligned, logger=logger)
+            packed = aligned
+        else:
+            # Nothing to align: a bundle is not installed. bundletool reads it and generates the
+            # split APKs, choosing their compression and page alignment from
+            # `BundleConfig.pb`'s `optimizations.uncompress_native_libraries` - so entry offsets
+            # in THIS zip are discarded before any device sees them. sopack deliberately neither
+            # reads nor rewrites that setting: whichever way it is set, it moves together with
+            # `extractNativeLibs`, so there is no combination in which skipping this breaks
+            # loading (compressed libs are extracted to disk at install and mapped from there).
+            logger(f"  not aligning: bundletool aligns native libraries when it generates APKs "
+                   f"from this {cont.noun}")
+            packed = unsigned
 
         # self-sign (v2/v3) with apksigner.
         #
         # Resolve apksigner BEFORE touching the keystore. ensure_keystore shells out to keytool
         # and writes ~/.sopack/debug.keystore, so probing in the other order generates a 2048-bit
         # key pair and only then discovers there is nothing to sign with - which is what used to
-        # happen, and it left a keystore behind on a machine that cannot sign at all.
+        # happen, and it left a keystore behind on a machine that cannot sign at all. The same
+        # reasoning is why `not cont.sign` skips ensure_keystore entirely instead of signing into
+        # a keystore nobody asked for.
         signer: list[str] | None = None
-        if no_sign:
+        if not cont.sign:
+            # sopack NEVER signs a bundle, and this is a design decision, not a missing feature:
+            #   * apksigner physically cannot - it needs a root AndroidManifest.xml, and a bundle's
+            #     manifest lives at <module>/manifest/ in protobuf form. It fails with
+            #     "ApkFormatException: Missing AndroidManifest.xml".
+            #   * a bundle is JAR-signed (jarsigner), and the signature Play actually checks is the
+            #     app's UPLOAD key - a key sopack has no business holding, and one that a debug
+            #     keystore cannot stand in for.
+            # So the artifact is handed over unsigned and the operator signs it. The old signature
+            # is still stripped in the entry loop above: MANIFEST.MF carries a SHA-256 digest of
+            # every entry, so a signature that can no longer verify is worse than none - it turns
+            # "unsigned, go sign it" into a confusing jarsigner -verify failure.
+            logger(f"  not signing: a packed {cont.noun} is left unsigned for you to sign with "
+                   f"your own upload key")
+            if no_sign:
+                logger("  (signing.sign: false was set too, so this changes nothing)")
+        elif no_sign:
             logger("  skipping signing (signing.sign: false)")
         else:
             try:
@@ -487,7 +603,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
 
         if signer is None:
             result.signed = False
-            shutil.copyfile(aligned, out_apk)
+            shutil.copyfile(packed, out_apk)
         else:
             ks = keystore or KeystoreInfo(path=DEFAULT_KEYSTORE_PATH)
             ensure_keystore(ks)
@@ -498,7 +614,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
             ]
             if min_sdk is not None:
                 sign_cmd += ["--min-sdk-version", str(min_sdk)]
-            sign_cmd += ["--out", out_apk, aligned]
+            sign_cmd += ["--out", out_apk, packed]
             diag.log_subprocess(sign_cmd)
             subprocess.run(sign_cmd, check=True)
 

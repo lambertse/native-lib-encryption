@@ -1,6 +1,12 @@
-"""The sopack config file (YAML) - every setting except the input and output APK.
+"""The sopack config file (YAML) - every setting except the input and output file.
 
     sopack pack in.apk -o out.apk [--config PATH]
+    sopack pack in.aab -o out.aab [--config PATH]
+
+There is no key for the container format either: APK-vs-AAB is detected from the file's
+contents (`sopack.container.detect`), so it is a fact about the input rather than a setting,
+and a key would let a caller declare the wrong one. Note that the whole ``signing:`` block is
+inapplicable to an AAB - sopack never signs a bundle.
 
 Lookup order: an explicit ``--config PATH`` (which must exist), then ``./config.yaml``,
 then the built-in defaults in `Config.default()` - so a bare pack still works on a machine
@@ -56,10 +62,12 @@ class ConfigError(ValueError):
 # exactly Config.default(). That makes the sample, the constant and the code defaults one
 # thing that cannot drift.
 SAMPLE_YAML = """\
-# sopack configuration. The command line carries only the input and output APK:
+# sopack configuration. The command line carries only the input and output file:
 #   sopack pack in.apk -o out.apk [--config PATH]
+#   sopack pack in.aab -o out.aab [--config PATH]   # same command; format is detected
 # Lookup order: --config PATH, then ./config.yaml, then these built-in defaults.
 # Every key below is optional; the value shown is the default.
+# APK or AAB is decided by the file's CONTENTS, so there is no key for it here.
 
 # wbaes  - white-box AES-128 key wrapping (DEFAULT). The long-term key is sealed
 #          and never reconstructed at runtime, so no portable key ships. Needs the
@@ -75,18 +83,21 @@ abis:
   - arm64-v8a
 
 libraries:
-  # Omit `include`, or leave it null, to encrypt EVERY lib/<abi>/*.so in the APK.
+  # Omit `include`, or leave it null, to encrypt EVERY native library in the input
+  # (lib/<abi>/*.so in an APK, <module>/lib/<abi>/*.so in an AAB).
   # An explicitly empty list ([]) is an error, not a request for auto-select.
   #
   # Entries match exactly like `exclude` below: a bare basename (libfoo -> that
-  # library in every selected ABI), a full APK path (lib/arm64-v8a/libfoo.so),
+  # library in every selected ABI), a full path (lib/arm64-v8a/libfoo.so),
   # fnmatch globs, and a trailing .so that is OPTIONAL. So `libapp`, `libapp.so`
-  # and `lib/arm64-v8a/libapp.so` all select the same library.
+  # and `lib/arm64-v8a/libapp.so` all select the same library. In an AAB you do
+  # NOT need the module prefix: lib/arm64-v8a/libapp.so matches
+  # base/lib/arm64-v8a/libapp.so.
   include:
     # - libapp
 
   # Never encrypt these. Same matching as `include` above: fnmatch globs on the
-  # basename, trailing .so optional, full APK paths too - so "libflutter" matches
+  # basename, trailing .so optional, full paths too - so "libflutter" matches
   # libflutter.so but not libflutterx.so. Exclusion ALWAYS wins over `include`.
   #
   # An empty list ([]) is fine here - unlike `include`, it can only narrow
@@ -111,6 +122,9 @@ libraries:
     # - libc++_shared
     # - libmy*
 
+# Nothing in this block applies to an AAB: sopack never signs a bundle (apksigner
+# cannot read one, and the signature Play checks is your upload key). A packed AAB
+# is always handed back UNSIGNED, for you to sign with jarsigner.
 signing:
   sign: true            # false == the old --no-sign: leave the APK UNSIGNED
   verify: true          # print the signer certificates after signing

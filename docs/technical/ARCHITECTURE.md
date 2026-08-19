@@ -84,7 +84,12 @@ page size - which we read from the kernel, never hardcode. The injected executab
 segment is aligned to 16 KB so the library still loads on 16 KB devices.
 
 An input library that is itself 4 KB-aligned cannot be packed, and cannot be repaired by
-the packer either - only re-linked. [`PAGE-ALIGNMENT.md`](./PAGE-ALIGNMENT.md) works that
+the packer either - only re-linked.
+
+Note the split of responsibility once the container is an **AAB**: the ELF-level alignment above is
+unchanged and still enforced per library, but the *zip-entry* offset alignment (Step 0 in
+`PAGE-ALIGNMENT.md`) is bundletool's, not sopack's - it generates the installable APKs and aligns
+them itself, so sopack skips that step for a bundle rather than aligning a zip nobody maps. [`PAGE-ALIGNMENT.md`](./PAGE-ALIGNMENT.md) works that
 through end to end: every mapping step from the APK entry offset to the decryptor's
 `mremap` window, which of them would crash and how far from the cause, why file padding
 is not a fix, and which parts of the refusal are sopack's own limitation.
@@ -300,13 +305,23 @@ instead of on the device; it is deliberately loader-aware now.
 
 ---
 
-## 6. Component 3 - APK repackage and self-sign
+## 6. Component 3 - APK / AAB repackage and self-sign
 
-Source: `sopack/apk.py`, driven by `sopack/cli.py`.
+Source: `sopack/apk.py`, driven by `sopack/cli.py`, with the format differences isolated in
+`sopack/container.py`.
 
-1. Unzip the APK; for each **selected** `lib/<abi>/<name>.so`, run Component 2. Selection
-   is either the explicit `libraries.include` list (by full path or bare basename → all
-   ABIs) or, when that list is omitted, **every** `lib/<abi>/*.so` in the input APK.
+**The input may be an APK or an Android App Bundle, and the format is detected from the
+file, not declared** - a root `BundleConfig.pb` means AAB, a root `AndroidManifest.xml`
+means APK, and neither is an input error. There is no flag and no config key for it. Only
+five things differ, all read off the `Container` descriptor: the entry pattern, where added
+artifacts go, whether an injected library is written uncompressed, whether the zip is
+16 KB-aligned, and whether sopack signs at all. Steps 2-4 below are therefore the **APK**
+path; §6a says what a bundle does instead.
+
+1. Unzip the container; for each **selected** `lib/<abi>/<name>.so` (an APK) or
+   `<module>/lib/<abi>/<name>.so` (a bundle), run Component 2. Selection
+   is either the explicit `libraries.include` list (by full path, module-relative path, or
+   bare basename → all ABIs) or, when that list is omitted, **every** matching entry.
    Exclusion patterns (`libraries.exclude`, which ships listing `libsopk_*`,
    `libvosWrapperEx` and `libflutter`) are checked *before* selection, so they override a
    name in `libraries.include` too. The first two are **also** prepended unconditionally by
@@ -333,6 +348,40 @@ Source: `sopack/apk.py`, driven by `sopack/cli.py`.
 > signature-pinning / integrity check (common in banking/security apps) will see the
 > new cert and may refuse to run - independent of whether the encryption itself
 > succeeded.
+
+### 6a. What an AAB does instead of steps 2-4
+
+Nothing about Component 1 or 2 changes - those operate on a `.so`, which does not care what
+zip it travelled in, and the ELF's own 16 KB `p_align` checks, `_self_verify_wbaes` and the
+`.dynsym`-name guard all still run per library. What changes is the container work:
+
+2'. The injected `.so` keeps the **compression it arrived with** (every `.so` in a real
+    bundle is DEFLATED). The old `META-INF/*.{SF,RSA,MF}` is still dropped.
+3'. **No alignment.** A bundle is never installed. bundletool reads it and *generates* the
+    split APKs, choosing their compression and page alignment from `BundleConfig.pb`'s
+    `optimizations.uncompress_native_libraries` - so entry offsets inside the bundle are
+    discarded before any device sees them, and forcing STORED would only inflate the
+    artifact (a real bundle's libraries are ~100 MB uncompressed). sopack deliberately
+    neither reads nor rewrites that setting: it moves together with `extractNativeLibs`,
+    so there is no combination in which skipping this breaks loading.
+4'. **No signing.** `apksigner` cannot even parse a bundle (`ApkFormatException: Missing
+    AndroidManifest.xml` - the manifest is at `<module>/manifest/` in protobuf form), a
+    bundle is JAR-signed, and the signature Play verifies is the app's **upload key**.
+    sopack has no business holding that, so the output is unsigned **by design**,
+    `RepackResult.signed` is `False`, and the CLI points at `jarsigner`. The old signature
+    is still stripped because `MANIFEST.MF` digests every entry: a signature that can no
+    longer verify is harder to diagnose than none.
+
+Added artifacts land in the **target's own module** directory, and for `cipher: wbaes` the
+shared provider is emitted once per `(module, abi)` while the white-box key is sealed once
+per **ABI**. That asymmetry is required, not incidental: bionic resolves a `DT_NEEDED`
+soname once per process, so every copy of `libsopk_wb.so` for an ABI must carry the same
+sealed blob, or a thin helper from one module unwraps against another's and aborts.
+
+Measured on a real 155 MB, 1456-entry bundle (`test_apks/vsa.aab`, `cipher: wbaes`,
+`abis: [arm64-v8a]`): 12 s, 23 libraries injected, 1 skipped by the `.dynsym` guard
+(the same library the APK of the same app also refuses), 24 entries added, the 3 old
+signature entries removed, and all 1430 other entries byte-identical.
 
 ---
 
@@ -488,6 +537,7 @@ ceiling but leave the clean envelope:
 sopack/               the tool (Python)
   cli.py              argument parsing → repackage()
   apk.py              unzip → inject → 16 KB align → apksigner; keystore mgmt
+  container.py        APK-vs-AAB detection, and the five things that differ between them
                       (+ adds the wbaes helper .so - the only add-file path)
   elf_inject.py       encrypt .text, add segment, hijack/add init, patch decinfo, self-verify
                       (+ _inject_wbaes: DT_NEEDED surgery + helper emission)

@@ -109,7 +109,20 @@ survives if the entry itself starts on a page boundary. Hence `apk.py`: every `.
 pads the local header so the entry's data begins at a multiple of **16384**.
 
 *If violated:* every segment's skew is off by the entry misalignment; the whole library fails to
-load. This step is entirely sopack's responsibility and it is enforced unconditionally.
+load. This step is entirely sopack's responsibility and it is enforced unconditionally **for an
+APK**.
+
+**For an AAB it is bundletool's responsibility, and sopack deliberately skips it.** A bundle is
+not installed; bundletool reads it and *generates* the split APKs, deciding their compression and
+page alignment from `BundleConfig.pb`'s `optimizations.uncompress_native_libraries` (a Gradle
+build sets `enabled: true, page_alignment: 16K`). So entry offsets inside the bundle's own zip are
+discarded before any device sees them, and writing `ZIP_STORED` there would only inflate the
+artifact - a real bundle's libraries are ~100 MB uncompressed. This is not a hole in the
+invariant: if `uncompress_native_libraries` is off, bundletool keeps the libraries compressed
+*and* leaves `extractNativeLibs="true"`, so they are extracted to disk at install and mapped from
+a plain file where Step 0 does not apply at all. The two settings move together, so there is no
+configuration in which skipping this step breaks loading. Everything from Step 1 onward - which is
+where the ELF's own `p_align` lives - is identical for both containers.
 
 ### Step 1 (pack time) - `.text` is encrypted in place, section-exact
 

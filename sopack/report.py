@@ -28,9 +28,12 @@ import os
 import shutil
 
 from . import diag, exitcodes
+from .container import abi_of as _abi_of
 
 # Bumped when the shape changes incompatibly, so a consumer can refuse a record it does not
-# understand instead of silently reading a missing key as None.
+# understand instead of silently reading a missing key as None. `container` was ADDED without a
+# bump: an added key cannot break a reader that does not look for it, and the meaning of every
+# pre-existing key is unchanged.
 SCHEMA = 1
 
 INDEX_NAME = "index.jsonl"
@@ -42,17 +45,16 @@ RUNS_DIR = "runs"
 _MAX_LINE = 4000
 
 
-def _abi_of(entry: str) -> str:
-    parts = entry.split("/")
-    return parts[1] if len(parts) > 2 else "?"
-
-
 def build(cfg, res, *, input_apk, output_apk, exit_code, error, config_source,
-          started_iso=None, duration_ms=None, run=None, tag=None, warnings=None) -> dict:
+          started_iso=None, duration_ms=None, run=None, tag=None, warnings=None,
+          container=None) -> dict:
     """The full `report.json` body.
 
     `res` may be None: a run that failed before or during `repackage` still gets a record, and a
     record that says "config-error, nothing was packed" is exactly what a batch triage needs.
+
+    `container` is the detected format ("apk" | "aab"), or None for a run that died before
+    detection - which is a real state and not the same as "apk", so it is not defaulted.
     """
     injected = list(getattr(res, "injected", []) or [])
     failed = list(getattr(res, "failed", []) or [])
@@ -81,6 +83,10 @@ def build(cfg, res, *, input_apk, output_apk, exit_code, error, config_source,
         "input": os.path.abspath(input_apk) if input_apk else None,
         "output": os.path.abspath(output_apk) if output_apk else None,
         "config_source": config_source,
+        # "apk" | "aab" | None. Read `signed` TOGETHER with this: sopack never signs a bundle, so
+        # `"container": "aab"` + `"signed": false` is a normal successful pack, while the same
+        # `signed: false` on an APK means signing was skipped or unavailable.
+        "container": (getattr(res, "container", None) if res is not None else None) or container,
         "cipher": getattr(cfg, "cipher", None),
         "abis": list(getattr(cfg, "abis", ()) or ()),
         "encrypted_count": len(injected),
@@ -127,6 +133,12 @@ def index_line(report: dict) -> dict:
         "output": os.path.basename(report.get("output") or "") or None,
         "exit_code": report.get("exit_code"),
         "status": report.get("status"),
+        # Here as well as in report.json because the index IS the batch view, and "why is every
+        # one of these unsigned?" is a question a batch asks. Note the key beside it is still
+        # named `apk` for both formats: it is published in this module's jq recipe and in
+        # config.SAMPLE_YAML (which is byte-pinned to config.sample.yaml), so it is added
+        # alongside, never renamed.
+        "container": report.get("container"),
         "cipher": report.get("cipher"),
         "abis": report.get("abis"),
         "encrypted_count": report.get("encrypted_count"),

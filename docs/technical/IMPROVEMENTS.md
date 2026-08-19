@@ -114,7 +114,41 @@ against peak RSS on a 1–2 GB device.
 
 ---
 
-## 3. Protect ABIs other than `arm64-v8a`
+## 3. Device-validate a packed AAB (`bundletool`)
+
+`scripts/device_test.sh` is **APK-only** and stays that way for now: it globs `*.apk`, strips a
+literal `.apk` from the slug, reads the package name with `aapt dump badging`, and installs with a
+single `adb install -r`. None of that works on a bundle.
+
+Validating a packed AAB on device needs the extra hop the format implies:
+
+```bash
+bundletool build-apks --bundle=out.aab --output=out.apks \
+    --ks=<keystore> --ks-key-alias=<alias>          # bundletool signs the GENERATED APKs
+bundletool install-apks --apks=out.apks
+```
+
+so the harness would need `bundletool` (a jar, not in the SDK by default), a signing step it does
+not currently perform, and `install-apks` instead of `adb install -r`. Until then the AAB path is
+verified structurally rather than on device: entry-by-entry diff of input vs output, the per-library
+`_self_verify_wbaes` / `.dynsym`-name guards that run on every pack, and a `jarsigner` round-trip
+proving the artifact is signable. What is NOT yet proven for a bundle is the end-to-end
+decrypt-and-run, and the reason is worth stating precisely: the *libraries* are identical to those
+the APK path produces and are covered by `device_test.sh` there, so what remains unverified is the
+container hop - that bundletool's generated splits keep the added `libsopk_*` entries in the right
+module with usable alignment.
+
+One caveat on coverage: `test_apks/vsa.aab` is **base-only**, so no real customer input exercises
+the **multi-module** path. It is covered by two synthetic two-module fixtures in
+`tests/test_container.py` - one faked, one doing real injection and real sealing (skipped without a
+host `wb_keygen` and built skeletons), which is what pins the load-bearing part: both modules'
+`libsopk_wb.so` come out byte-identical, so whichever copy bionic resolves for the shared soname
+unwraps every module's helpers. What no test can cover here is bundletool's own behaviour on a
+multi-module bundle.
+
+---
+
+## 4. Protect ABIs other than `arm64-v8a`
 
 Only `arm64-v8a` is protected in practice, by deliberate scope choice. The other ABIs ship
 cleartext `.text`, so an analyst after the *algorithm* reads the x86_64 build and never touches

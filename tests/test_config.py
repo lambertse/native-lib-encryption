@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import mkapk
+
 from sopack import config
 from sopack.config import Config, ConfigError, loads
 from sopack.stubs import DEFAULT_ABIS, SUPPORTED_ABIS
@@ -502,8 +504,10 @@ def packed(tmp_path, monkeypatch):
     # repackage is faked, but _cmd_pack now validates the input APK up front so a missing input
     # gets exit 4 with a clear message instead of an ENOENT from deep inside the pack (which was
     # indistinguishable from an unwritable OUTPUT path). So the input has to actually exist.
-    src = tmp_path / "in.apk"
-    src.write_bytes(b"PK\x05\x06" + b"\x00" * 18)          # an empty but real zip
+    # A real, DETECTABLE APK, not just a real zip: _cmd_pack classifies the input by content
+    # (container.detect) before it calls repackage, so an empty zip is now correctly rejected as
+    # "neither an APK nor a bundle" - which would fail these tests for a reason they are not about.
+    src = mkapk(tmp_path / "in.apk")
     monkeypatch.setenv("SOPACK_LOG_DIR", str(tmp_path / "logs"))
 
     def run(yaml_text):

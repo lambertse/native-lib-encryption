@@ -1,10 +1,13 @@
 """sopack command-line interface.
 
     sopack pack in.apk -o out.apk [--config PATH]
+    sopack pack in.aab -o out.aab [--config PATH]
     sopack init-config [-o PATH]
 
-The command line carries only the input and output APK. Every other setting - cipher, ABIs,
-library selection, keystore, signing and logging - lives in a YAML config file. sopack reads
+The command line carries only the input and output file, and whether that file is an APK or an
+Android App Bundle is DETECTED from its contents (`sopack/container.py`) rather than declared.
+Every other setting - cipher, ABIs, library selection, keystore, signing and logging - lives in
+a YAML config file. sopack reads
 `--config PATH` if given (an error if it does not exist), else `./config.yaml`, else its
 built-in defaults.
 
@@ -39,6 +42,8 @@ from . import __version__, diag, exitcodes, report
 from .apk import (DEFAULT_KEYSTORE_PATH, KeystoreInfo, NothingPackedError, SelectionError,
                   build_excludes, repackage, verify_signature)
 from .config import DEFAULT_CONFIG_NAME, SAMPLE_YAML, Config, ConfigError, load
+from .container import (APK as APK_CONTAINER, abi_of as _abi_of,
+                        detect as detect_container)
 from .elf_inject import InjectError
 from .errors import InputError, ToolMissingError
 from .provision import ProvisionError
@@ -116,11 +121,6 @@ def _reject_removed_flags(argv) -> None:
         prev = arg
 
 
-def _abi_of(entry: str) -> str:
-    parts = entry.split("/")
-    return parts[1] if len(parts) > 2 else "?"
-
-
 def _print_summary(res, abis) -> None:
     """Per-ABI account of what got protected and what shipped in cleartext.
 
@@ -189,10 +189,20 @@ def _cmd_pack(args: argparse.Namespace, ctx: dict) -> int:
     # Checked HERE, up front, rather than left to whichever open() fails first. A missing input and
     # an unwritable output both surface as FileNotFoundError from deep inside the pack, and an
     # errno does not say which path it was about - which is how `-o /no/such/dir/o.apk` came to be
-    # reported as a missing input APK.
+    # reported as a missing input. (The message says "input", not "input APK": the input may be an
+    # AAB, and at this point it has not even been opened, so we do not yet know which.)
     if not os.path.isfile(args.input):
         what = "is a directory" if os.path.isdir(args.input) else "does not exist"
-        raise InputError(f"input APK {args.input} {what}")
+        raise InputError(f"input {args.input} {what}")
+
+    # APK or AAB, decided by what is INSIDE the file. Done here, before the banner, so the pack
+    # announces what it thinks it was handed - and so a file that is neither fails now rather than
+    # after rewriting a ~150 MB zip. The descriptor is passed to `repackage`, which would
+    # otherwise re-read the central directory to reach the same conclusion.
+    cont = detect_container(args.input)
+    # Into ctx immediately, not after repackage returns: a pack that raises still gets a run
+    # record, and "which format was this?" is part of triaging that failure.
+    ctx["container"] = cont.kind
 
     ks_cfg = cfg.signing.keystore
 
@@ -212,9 +222,21 @@ def _cmd_pack(args: argparse.Namespace, ctx: dict) -> int:
     eff_excludes = build_excludes(excludes)
     diag.emit(f"sopack {__version__}: packing {args.input} -> {args.output}")
     diag.emit(f"  config: {source or f'built-in defaults (no {DEFAULT_CONFIG_NAME} found)'}")
+    # AAB-only line, deliberately: the APK path's output has to stay byte-for-byte what it was,
+    # and for an APK there is nothing to say - it is what this tool has always taken.
+    if cont is not APK_CONTAINER:
+        diag.emit("  input: Android App Bundle (detected)")
     diag.emit(f"  cipher={cfg.cipher}  abis={','.join(cfg.abis)}")
-    diag.emit(f"  libs={'ALL lib/<abi>/*.so' if libs is None else ','.join(libs)}")
+    diag.emit(f"  libs={'ALL ' + cont.lib_shape if libs is None else ','.join(libs)}")
     diag.emit(f"  excluding: {', '.join(eff_excludes)}")
+    # A warning, never an error: the container is decided by content, so a misnamed output is
+    # cosmetic - but silently writing a bundle to something called `.apk` is how someone ends up
+    # feeding it to `adb install`.
+    out_ext = os.path.splitext(args.output)[1].lower()
+    if out_ext and out_ext != f".{cont.kind}":
+        diag.note_warning(f"WARNING: the input is an {cont.noun} but the output is named "
+                          f"{os.path.basename(args.output)} - it will be written as an "
+                          f"{cont.noun} regardless")
     # No wb_keygen= : there is no config key for it either, and provision.find_wb_keygen
     # locates one on its own (vendor/wbc/bin/ from a local build, or the bundle it was
     # installed from). repackage still takes the kwarg, so a library caller can pin one.
@@ -223,7 +245,7 @@ def _cmd_pack(args: argparse.Namespace, ctx: dict) -> int:
                     log=cfg.logging.stub_log,
                     allow_helper_log=cfg.logging.allow_helper_log,
                     exclude_libs=excludes, no_sign=not cfg.signing.sign,
-                    logger=diag.emit)
+                    logger=diag.emit, container=cont)
     ctx["res"] = res
 
     diag.emit(f"\nInjected {len(res.injected)} librar{'y' if len(res.injected)==1 else 'ies'}:")
@@ -240,7 +262,8 @@ def _cmd_pack(args: argparse.Namespace, ctx: dict) -> int:
                           f"ship in CLEARTEXT")
 
     # signing.verify runs apksigner too, so an unsigned output has nothing to verify and the
-    # attempt would fail for the same reason signing did.
+    # attempt would fail for the same reason signing did. That covers a bundle for free: sopack
+    # never signs one, so res.signed is False and there is nothing to dump.
     if cfg.signing.verify and res.signed:
         diag.emit("\nSignature:")
         diag.emit(verify_signature(args.output, min_sdk=cfg.signing.min_sdk))
@@ -248,6 +271,14 @@ def _cmd_pack(args: argparse.Namespace, ctx: dict) -> int:
     if res.signed:
         diag.emit("Note: re-signed with a new certificate - this is a new app identity "
                   "(cannot update-install over the original).")
+    elif cont is not APK_CONTAINER:
+        # A bundle is unsigned BY DESIGN, not degraded, so it gets its own advice: apksigner
+        # cannot read a bundle at all, and the signature that matters is the app's upload key.
+        # Naming the real command matters here - the APK advice below would send someone to a
+        # tool that fails with "Missing AndroidManifest.xml" and no hint why.
+        diag.emit(f"Note: this {cont.noun} is UNSIGNED, by design - sopack does not hold your "
+                  "upload key. Sign it with yours before uploading:")
+        diag.emit(f"  jarsigner -keystore <keystore> -signedjar signed.aab {args.output} <alias>")
     else:
         # Last line of output, because it is the one thing that decides what you can do with
         # this file. A packed-but-unsigned APK is a normal pipeline artifact, but `adb install`
@@ -283,13 +314,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"sopack {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    pk = sub.add_parser("pack", help="encrypt .so libraries inside an APK and re-sign")
-    pk.add_argument("input", help="input APK path")
-    pk.add_argument("-o", "--output", required=True, help="output APK path")
+    pk = sub.add_parser("pack",
+                        help="encrypt .so libraries inside an APK or AAB (and re-sign an APK)")
+    # No --aab / --format flag, and no config key either: the container is decided by what is
+    # inside the file (container.detect). A flag would let a caller declare the wrong one, and the
+    # single-input-single-output shape of this command is pinned by tests/test_lib_select.py.
+    pk.add_argument("input", help="input APK or AAB path (detected from the file)")
+    pk.add_argument("-o", "--output", required=True, help="output path, same format as the input")
     pk.add_argument("--config", default=None,
                     help=f"YAML config path. Default: ./{DEFAULT_CONFIG_NAME} if present, "
                          f"else sopack's built-in defaults (cipher wbaes, arm64-v8a, every "
-                         f"lib/<abi>/*.so). Run `sopack init-config` to write one.")
+                         f"native library). Run `sopack init-config` to write one.")
     pk.set_defaults(func=_cmd_pack)
 
     ic = sub.add_parser("init-config",
@@ -399,6 +434,7 @@ def main(argv=None) -> int:
                                 input_apk=ctx.get("input"), output_apk=ctx.get("output"),
                                 exit_code=code, error=error,
                                 config_source=ctx.get("config_source"),
+                                container=ctx.get("container"),
                                 duration_ms=int((time.time() - started) * 1000))
         except Exception:                                   # pragma: no cover - defensive
             diag.debug("could not finalize the run report:\n" + traceback.format_exc())
