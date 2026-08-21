@@ -75,7 +75,8 @@ pinned by a KAT captured from the real 2.0.0 `wbc_unwrap_key` in `tests/test_cip
 
 The *ownership* view - who produces each artifact and whether it ships. For the
 step-by-step **sequence** at pack time and at load, and the same picture for stub mode,
-see [`ARCHITECTURE.md`](./ARCHITECTURE.md) §12c–d.
+see [`ARCHITECTURE.md`](./ARCHITECTURE.md) §12c–d; for where the injection and the
+add-file path sit around those steps, §12g.
 
 ```
   ── host (pack time) ──────────────────────┐   ── device (load time) ────────────────

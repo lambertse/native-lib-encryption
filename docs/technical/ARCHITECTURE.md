@@ -3,8 +3,8 @@
 This document explains **what sopack is, how it is built, and the reasoning behind
 each design decision** - including the non-obvious constraints that dictated the shape
 of the whole system and the bugs that taught us why the "obvious" approaches don't
-work. If you only want to run the tool, read [`building.md`](./building.md). If
-something crashes, read [`troubleshooting.md`](./troubleshooting.md).
+work. If you only want to run the tool, read [`BUILDING.md`](../BUILDING.md). If
+something crashes, read [`TROUBLESHOOTING.md`](../TROUBLESHOOTING.md).
 
 ---
 
@@ -494,7 +494,7 @@ Flutter `SIGSEGV`. glibc `dlopen` on the host passed both, so host tests can't c
 **Conclusion:** bionic (Android 14+) requires a section header table to exist; detaching it
 is not viable, so the feature was **removed**. It was also marginal: once whitening holds,
 `.text`'s location (derivable from the un-strippable program headers + `PT_DYNAMIC`/`.dynsym`)
-gives an analyst nothing. See [`static-analysis-hardening.md`](./static-analysis-hardening.md)
+gives an analyst nothing. See [`HARDENING.md`](./HARDENING.md)
 §Method 3.
 
 ### 9d. String hygiene
@@ -570,7 +570,7 @@ docs/                 this documentation
 
 *For the boundary with the whitebox-cryptography SDK itself - the API surface consumed vs refused,
 the artifact flow, the version contract and the upgrade checklist - see
-[`wbc-integration.md`](./wbc-integration.md). This section is the reasoning behind it.*
+[`WBAES.md`](./WBAES.md). This section is the reasoning behind it.*
 
 An alternative to §4's freestanding stub, selected with `cipher: wbaes`. Everything in
 §§1–2 still applies (`execmem` not `execmod`, no W+X, I-cache flush, 16 KB pages); what
@@ -649,9 +649,24 @@ passphrase.
 
 What survives is that `wbc_open` is **not free** - `Unseal` still AEAD-decrypts the ~455 KB blob
 and builds the VM image, once per library. So per-library cost still multiplies, just at a much
-smaller constant. The remaining argument for collapsing to one shared blob is therefore **APK
-size**, not startup: each per-target helper ships ~465 KB of white-box code plus a ~455 KB blob,
-≈920 KB, and N of them duplicate both. See §11g.
+smaller constant.
+
+That residue is why **APK size**, not startup, is what drove the v3 provider split - which has
+**shipped**: before it each per-target helper carried ~465 KB of white-box code plus its own
+~455 KB blob, ≈920 KB duplicated N times. §12c–d have the resulting shape; this section only owns
+the two constraints that fixed it.
+
+**The trigger cannot be shared, only the provider.** The shape named in earlier drafts - "one
+helper carrying N regions" - cannot work: bionic runs a shared object's constructors exactly once,
+so a helper shared by N targets decrypts only what was mapped when the *first* target loaded, and
+a late-`dlopen`ed library (the Flutter `libapp.so` case) never gets decrypted at all. Hence one
+thin helper per target, and a provider that is deliberately not a trigger - it has no constructor,
+so it raises no ordering question.
+
+**Caching the provider's `wbc_ctx` stays deferred**, and declined on purpose rather than pending:
+it would keep the ~400 KB table image resident and dumpable for the whole process lifetime, and
+`wbc_ctx` is not thread-safe. `sopk_wb.c` therefore opens, unwraps and closes per call - `ctx` is
+a local, never a static.
 
 ### 11c. Why the bulk cipher is sopack's own ChaCha20, not the SDK's AEAD
 
@@ -748,7 +763,7 @@ any change, resolving them the way bionic does (`_LoaderView`: program headers +
 section headers, since in this mode the `.dynstr` section header and `DT_STRTAB` legitimately
 point at different bytes).
 
-See [`wbaes-verification.md`](./wbaes-verification.md) for the six-phase verification
+See [`WBAES.md`](./WBAES.md) Part II for the six-phase verification
 procedure, including a host round-trip that exercises every one of these contracts without a
 device.
 
@@ -765,30 +780,39 @@ primitive differs. Call that **stub mode**. `cipher: wbaes` is the other. Both u
 16-byte nonce block convention (12-byte ChaCha20 nonce ‖ 4-byte little-endian counter), so the
 nonce is never a point of difference.
 
+§§12a–b are stub mode, §§12c–d are `wbaes`, §12e is the placement tail both share, §12f is
+the side-by-side, and §12g is the container-level pack sequence for `wbaes` - where the
+injection and the added artifacts fit around the key steps.
+
 ### 12a. Stub mode - pack time (how the key is embedded)
 
 ```
-HOST - sopack pack, cipher: chacha20|xor
+HOST - sopack pack, cipher: chacha20|xor          driver: elf_inject.py:inject_so
 ─────────────────────────────────────────────────────────────────────────────────
-  cipher.gen_key_nonce()
+  cipher.gen_key_nonce()                               ← cipher.py:gen_key_nonce
     ├── key32   = urandom(32)
     └── nonce16 = urandom(12) ‖ 00 00 00 00
            │
            ├──▶ apply_cipher(.text, key32, nonce16) ──▶ ciphertext, IN PLACE
-           │                                            (stream cipher: same length)
-           └──▶ sopk_decinfo, 128 B   (metadata.py ⇄ stub/decinfo.h)
+           │      ← cipher.py:apply_cipher            (stream cipher: same length)
+           └──▶ sopk_decinfo, 128 B   (metadata.py:DecInfo ⇄ stub/decinfo.h)
                   magic 'SOPK' │ version │ cipher_id │ flags
                   delta_text │ text_size │ delta_init   ← signed, vs &g_decinfo
                   key32 │ nonce16 │ reserved[40]
                            │
            stub blob (with the record at decinfo_off) appended as one R+X PT_LOAD
+             ← blob + decinfo_off from stubs.py:load_stub
                            │
            WHITEN AT REST - the record is masked in the shipped file:
              span = blob[decinfo_off-1024 : decinfo_off]      ← the stub's OWN
              wkey = cipher.whiten_key(span)                      code/rodata
              shipped128 = ChaCha20(record, wkey, WHITEN_NONCE)
+             ← cipher.py:whiten, written by elf_inject.py:_patch_decinfo
                            │
            DT_INIT ──▶ stub entry     (hijack the existing one, or add in place)
+             ← elf_inject.py:_hijack_existing_init / :_add_dtinit_inplace
+                           │
+           output re-read and checked          ← elf_inject.py:_self_verify
 ```
 
 The whitening key is **derived from the stub's own bytes**, so nothing key-shaped is stored to
@@ -806,16 +830,18 @@ cost; it does not remove the ceiling (§9e).
 ### 12b. Stub mode - runtime (how the key is retrieved)
 
 ```
-DEVICE - bionic runs DT_INIT before DT_INIT_ARRAY
+DEVICE - bionic runs DT_INIT before DT_INIT_ARRAY   all of this: stub/stub.c
 ─────────────────────────────────────────────────────────────────────────────────
-  DT_INIT ──▶ sopk_entry
+  DT_INIT ──▶ sopk_entry                               ← stub/stub.c:sopk_entry
     │
     │  &g_decinfo reached PC-relatively (adr; -mcmodel=tiny) - no load bias needed
     │
     ├─ copy the shipped 128 bytes byte-by-byte into a STACK local raw[128]
     │     (the segment is R+X: de-whitening in place is not possible)
     ├─ wkey = sopk_whiten_key(&g_decinfo - 1024, 1024)   ← recomputed from own code
+    │       stub/stub_cipher.h:sopk_whiten_key   (mirror of cipher.py:whiten_key)
     └─ sopk_chacha20_apply(raw, 128, wkey, SOPK_WHITEN_NONCE)   ← self-inverse
+            stub/stub_cipher.h:sopk_chacha20_apply
            │
            ├─ parse raw[] into locals: key32, nonce16, cipher_id, flags,     [A:entry]
            │     delta_text, text_size, delta_init   ← plaintext key material
@@ -833,34 +859,74 @@ DEVICE - bionic runs DT_INIT before DT_INIT_ARRAY
 
 ### 12c. `wbaes` mode - pack time (how the key is embedded)
 
+**Two scopes, and keeping them straight is the whole of this section:** `kek` is one per
+**(pack, ABI)**, `sk` is one per **target**. The asymmetry is forced, not stylistic - bionic
+resolves a `DT_NEEDED` soname once per process, so every copy of `libsopk_wb.so` for an ABI must
+carry the *same* sealed blob. Sealing per target would put N KEKs behind one soname and a
+helper would unwrap against the wrong blob on essentially every launch.
+
 ```
-HOST - sopack pack, cipher: wbaes            (provision.py:provision_text)
+HOST - sopack pack, cipher: wbaes
 ─────────────────────────────────────────────────────────────────────────────────
-  gen_wbaes_params() ──▶ kek16, sk32, wrap_iv16, nonce16
-  passphrase = token_hex(16)        seed = randbits(64)
-           │
-  kek16 ──▶ host wb_keygen --key <hex> --pass <p> --seed <n> --out blob
+ONCE PER (PACK, ABI)                              provision.py:provision_pack
+  kek16      = urandom(16)          ← the long-term AES-128 key
+  passphrase = token_hex(16)        ← 128 bits: the `light` tier's stated precondition
+  seed       = randbits(64)         ← picks the white-box's internal bijections, so two
+           │                          packs of the same key never ship comparable blobs
+  kek16 ──▶ host wb_keygen --key <hex> --pass <p> --seed <n> --kdf light --out blob
            │        │
-           │        └──▶ sealed blob   (kek diffused into the table network;
-           │                            NOT recoverable from the blob)
+           │        └──▶ sealed blob, ~455 KB, format v4
+           │             (kek diffused into the table network; NOT recoverable from it)
+           │
+  wpass = whiten_pass(passphrase, blob)   ← keyed off blob[:WHITEN_SPAN], the blob's OWN bytes
+           │
+  ✗ kek16 is DISCARDED - never written to any output, never leaves this function
+
+PER TARGET                                        provision.py:provision_text
+  sk32, wrap_iv16, nonce16 = urandom(32), urandom(16), urandom(12) ‖ 00 00 00 00
            │
   sk32 ──(AES-128-CTR under kek16)──▶ wrapped = wrap_iv ‖ aes128_ctr(sk, kek, iv)
            │                          48 B - byte-identical to wbc_wrap_key (§11d)
            │
-  sk32 ──▶ apply_cipher(.text, sk32, nonce16) ──▶ ciphertext, IN PLACE
-           │
-  wpass = whiten_pass(passphrase, blob)     ← keyed off blob[:1024], the blob's own bytes
-           │
-  ✗ kek16 and sk32 are DISCARDED - never written to any output
-           │
-  sopk_rt_region v2 (96-B header + soname ‖ wpass ‖ blob)  ← rt_meta.py ⇄ sopk_rt.h
-           │
-  helper skeleton clone ── region appended as RO 16 KB-aligned PT_LOAD
-           │              ── DT_SONAME := libsopk_rt_<target>.so
-           │
-  target: + DT_NEEDED libsopk_rt_<target>.so   (raw surgery; no DT_INIT touched)
-  APK:    + lib/<abi>/libsopk_rt_<target>.so   (STORED, 16 KB)
+  sk32 ──▶ apply_cipher(CIPHER_CHACHA20, .text, sk32, nonce16) ──▶ ciphertext, IN PLACE
+           │                                                       (stream cipher: same length)
+  ✗ sk32 is DISCARDED
 ```
+
+The material then splits across **two** artifacts - that split *is* v3. Each region is appended
+to its artifact as one read-only 16 KB-aligned `PT_LOAD` and found on device by magic-scanning
+that artifact's own program headers, never a patched symbol or a file offset (§11e):
+
+```
+  'SRTT' sopk_rt_region v3, 96-B header + tail        rt_meta.py ⇄ stub/sopk_rt.h
+     magic │ version │ text_rva │ text_size │ wrapped[48] │ nonce16[16] │
+     soname_len │ flags │ reserved
+     tail: the TARGET's soname ONLY - no blob and no passphrase since v3
+           │
+     ──▶ thin helper skeleton clone, DT_SONAME := libsopk_rt_<target>.so
+         ONE PER TARGET, a few KB
+         ← elf_inject.py:_emit_helper, skeleton from stubs.py:helper_skeleton_path
+
+  'SRTW' sopk_wb_region v3, 24-B header + tail
+     magic │ version │ blob_len │ pass_len │ flags │ reserved0 │ reserved1
+     tail: wpass, then the sealed blob
+           │
+     ──▶ provider skeleton, DT_SONAME stays exactly libsopk_wb.so (never renamed)
+         ONE PER (MODULE, ABI), ~465 KB + the blob
+         ← elf_inject.py:emit_provider, skeleton from stubs.py:provider_skeleton_path
+
+  target: + DT_NEEDED libsopk_rt_<target>.so   ← elf_inject.py:_add_needed_inplace
+          raw ELF surgery - no DT_INIT hijack, no decinfo, no stub in this mode
+          then checked by elf_inject.py:_self_verify_wbaes / :_self_verify_provider
+```
+
+Note the last line of each: the provider is emitted once per **(module, ABI)** so a multi-module
+bundle gets one beside each module's helpers, but every copy for a given ABI carries the single
+`pack_keys[abi]` blob. Emission scope and sealing scope are deliberately different.
+
+`wpass` and the blob **must stay in the same artifact**: the whitening key is derived from the
+blob's own first `WHITEN_SPAN` bytes, so splitting them across two `.so` files would turn any
+provider/helper skew into a silent `wbc_open` failure rather than a version error.
 
 What ships is the sealed blob, the wrapped session key, the nonce and the whitened passphrase.
 **No shipped byte is a key that can be copied out and used** - the long-term key exists only as a
@@ -868,41 +934,66 @@ table network, and the session key only as ciphertext under it.
 
 ### 12d. `wbaes` mode - runtime (how the key is retrieved)
 
+Since v3 the thin helper links **no white-box at all**. It calls `sopk_wb_k`, the provider's one
+export, and the provider owns every `wbc_*` call. The division is worth naming because it is the
+answer to "why not one helper for N libraries": the helper is the **trigger** and must stay 1:1
+with its target, since bionic runs a shared object's constructors exactly once and a shared
+trigger would never fire for a late-`dlopen`ed library; the provider is a **key service** -
+shared, stateless, and with no constructor at all, so it raises no ordering question.
+
 ```
 DEVICE - bionic runs a dependency's constructors BEFORE the dependent's init
+  thin helper: stub/sopk_rt.c        shared provider: stub/sopk_wb.c
 ─────────────────────────────────────────────────────────────────────────────────
-  dlopen(target) ──▶ load libsopk_rt_<target>.so ──▶ sopk_rt_ctor
+  dlopen(target) ──▶ load libsopk_rt_<target>.so ──▶ its own DT_NEEDED pulls in
+                     libsopk_wb.so ──▶ sopk_rt_ctor
+                                       ← stub/sopk_rt.c:sopk_rt_ctor
     │
-    ├─ magic-scan own program headers for 'SRTR' + EXACT version  (§11e)
+    ├─ magic-scan own program headers for 'SRTT' + EXACT version  (§11e)
     │     no match ──▶ return - FAIL OPEN, SILENTLY
     │     (that silence is why _emit_helper demands the build marker at pack time)
     ├─ dl_iterate_phdr ──▶ target load base, matched by soname basename
+    │     not mapped ──▶ sopk_fail(NO_TARGET) ──▶ abort()
     │
-    ├─ wkey = sopk_whiten_key(region.blob, 1024) ─▶ ChaCha20(wpass) ──▶ pass
-    │     (self-inverse; the same whiten_key/WHITEN_NONCE pair as stub mode uses)
-    ├─ wbc_open(blob, pass) ──▶ ctx        Argon2id: ~230 ms, +64 MiB transient
-    ├─ wbc_unwrap_key(ctx, wrapped) ──▶ sk32              2 white-box blocks, ~1.4 ms
-    └─ wbc_close(ctx)                                     frees the ~400 KB VM image
-           │
-           │  sk32 is now an ORDINARY key in ORDINARY memory ── the one window a
-           │  process dump can exploit without attacking the white-box (§11a)
-           │
-           ├─ text = target_base + region.text_rva
-           ├─ mmap anon RW ‖ copy window ‖ ChaCha20(text…, sk32, nonce16)   ─┐
-           ├─ wbc_wipe(sk32, 32)   ← window closed as soon as the decrypt is  │ §12e
-           │                         done, BEFORE the pages are placed        │
-           └─ mremap onto the original VA ‖ mprotect R-X ‖ icache flush     ─┘
+    ├─ sopk_wb_k(abi, region.wrapped[48], out sk32) ──▶ into libsopk_wb.so:
+    │                                    ← stub/sopk_wb.c:sopk_wb_k, its ONE export
+    │                                    magic-scan own phdrs for 'SRTW'
+    │                                    pass = whiten(wpass, blob[:WHITEN_SPAN])
+    │                                    wbc_blob_kdf_tier(blob)  ← must be 0; also the
+    │                                                               3.0.0 link tripwire
+    │                                    ctx  = wbc_open(blob, pass)          1.1 ms
+    │                                    sk32 = wbc_unwrap_key(ctx, wrapped)  0.83 ms
+    │                                    wbc_close(ctx)   frees the ~400 KB VM image
+    │   ◀── SOPK_WB_OK, or a reason code the helper folds into its 10..19 fail band
+    │       (the provider never aborts; the helper owns failing closed, so the
+    │        tombstone names the step instead of blaming the shared object)
+    │
+    │  ★ sk32 is now an ORDINARY key in ORDINARY memory - the one window a process
+    │    dump can exploit without attacking the white-box at all (§11a)
+    │
+    ├─ text = target_base + region.text_rva
+    ├─ mmap anon RW ‖ copy window ‖ ChaCha20(text…, sk32, nonce16)   11.8 ms  ─┐
+    ├─ sopk_wipe(sk32, 32)  ← the helper's OWN wipe: this file no longer links   │ §12e
+    │                         the white-box, so wbc_wipe is unavailable. Called  │
+    │                         as soon as the decrypt is done, BEFORE placement.  │
+    └─ mremap onto the original VA ‖ mprotect R-X ‖ icache flush               ─┘
 ```
+
+**~13.7 ms per library** at the `light` tier, and only the ChaCha20 term grows with `.text` - the
+white-box charge is two blocks regardless of payload. `wbc_open` is still paid **once per
+library** because the provider is stateless by choice; §11b has the full breakdown, the ~230 ms /
++64 MiB Argon2id history this replaced, and why the tier change is security-neutral here.
 
 The long-term key `kek` is **never reconstructed on device**, at any point. That is the entire
 security difference between the two modes.
 
 ### 12e. The shared `.text` placement tail (identical in both modes)
 
-Both decryptors end the same way, and the shape is forced by §2a - executing bytes the process
+Implemented twice, once per decryptor: `stub/stub.c:sopk_entry` for stub mode,
+`stub/sopk_rt.c:sopk_rt_ctor` for `wbaes`. Both end the same way, and the shape is forced by §2a - executing bytes the process
 modified in a *file-backed* mapping is `execmod` (denied to apps); executing from *anonymous*
 memory is `execmem` (allowed). Hence: never decrypt in place. The bracketed letters are stub
-mode's logcat stages - the ones [`troubleshooting.md`](./troubleshooting.md) has you read.
+mode's logcat stages - the ones [`TROUBLESHOOTING.md`](../TROUBLESHOOTING.md) has you read.
 
 ```
   pg = AT_PAGESZ                     ← read at runtime; 4 KB or 16 KB, never hardcoded
@@ -926,16 +1017,92 @@ unwind table valid, so nothing else in the library needs rewriting.
 | bulk cipher over `.text` | ChaCha20 or XOR | ChaCha20 (always) |
 | key used for `.text` | `key32`, generated per library | `sk32`, the unwrapped session key |
 | what ships | the key itself, **whitened** | sealed blob + wrapped key + whitened passphrase |
-| where the metadata lives | `sopk_decinfo`, 128 B, inside the R+X stub segment | `sopk_rt_region` v2, 96 B + tail, in the helper's RO segment |
+| where the metadata lives | `sopk_decinfo`, 128 B, inside the R+X stub segment | TWO v3 regions in RO segments: `'SRTT'` 96 B + soname per target, `'SRTW'` 24 B + wpass + blob per ABI |
 | found at runtime by | known offset from `&g_decinfo` (PC-relative) | magic-scan of the helper's own phdrs |
-| decryptor | freestanding stub, raw syscalls, no libc | normal `.so`, libc + C++ + libsodium |
+| decryptor | freestanding stub, raw syscalls, no libc | two normal `.so`s: a few-KB thin helper per target (libc only) + one ~465 KB provider per ABI (C++ + libsodium) |
 | delivery | `DT_INIT` hijack or in-place add | `DT_NEEDED` on the target |
+| files added to the container | none - the stub rides inside the target | 1 thin helper per target + 1 provider per (module, ABI); the tool's only add-file path |
 | works on `INIT_ARRAY`-only libs | yes, via the added `DT_INIT` | yes, for free |
 | gate on bad metadata | `magic` / `text_size` check → chain original (fail open, logs `A:not-patched`) | exact region version → `abort()` (**fails closed**, reason in `sopk_fail_code`) |
 | symbols / debug info shipped | n/a (flat blob, no symbol table) | none: the packer strips every non-ALLOC section |
-| plaintext key in memory | the de-whitened stack copy, for one frame; **not** explicitly zeroed on exit | `sk32`, only between the unwrap and the explicit `wbc_wipe` |
-| startup cost | ~15 ms per 5.5 MiB | ~245 ms per library (Argon2id dominates) |
+| plaintext key in memory | the de-whitened stack copy, for one frame; **not** explicitly zeroed on exit | `sk32`, only between the unwrap and the explicit `sopk_wipe` (the helper's own - it no longer links the white-box) |
+| startup cost | ~15 ms per 5.5 MiB | ~13.7 ms per library at the `light` tier (ChaCha20 dominates; §11b) |
 | **long-term key recoverable from the shipped files?** | **yes** - reverse the stub once | **no** - never reconstructed on device |
 
 For the SDK-boundary view of the `wbaes` column - which WBC calls and artifacts each step uses -
-see [`wbc-integration.md`](./wbc-integration.md).
+see [`WBAES.md`](./WBAES.md).
+
+### 12g. `wbaes` mode - the container-level sequence (where inject fits)
+
+§§12c–d follow the *key*. This follows the *pack*, because the ordering inside
+`apk.repackage` is load-bearing in three places and none of it is visible from the per-library
+view. One entry loop over `zin.infolist()` of the **input** only, so artifacts added later can
+never be re-selected within a run.
+
+```
+sopack pack in.apk -o out.apk                                     apk.py:repackage
+─────────────────────────────────────────────────────────────────────────────────
+  detect container from CONTENTS                  BundleConfig.pb → AAB
+    ← container.py:detect                         AndroidManifest.xml → APK
+  build_excludes()  ← apk.py:build_excludes; ALWAYS_EXCLUDE_PATTERNS prepended
+                      unconditionally, so an already-packed APK cannot feed
+                      libsopk_* back through inject
+           │
+  FOR EACH ENTRY matching the container's lib pattern:
+    │
+    ├─ _classify → candidate?   ← apk.py:_classify, via apk.py:_match_lib_pattern
+    │                             (exclusion is checked BEFORE selection)
+    │
+    ├─ if this ABI has no pack key yet:  provision_pack(abi)   ← SEALED LAZILY, on
+    │     provision.py:provision_pack, which shells out to the host wb_keygen
+    │     found by provision.py:find_wb_keygen.  Lazy means: sealed on
+    │     this ABI's FIRST target, not up front. Safe only because every
+    │     intermediate lives in `tmp` and out_apk is not written until signing, so
+    │     a stale pre-3.0.0 wb_keygen raising mid-loop leaves no partial output.
+    │     Do not hoist the output write into the loop without hoisting this.
+    │
+    ├─ inject_so → _inject_wbaes (elf_inject.py), six steps:
+    │     1. encrypt .text under a fresh session key            (§12c, per target)
+    │     2. reserve a 16 KB-aligned placeholder segment for a .dynstr copy
+    │        NOT LIEF add_library: it grows .dynamic/.dynstr and spills 4 KB-aligned
+    │        segments on tight libs, breaking 16 KB loading
+    │     3. binary.write(), THEN read _effective_strtab() and fill the placeholder;
+    │        raw-repoint DT_STRTAB/DT_STRSZ and overwrite .dynamic's DT_NULL with
+    │        DT_NEEDED in place. Post-write is mandatory - LIEF re-sorts .dynstr and
+    │        rewrites every st_name during write(), so a copy taken earlier
+    │        desynchronises every symbol name and dlsym returns NULL (§11f)
+    │     4. emit the thin helper carrying this target's 'SRTT' region, strip every
+    │        non-ALLOC section, refuse a skeleton missing the build marker
+    │     5. _self_verify_wbaes: dynsym names unchanged vs input, 16 KB + no TEXTREL,
+    │        no kek/sk byte present in the output
+    │     6. (standalone callers only) emit a provider beside the helper
+    │
+    └─ InjectError under auto-select ──▶ SKIP: original entry written back verbatim,
+       recorded in RepackResult.failed, ships in CLEARTEXT and is named in the CLI
+       summary. An EXPLICITLY NAMED library re-raises instead (§Library selection).
+           │
+  AFTER THE LOOP - the provider cannot be produced per target:
+    ├─ for each (module, abi) in thin_by_slot:  emit_provider(pack_keys[abi])
+    │     ← elf_inject.py:emit_provider
+    │     Keyed on thin_by_slot, NOT pack_keys: an ABI whose every target was skipped
+    │     has a pack key and no consumer, and its provider would be ~936 KB of dead
+    │     white-box. All copies for one ABI carry the SAME blob (§12c).
+    ├─ add the helpers + providers as new entries - the tool's ONLY add-file path.
+    │     STORED for an APK (page-mappable in place); DEFLATED for a bundle, since
+    │     bundletool re-packs them into the splits it generates.
+    │     A helper name collision warns and keeps the existing bytes; a PROVIDER
+    │     collision is FATAL - reusing a foreign blob means no session key unwraps.
+    └─ PACK-LEVEL CLOSURE: assert every staged slot's provider entry exists.
+       _self_verify_wbaes runs per target and structurally cannot see this, and a
+       missing provider fails 100% of launches inside whatever dlopen'd the target.
+           │
+  zero packed libraries ──▶ NothingPackedError (exit 6), carrying the partial result
+           │
+  APK: 16 KB zip-align, then apksigner self-sign (best-effort; warns if absent)
+  AAB: no align, NEVER signed - META-INF/*.{SF,RSA,MF} stripped, go run jarsigner
+```
+
+The three orderings that matter, restated because each was a bug once: **seal before
+`inject_so`** (the wrap needs the KEK), **emit the provider after the loop** (it depends on
+knowing which slots actually staged helpers), and **read `.dynstr` after `binary.write()`** (LIEF
+rewrites it during the write).
